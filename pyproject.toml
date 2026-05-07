@@ -1,0 +1,25 @@
+[project]
+name = "nikon-control"
+version = "0.0.1"
+description = "Drive a Nikon microscope (NIS Elements + JOBS 6.20) for cell-targeted 10x->40x acquisition."
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.24",
+  "scikit-image>=0.22",
+  "matplotlib>=3.7",
+  "tifffile>=2024.1.0",
+]
+
+[project.optional-dependencies]
+nd2 = ["nd2>=0.10"]
+dev = ["pytest>=7"]
+
+[project.scripts]
+nikon-control = "nikon_control.cli:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
