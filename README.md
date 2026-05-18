@@ -64,15 +64,31 @@ Opens the file in napari. One shape layer per class, colour-coded
 (red `single`, yellow `doublet`, cyan `debris`). To label a cell:
 
 1. Select the class layer (clicking its name in the layer list).
-2. Pick the rectangle tool, draw around the cell.
-3. Move through time with the T slider; new boxes are pinned to the
-   active timepoint.
+2. Pick the rectangle tool, draw around the cell. The bbox is visible at
+   **every timepoint** — cells don't move much, no need to redraw.
+3. If a cell dies: navigate to the last alive frame on the T slider,
+   select the cell's bbox, click **Mark death of selected at current T**
+   in the right dock. The bbox's `t_end` is recorded.
 4. Click **Save annotations** in the right dock; output goes to
    `<file>.annotations.json` next to the ND2.
 
-Schema is documented in [src/nikon_control/annotate.py](src/nikon_control/annotate.py).
-Bounding boxes only (no masks). Annotate sparsely across time — first /
-middle / last frame is usually enough; nearby frames are redundant.
+Schema documented in [src/nikon_control/annotate.py](src/nikon_control/annotate.py).
+Bounding boxes only (no masks). Each annotation has optional `t_start` and
+`t_end` recording the cell's lifecycle; defaults mean "alive the whole
+recording".
+
+### Training-format export (planned, not built)
+
+Training frameworks (Ultralytics YOLO, Detectron2, mmdetection) want
+images on disk with sidecar annotations, not raw ND2s. When we have
+enough annotated data we'll add `nikon-control-export`, which reads
+`.annotations.json` files and dumps either:
+
+- **Full-frame TIFFs** with per-frame bboxes in COCO JSON (for detectors).
+- **Per-cell crops** at a fixed size (for classifiers).
+
+Not built yet — format depends on which trainer we land on. Tell me when
+you're close to needing it.
 
 For multi-user deployment on a Windows server (RDP install, shared venv,
 launcher batch file, troubleshooting), see

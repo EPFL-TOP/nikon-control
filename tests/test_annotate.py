@@ -1,4 +1,4 @@
-from pathlib import Path
+import json
 
 from nikon_control.annotate import (
     Annotation,
@@ -20,8 +20,10 @@ def test_save_load_roundtrip(tmp_path):
         channels=["BF", "GFP", "DAPI"],
         annotator="ch",
         annotations=[
-            Annotation(t=5, z=0, bbox=[10.0, 20.0, 100.0, 200.0], label="single"),
-            Annotation(t=5, z=0, bbox=[300.0, 400.0, 380.0, 480.0], label="doublet"),
+            Annotation(bbox=[10.0, 20.0, 100.0, 200.0], label="single"),
+            Annotation(
+                bbox=[300.0, 400.0, 380.0, 480.0], label="doublet", t_end=42
+            ),
         ],
     )
     p = tmp_path / "x.annotations.json"
@@ -30,41 +32,51 @@ def test_save_load_roundtrip(tmp_path):
 
     assert loaded.schema_version == SCHEMA_VERSION
     assert loaded.source == af.source
-    assert loaded.image_shape == af.image_shape
-    assert loaded.axes == af.axes
-    assert loaded.channels == af.channels
     assert loaded.classes == list(DEFAULT_CLASSES)
     assert len(loaded.annotations) == 2
     assert loaded.annotations[0].bbox == [10.0, 20.0, 100.0, 200.0]
-    assert loaded.annotations[0].label == "single"
+    assert loaded.annotations[0].t_start == 0
+    assert loaded.annotations[0].t_end is None
     assert loaded.annotations[1].label == "doublet"
+    assert loaded.annotations[1].t_end == 42
 
 
-def test_bbox_shape_roundtrip_with_time():
-    axes = ["T", "Y", "X"]
-    shape = _bbox_to_shape(t=7, z=0, bbox=[10.0, 20.0, 100.0, 200.0], axes=axes)
-    assert len(shape) == 4  # 4 vertices
-    assert all(len(v) == 3 for v in shape)  # 3 dims each
-
-    t, z, bbox = _shape_to_bbox(shape, axes)
-    assert t == 7
-    assert z == 0
-    assert bbox == [10.0, 20.0, 100.0, 200.0]
+def test_bbox_shape_roundtrip():
+    shape = _bbox_to_shape([10.0, 20.0, 100.0, 200.0])
+    assert len(shape) == 4
+    assert all(len(v) == 2 for v in shape)
+    assert _shape_to_bbox(shape) == [10.0, 20.0, 100.0, 200.0]
 
 
-def test_bbox_shape_roundtrip_with_time_and_z():
-    axes = ["T", "Z", "Y", "X"]
-    shape = _bbox_to_shape(t=3, z=2, bbox=[5.0, 15.0, 50.0, 150.0], axes=axes)
-    t, z, bbox = _shape_to_bbox(shape, axes)
-    assert t == 3
-    assert z == 2
-    assert bbox == [5.0, 15.0, 50.0, 150.0]
+def test_load_migrates_v0_1(tmp_path):
+    payload = {
+        "schema_version": "0.1",
+        "source": "/some/path.nd2",
+        "image_shape": [60, 3, 1024, 1024],
+        "axes": ["T", "C", "Y", "X"],
+        "channels": ["BF"],
+        "classes": ["single", "doublet"],
+        "annotator": "",
+        "annotations": [
+            {
+                "t": 5,
+                "z": 0,
+                "bbox": [10.0, 20.0, 100.0, 200.0],
+                "label": "single",
+                "notes": "",
+                "created": "2026-05-18T14:00:00",
+            }
+        ],
+    }
+    p = tmp_path / "old.annotations.json"
+    p.write_text(json.dumps(payload))
 
+    loaded = load(p)
 
-def test_bbox_shape_roundtrip_2d_only():
-    axes = ["Y", "X"]
-    shape = _bbox_to_shape(t=0, z=0, bbox=[1.0, 2.0, 3.0, 4.0], axes=axes)
-    t, z, bbox = _shape_to_bbox(shape, axes)
-    assert t == 0
-    assert z == 0
-    assert bbox == [1.0, 2.0, 3.0, 4.0]
+    assert loaded.schema_version == SCHEMA_VERSION
+    assert len(loaded.annotations) == 1
+    a = loaded.annotations[0]
+    assert a.bbox == [10.0, 20.0, 100.0, 200.0]
+    assert a.t_start == 0
+    assert a.t_end is None
+    assert not hasattr(a, "t")

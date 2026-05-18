@@ -10,29 +10,37 @@ CLI:
     nikon-control-annotate path/to/file.nd2 -o some/annotations.json
     nikon-control-annotate path/to/file.nd2 --classes single doublet dividing
 
-The schema is documented at the bottom of this module's docstring.
+Lifecycle model: each bbox is **persistent across the whole recording** by
+default (cells don't move much, no need to redraw per frame). If a cell
+dies, select its bbox and click "Mark death of selected at current T" — the
+bbox's `t_end` is set to that frame, recording the cell's last alive frame.
 
-Schema (stable, version 0.1):
+Schema (stable, version 0.2):
 
     {
-        "schema_version": "0.1",
+        "schema_version": "0.2",
         "source": "<path to nd2>",
-        "image_shape": [...],          # ND2 shape, e.g. [60, 3, 1024, 1024]
-        "axes": ["T", "C", "Y", "X"],  # axis order matching image_shape
+        "image_shape": [...],
+        "axes": ["T", "C", "Y", "X"],
         "channels": ["BF", "GFP", ...],
         "classes": ["single", "doublet", "debris"],
         "annotator": "",
         "annotations": [
             {
-                "t": 0, "z": 0,
-                "bbox": [y0, x0, y1, x1],   # pixel coords, y/x order
+                "bbox": [y0, x0, y1, x1],
                 "label": "single",
+                "t_start": 0,
+                "t_end": null,            # null = alive until end of recording
+                "z": 0,
                 "notes": "",
                 "created": "2026-05-18T14:00:00"
             },
             ...
         ]
     }
+
+v0.1 files (with a per-annotation ``t`` field) are auto-migrated on load:
+``t`` is dropped, the annotation is treated as alive for the whole recording.
 """
 from __future__ import annotations
 
@@ -41,17 +49,19 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-SCHEMA_VERSION = "0.1"
+SCHEMA_VERSION = "0.2"
 DEFAULT_CLASSES: tuple[str, ...] = ("single", "doublet", "debris")
 _LAYER_COLORS = ("red", "yellow", "cyan", "magenta", "lime")
+_NO_DEATH = -1  # sentinel stored in napari properties for "alive until end"
 
 
 @dataclass
 class Annotation:
-    t: int
-    z: int
     bbox: list[float]  # [y0, x0, y1, x1]
     label: str
+    t_start: int = 0
+    t_end: int | None = None
+    z: int = 0
     notes: str = ""
     created: str = field(
         default_factory=lambda: datetime.now().isoformat(timespec="seconds")
@@ -72,49 +82,43 @@ class AnnotationFile:
 
 def save(ann: AnnotationFile, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    ann.schema_version = SCHEMA_VERSION
     payload = asdict(ann)
     payload["annotations"] = [asdict(a) for a in ann.annotations]
     path.write_text(json.dumps(payload, indent=2))
 
 
+def _upgrade_annotation(a: dict) -> dict:
+    """Migrate per-annotation dict from any older schema to v0.2."""
+    a.pop("t", None)  # v0.1 had a single per-frame t; we no longer track it
+    a.setdefault("t_start", 0)
+    a.setdefault("t_end", None)
+    return a
+
+
 def load(path: Path) -> AnnotationFile:
     payload = json.loads(path.read_text())
     raw_anns = payload.pop("annotations", [])
+    payload["schema_version"] = SCHEMA_VERSION
     af = AnnotationFile(**payload)
-    af.annotations = [Annotation(**a) for a in raw_anns]
+    af.annotations = [Annotation(**_upgrade_annotation(a)) for a in raw_anns]
     return af
 
 
-def _shape_to_bbox(
-    rect, axes: list[str]
-) -> tuple[int, int, list[float]]:
-    """Extract (t, z, bbox=[y0,x0,y1,x1]) from a napari rectangle vertex array."""
+def _shape_to_bbox(rect) -> list[float]:
+    """Extract bbox=[y0,x0,y1,x1] from a 2D napari rectangle (4 vertices, 2D)."""
     import numpy as np
 
     rect = np.asarray(rect)
-    yi = axes.index("Y")
-    xi = axes.index("X")
-    t = int(round(float(rect[0, axes.index("T")]))) if "T" in axes else 0
-    z = int(round(float(rect[0, axes.index("Z")]))) if "Z" in axes else 0
-    ys = rect[:, yi]
-    xs = rect[:, xi]
-    return t, z, [float(ys.min()), float(xs.min()), float(ys.max()), float(xs.max())]
+    ys = rect[:, -2]
+    xs = rect[:, -1]
+    return [float(ys.min()), float(xs.min()), float(ys.max()), float(xs.max())]
 
 
-def _bbox_to_shape(t: int, z: int, bbox: list[float], axes: list[str]) -> list[list[float]]:
-    """Build a 4-vertex rectangle in napari's per-axis coordinate order."""
+def _bbox_to_shape(bbox: list[float]) -> list[list[float]]:
+    """Build a 4-vertex 2D rectangle in (y, x) order."""
     y0, x0, y1, x1 = bbox
-    ndim = len(axes)
-    def vertex(y, x):
-        v = [0.0] * ndim
-        if "T" in axes:
-            v[axes.index("T")] = float(t)
-        if "Z" in axes:
-            v[axes.index("Z")] = float(z)
-        v[axes.index("Y")] = float(y)
-        v[axes.index("X")] = float(x)
-        return v
-    return [vertex(y0, x0), vertex(y0, x1), vertex(y1, x1), vertex(y1, x0)]
+    return [[y0, x0], [y0, x1], [y1, x1], [y1, x0]]
 
 
 def open_for_annotation(
@@ -122,14 +126,11 @@ def open_for_annotation(
     json_out: Path | None = None,
     classes: list[str] | None = None,
 ) -> None:
-    """Open an ND2 file in napari and block until the window closes.
-
-    On close (or when the Save button is clicked), annotations are written to
-    `json_out` (default: <nd2>.annotations.json).
-    """
+    """Open an ND2 file in napari and block until the window closes."""
     try:
         import napari
         import nd2 as nd2lib
+        import numpy as np
         from magicgui import magicgui
     except ImportError as exc:
         raise ImportError(
@@ -155,7 +156,7 @@ def open_for_annotation(
     f = nd2lib.ND2File(str(nd2_path))
     try:
         arr = f.to_dask()
-        sizes = f.sizes  # ordered dict like {'T': 60, 'C': 3, 'Y': 1024, 'X': 1024}
+        sizes = f.sizes
         axes = list(sizes.keys())
         state.image_shape = list(arr.shape)
         state.axes = axes
@@ -166,43 +167,78 @@ def open_for_annotation(
         except Exception:
             state.channels = []
         channel_idx = axes.index("C") if "C" in axes else None
-        channel_names = state.channels or None
+        non_channel_axes = [a for a in axes if a != "C"]
+        t_dim_in_viewer = (
+            non_channel_axes.index("T") if "T" in non_channel_axes else None
+        )
 
         viewer = napari.Viewer(title=f"annotate: {nd2_path.name}")
         if channel_idx is not None:
-            viewer.add_image(arr, channel_axis=channel_idx, name=channel_names)
+            viewer.add_image(
+                arr, channel_axis=channel_idx, name=state.channels or None
+            )
         else:
             viewer.add_image(arr, name=nd2_path.stem)
 
-        non_channel_axes = [a for a in axes if a != "C"]
-
         class_layers: dict[str, "napari.layers.Shapes"] = {}
         for i, cls in enumerate(state.classes):
-            existing = [
-                _bbox_to_shape(a.t, a.z, a.bbox, non_channel_axes)
-                for a in state.annotations
-                if a.label == cls
-            ]
-            class_layers[cls] = viewer.add_shapes(
-                existing if existing else None,
+            existing_shapes: list[list[list[float]]] = []
+            existing_t_ends: list[int] = []
+            for a in state.annotations:
+                if a.label == cls:
+                    existing_shapes.append(_bbox_to_shape(a.bbox))
+                    existing_t_ends.append(
+                        a.t_end if a.t_end is not None else _NO_DEATH
+                    )
+            props = {
+                "t_end": np.array(existing_t_ends, dtype=int)
+                if existing_t_ends
+                else np.array([], dtype=int)
+            }
+            layer = viewer.add_shapes(
+                existing_shapes if existing_shapes else None,
                 shape_type="rectangle",
                 edge_color=_LAYER_COLORS[i % len(_LAYER_COLORS)],
                 face_color="transparent",
                 edge_width=2,
                 name=cls,
-                ndim=len(non_channel_axes),
+                ndim=2,
+                properties=props,
             )
+            try:
+                layer.current_properties = {
+                    "t_end": np.array([_NO_DEATH], dtype=int)
+                }
+            except Exception:
+                pass
+            class_layers[cls] = layer
 
         def _collect() -> list[Annotation]:
             out: list[Annotation] = []
             now = datetime.now().isoformat(timespec="seconds")
             for cls, layer in class_layers.items():
-                for rect in layer.data:
-                    t, z, bbox = _shape_to_bbox(rect, non_channel_axes)
+                t_ends = layer.properties.get(
+                    "t_end", np.array([], dtype=int)
+                )
+                for i, rect in enumerate(layer.data):
+                    t_end_raw = int(t_ends[i]) if i < len(t_ends) else _NO_DEATH
+                    t_end = None if t_end_raw < 0 else t_end_raw
                     out.append(
-                        Annotation(t=t, z=z, bbox=bbox, label=cls, created=now)
+                        Annotation(
+                            bbox=_shape_to_bbox(rect),
+                            label=cls,
+                            t_start=0,
+                            t_end=t_end,
+                            created=now,
+                        )
                     )
             return out
+
+        def _active_class_layer():
+            active = viewer.layers.selection.active
+            if active is not None and active.name in class_layers:
+                return active
+            return None
 
         @magicgui(call_button="Save annotations")
         def save_widget() -> None:
@@ -210,7 +246,44 @@ def open_for_annotation(
             save(state, json_out)
             print(f"saved {len(state.annotations)} annotations -> {json_out}")
 
+        @magicgui(call_button="Mark death of selected at current T")
+        def mark_death_widget() -> None:
+            if t_dim_in_viewer is None:
+                print("no time axis in this file; nothing to mark")
+                return
+            layer = _active_class_layer()
+            if layer is None:
+                print("select a class shape layer (e.g. 'single') first")
+                return
+            if not layer.selected_data:
+                print("select one or more shapes first")
+                return
+            current_t = int(viewer.dims.current_step[t_dim_in_viewer])
+            t_ends = layer.properties["t_end"].copy()
+            for i in layer.selected_data:
+                t_ends[i] = current_t
+            layer.properties = {"t_end": t_ends}
+            print(f"marked {len(layer.selected_data)} shape(s) dead at T={current_t}")
+
+        @magicgui(call_button="Clear death of selected")
+        def clear_death_widget() -> None:
+            layer = _active_class_layer()
+            if layer is None or not layer.selected_data:
+                return
+            t_ends = layer.properties["t_end"].copy()
+            for i in layer.selected_data:
+                t_ends[i] = _NO_DEATH
+            layer.properties = {"t_end": t_ends}
+            print(f"cleared death of {len(layer.selected_data)} shape(s)")
+
         viewer.window.add_dock_widget(save_widget, name="Save", area="right")
+        viewer.window.add_dock_widget(
+            mark_death_widget, name="Mark death", area="right"
+        )
+        viewer.window.add_dock_widget(
+            clear_death_widget, name="Clear death", area="right"
+        )
+
         napari.run()
 
         state.annotations = _collect()
