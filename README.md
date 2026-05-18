@@ -16,9 +16,27 @@ interest.
 ## Status
 
 - **Phase 0 (data-path scaffold)**: done — loader, placeholder BF detector,
-  CLI, overlay PNG, tests.
-- **Phase 1 (microscope connection)**: starts as soon as we have access to
-  the scope on the Windows PC. See [Coming up](#coming-up--what-to-verify-on-the-microscope-pc).
+  CLI, overlay PNG, `jobs_log` helper, tests.
+- **Phase 1 (microscope connection)**: *paused*. The
+  [capability-discovery snippet](jobs/README.md) is ready to paste into a
+  JOBS Python task on the next microscope visit; its output unblocks the
+  first real microscope-control module.
+- **Current focus (May 2026)**: two upstream workstreams opened in parallel,
+  both runnable off-microscope on the Mac:
+  - **Cross-calibration of 4×/10×/40× objectives** — they are not
+    parcentric; switching mag shifts the FOV centre. Plan: a physical
+    calibration target + a JOBS macro that derives per-objective XY
+    offsets. Without this, the 40× tile placement from a 10×-detected cell
+    list is systematically misaligned, so it's a prerequisite for the tile
+    planner.
+  - **Cell detector at 4× / 10× with annotation dashboard** — a 4× scan
+    takes under a minute; if we can detect ~90 % of cells at low mag, the
+    40× tile planner has a real input. Detector must distinguish single
+    cells from doublets, with the category list left extensible.
+    Annotation dashboard (likely napari-based) on existing 40× ND2 data is
+    the first concrete step.
+
+The 4-phase roadmap below is still the destination; these two tracks feed it.
 
 ## Quick start (Mac, dev)
 
@@ -31,6 +49,45 @@ pytest
 ```
 
 The `nd2` extra is optional — omit it if you only have `.tif` test images.
+
+## Annotation tool
+
+To label cells in ND2 files for detector training:
+
+```sh
+pip install -e '.[annotate]'
+nikon-control-annotate path/to/file.nd2
+nikon-control-annotate path/to/file.nd2 --classes single doublet dividing
+```
+
+Opens the file in napari. One shape layer per class, colour-coded
+(red `single`, yellow `doublet`, cyan `debris`). To label a cell:
+
+1. Select the class layer (clicking its name in the layer list).
+2. Pick the rectangle tool, draw around the cell.
+3. Move through time with the T slider; new boxes are pinned to the
+   active timepoint.
+4. Click **Save annotations** in the right dock; output goes to
+   `<file>.annotations.json` next to the ND2.
+
+Schema is documented in [src/nikon_control/annotate.py](src/nikon_control/annotate.py).
+Bounding boxes only (no masks). Annotate sparsely across time — first /
+middle / last frame is usually enough; nearby frames are redundant.
+
+For multi-user deployment on a Windows server (RDP install, shared venv,
+launcher batch file, troubleshooting), see
+[docs/windows-deploy.md](docs/windows-deploy.md).
+
+## Design proposals (awaiting sign-off)
+
+- [Calibration approach](docs/calibration.md) — image-content registration
+  via phase correlation, no physical probe. Implemented as a JOBS Python
+  task; produces a `calibration.json` with the (Δx, Δy) parcentric offsets
+  between 4×/10×/40×.
+- [Experimental sessions](docs/experimental-sessions.md) — three session
+  types (bulk 40× collection, multi-mag annotation seed, periodic
+  calibration check) and the plan for propagating 40× annotations to 10×
+  and 4× image space.
 
 ## The experiment we want to automate
 

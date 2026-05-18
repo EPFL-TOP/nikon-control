@@ -12,10 +12,16 @@ dependencies = [
 
 [project.optional-dependencies]
 nd2 = ["nd2>=0.10"]
+annotate = [
+  "nd2>=0.10",
+  "napari[all]>=0.4.18",
+  "magicgui>=0.7",
+]
 dev = ["pytest>=7"]
 
 [project.scripts]
 nikon-control = "nikon_control.cli:main"
+nikon-control-annotate = "nikon_control.annotate:main"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]
