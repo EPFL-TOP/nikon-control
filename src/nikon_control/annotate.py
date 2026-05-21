@@ -121,6 +121,11 @@ def _bbox_to_shape(bbox: list[float]) -> list[list[float]]:
     return [[y0, x0], [y0, x1], [y1, x1], [y1, x0]]
 
 
+def _death_label(t_end: int) -> str:
+    """Text shown above marked-dead bboxes inside napari."""
+    return "" if t_end < 0 else f"† T={t_end}"
+
+
 def open_for_annotation(
     nd2_path: Path,
     json_out: Path | None = None,
@@ -191,9 +196,10 @@ def open_for_annotation(
                         a.t_end if a.t_end is not None else _NO_DEATH
                     )
             props = {
-                "t_end": np.array(existing_t_ends, dtype=int)
-                if existing_t_ends
-                else np.array([], dtype=int)
+                "t_end": np.array(existing_t_ends or [], dtype=int),
+                "death_label": np.array(
+                    [_death_label(t) for t in existing_t_ends], dtype=object
+                ),
             }
             layer = viewer.add_shapes(
                 existing_shapes if existing_shapes else None,
@@ -204,10 +210,18 @@ def open_for_annotation(
                 name=cls,
                 ndim=2,
                 properties=props,
+                text={
+                    "string": "{death_label}",
+                    "size": 12,
+                    "color": _LAYER_COLORS[i % len(_LAYER_COLORS)],
+                    "anchor": "upper_left",
+                    "translation": [-12, 0],
+                },
             )
             try:
                 layer.current_properties = {
-                    "t_end": np.array([_NO_DEATH], dtype=int)
+                    "t_end": np.array([_NO_DEATH], dtype=int),
+                    "death_label": np.array([""], dtype=object),
                 }
             except Exception:
                 pass
@@ -240,41 +254,85 @@ def open_for_annotation(
                 return active
             return None
 
+        def _report(msg: str) -> None:
+            """Show a message in the napari status bar AND stdout."""
+            viewer.status = msg
+            print(msg)
+
+        def _apply_t_end(layer, indices: list[int], value: int) -> bool:
+            """Write `value` into the t_end property at `indices`. Return True
+            if the write was persisted (verified by read-back)."""
+            t_ends = layer.properties["t_end"].copy()
+            labels = layer.properties["death_label"].copy()
+            for i in indices:
+                t_ends[i] = value
+                labels[i] = _death_label(value)
+            new_props = dict(layer.properties)
+            new_props["t_end"] = t_ends
+            new_props["death_label"] = labels
+            layer.properties = new_props
+            layer.refresh()
+            read_back = layer.properties["t_end"]
+            return all(int(read_back[i]) == value for i in indices)
+
         @magicgui(call_button="Save annotations")
         def save_widget() -> None:
             state.annotations = _collect()
             save(state, json_out)
-            print(f"saved {len(state.annotations)} annotations -> {json_out}")
+            n_dead = sum(1 for a in state.annotations if a.t_end is not None)
+            _report(
+                f"saved {len(state.annotations)} annotations "
+                f"({n_dead} with death marked) -> {json_out}"
+            )
 
         @magicgui(call_button="Mark death of selected at current T")
         def mark_death_widget() -> None:
             if t_dim_in_viewer is None:
-                print("no time axis in this file; nothing to mark")
+                _report("this file has no time axis; nothing to mark")
                 return
             layer = _active_class_layer()
             if layer is None:
-                print("select a class shape layer (e.g. 'single') first")
+                _report(
+                    "first click a class shape layer (single/doublet/...) "
+                    "in the left layer list"
+                )
                 return
             if not layer.selected_data:
-                print("select one or more shapes first")
+                _report(
+                    "no shape selected. Switch to the 'select shapes' tool "
+                    "(arrow icon in the layer toolbar), click a rectangle, "
+                    "then click this button."
+                )
                 return
             current_t = int(viewer.dims.current_step[t_dim_in_viewer])
-            t_ends = layer.properties["t_end"].copy()
-            for i in layer.selected_data:
-                t_ends[i] = current_t
-            layer.properties = {"t_end": t_ends}
-            print(f"marked {len(layer.selected_data)} shape(s) dead at T={current_t}")
+            indices = list(layer.selected_data)
+            ok = _apply_t_end(layer, indices, current_t)
+            if not ok:
+                _report(
+                    "WARNING: death mark did NOT persist on read-back. "
+                    "Please report this with your napari version."
+                )
+                return
+            _report(
+                f"marked {len(indices)} shape(s) in '{layer.name}' "
+                f"as dead at T={current_t}"
+            )
 
         @magicgui(call_button="Clear death of selected")
         def clear_death_widget() -> None:
             layer = _active_class_layer()
-            if layer is None or not layer.selected_data:
+            if layer is None:
+                _report("first click a class shape layer in the layer list")
                 return
-            t_ends = layer.properties["t_end"].copy()
-            for i in layer.selected_data:
-                t_ends[i] = _NO_DEATH
-            layer.properties = {"t_end": t_ends}
-            print(f"cleared death of {len(layer.selected_data)} shape(s)")
+            if not layer.selected_data:
+                _report("no shape selected; use the 'select shapes' tool")
+                return
+            indices = list(layer.selected_data)
+            ok = _apply_t_end(layer, indices, _NO_DEATH)
+            if not ok:
+                _report("WARNING: clear-death did NOT persist on read-back.")
+                return
+            _report(f"cleared death of {len(indices)} shape(s) in '{layer.name}'")
 
         viewer.window.add_dock_widget(save_widget, name="Save", area="right")
         viewer.window.add_dock_widget(

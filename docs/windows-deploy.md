@@ -9,9 +9,15 @@ the annotation tool against ND2 files on a shared drive.
 - Python **3.11** (recommended) or 3.12.
   - **Avoid 3.13** on Windows for now — some of napari's transitive
     dependencies still lag on 3.13 wheels.
+  - **Must be installed for all users**, not per-user. A per-user Python
+    (default location: `C:\Users\<you>\AppData\Local\...`) is not readable
+    by other Windows users due to ACLs on `AppData\Local`, so a venv
+    created from it will fail for every other annotator with
+    `No Python at '"C:\Users\<you>\AppData\...'`.
   - Install from <https://www.python.org/downloads/windows/> with
-    "Add Python to PATH" ticked, or via Miniconda
-    (<https://docs.conda.io/projects/miniconda/>).
+    **"Install Python 3.11 for all users"** TICKED, or install Miniconda
+    "for all users" so it lands in `C:\ProgramData\miniconda3\` instead of
+    `C:\Users\<you>\AppData\`.
 - Git for Windows: <https://git-scm.com/download/win>.
 - Microsoft Visual C++ Redistributable (usually preinstalled; needed by
   some scientific wheels).
@@ -116,6 +122,20 @@ pip install -e ".[annotate]"   # only needed if dependencies changed
 ```
 
 ## Common issues
+
+- **`No Python at '"C:\Users\<owner>\AppData\Local\...\python.exe'`** when
+  another user tries to launch: the venv was created from a per-user
+  Python install. Re-do prerequisites with a system-wide Python (see
+  Prerequisites), then recreate the venv:
+
+  ```powershell
+  cd C:\Tools\nikon-control
+  Remove-Item -Recurse -Force .venv
+  py -3.11 -m venv .venv
+  .\.venv\Scripts\Activate.ps1
+  python -m pip install --upgrade pip
+  pip install -e ".[annotate]"
+  ```
 
 - **`Activate.ps1` blocked**: see `Set-ExecutionPolicy` line above.
 - **`napari` opens but is black / OpenGL errors**: rare on real GPUs;

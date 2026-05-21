@@ -61,16 +61,37 @@ nikon-control-annotate path/to/file.nd2 --classes single doublet dividing
 ```
 
 Opens the file in napari. One shape layer per class, colour-coded
-(red `single`, yellow `doublet`, cyan `debris`). To label a cell:
+(red `single`, yellow `doublet`, cyan `debris`).
 
-1. Select the class layer (clicking its name in the layer list).
-2. Pick the rectangle tool, draw around the cell. The bbox is visible at
-   **every timepoint** — cells don't move much, no need to redraw.
-3. If a cell dies: navigate to the last alive frame on the T slider,
-   select the cell's bbox, click **Mark death of selected at current T**
-   in the right dock. The bbox's `t_end` is recorded.
-4. Click **Save annotations** in the right dock; output goes to
-   `<file>.annotations.json` next to the ND2.
+**To draw boxes:**
+
+1. Click the class name in the **layer list on the left** (e.g. `single`)
+   to make that layer active.
+2. In the **layer toolbar** (small icons that appeared above the layer
+   list), pick the **rectangle tool**.
+3. Draw around each cell. The bbox is visible at every timepoint — cells
+   don't move much, no need to redraw.
+
+**To mark a cell as dead:**
+
+1. Scrub the T slider to the frame where the cell dies.
+2. **Switch the layer toolbar from the rectangle tool to the *select
+   shapes* tool** (arrow icon, second from the left). This is the step
+   most users miss — leaving the rectangle tool active means clicking on
+   a box draws a new one instead of selecting it.
+3. Click the box of the dead cell — it gets a selection highlight.
+4. Click **Mark death of selected at current T** in the right dock.
+5. A `† T=<frame>` label appears above the box, and a confirmation shows
+   in napari's status bar (bottom of the window). If you ever see
+   "WARNING: death mark did NOT persist", something is wrong with the
+   napari version on that machine — tell me.
+
+**To clear a death mark** (cell turned out to be alive): same select-tool
+flow, click the box, click **Clear death of selected**.
+
+**To save:** click **Save annotations** in the right dock. Output is
+`<file>.annotations.json` next to the ND2. The status bar reports how
+many annotations were saved and how many have a death marked.
 
 Schema documented in [src/nikon_control/annotate.py](src/nikon_control/annotate.py).
 Bounding boxes only (no masks). Each annotation has optional `t_start` and
