@@ -6,6 +6,7 @@ from nikon_control.annotate import (
     DEFAULT_CLASSES,
     SCHEMA_VERSION,
     _bbox_to_shape,
+    _life_label,
     _shape_to_bbox,
     load,
     save,
@@ -39,6 +40,13 @@ def test_save_load_roundtrip(tmp_path):
     assert loaded.annotations[0].t_end is None
     assert loaded.annotations[1].label == "doublet"
     assert loaded.annotations[1].t_end == 42
+
+
+def test_life_label_combinations():
+    assert _life_label(0, -1) == ""
+    assert _life_label(5, -1) == "↑T=5"
+    assert _life_label(0, 42) == "†T=42"
+    assert _life_label(5, 42) == "↑T=5 †T=42"
 
 
 def test_bbox_shape_roundtrip():

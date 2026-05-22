@@ -72,22 +72,34 @@ Opens the file in napari. One shape layer per class, colour-coded
 3. Draw around each cell. The bbox is visible at every timepoint — cells
    don't move much, no need to redraw.
 
-**To mark a cell as dead:**
+**To mark a cell as born partway through** (appears mid-recording):
 
-1. Scrub the T slider to the frame where the cell dies.
+1. Scrub the T slider to the frame the cell first appears.
 2. **Switch the layer toolbar from the rectangle tool to the *select
    shapes* tool** (arrow icon, second from the left). This is the step
    most users miss — leaving the rectangle tool active means clicking on
    a box draws a new one instead of selecting it.
-3. Click the box of the dead cell — it gets a selection highlight.
-4. Click **Mark death of selected at current T** in the right dock.
-5. A `† T=<frame>` label appears above the box, and a confirmation shows
-   in napari's status bar (bottom of the window). If you ever see
-   "WARNING: death mark did NOT persist", something is wrong with the
-   napari version on that machine — tell me.
+3. Click the box of that cell.
+4. Click **Mark birth of selected at current T** in the right dock.
+5. A `↑T=<frame>` label appears above the box and the box dims to 25 %
+   opacity on frames before that T.
 
-**To clear a death mark** (cell turned out to be alive): same select-tool
-flow, click the box, click **Clear death of selected**.
+**To mark a cell as dead:**
+
+1. Scrub the T slider to the frame where the cell dies.
+2. Switch to the select-shapes tool, click the box.
+3. Click **Mark death of selected at current T**.
+4. A `†T=<frame>` label appears, and the box dims on frames after that T.
+
+If a cell both appears late and dies later, both markers show:
+`↑T=5 †T=42`.
+
+**To clear a mark**: same select-tool flow, click the box, click
+**Clear birth of selected** (resets `t_start` to 0) or
+**Clear death of selected** (resets `t_end` to unset).
+
+If you ever see "WARNING: ... did NOT persist", the napari install is
+misbehaving — tell me with the napari version.
 
 **To save:** click **Save annotations** in the right dock. Output is
 `<file>.annotations.json` next to the ND2. The status bar reports how

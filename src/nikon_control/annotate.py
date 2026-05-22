@@ -11,9 +11,19 @@ CLI:
     nikon-control-annotate path/to/file.nd2 --classes single doublet dividing
 
 Lifecycle model: each bbox is **persistent across the whole recording** by
-default (cells don't move much, no need to redraw per frame). If a cell
-dies, select its bbox and click "Mark death of selected at current T" — the
-bbox's `t_end` is set to that frame, recording the cell's last alive frame.
+default (cells don't move much, no need to redraw per frame). The bbox is
+considered alive on every frame ``t`` with ``t_start <= t <= t_end`` (where
+``t_end`` defaults to "end of recording" if not set).
+
+- If a cell **appears** partway through (mitosis, drifts in, etc.), select
+  its bbox at the frame of appearance and click "Mark birth of selected at
+  current T". Its ``t_start`` is recorded.
+- If a cell **dies**, select its bbox at the last alive frame and click
+  "Mark death of selected at current T". Its ``t_end`` is recorded.
+
+Shapes outside their alive range are dimmed (25 % opacity) so the user can
+still see them spatially while making clear they aren't "alive" at the
+current T.
 
 Schema (stable, version 0.2):
 
@@ -121,9 +131,14 @@ def _bbox_to_shape(bbox: list[float]) -> list[list[float]]:
     return [[y0, x0], [y0, x1], [y1, x1], [y1, x0]]
 
 
-def _death_label(t_end: int) -> str:
-    """Text shown above marked-dead bboxes inside napari."""
-    return "" if t_end < 0 else f"† T={t_end}"
+def _life_label(t_start: int, t_end: int) -> str:
+    """Text shown above bboxes inside napari — birth and/or death markers."""
+    parts = []
+    if t_start > 0:
+        parts.append(f"↑T={t_start}")
+    if t_end >= 0:
+        parts.append(f"†T={t_end}")
+    return " ".join(parts)
 
 
 def open_for_annotation(
@@ -137,6 +152,7 @@ def open_for_annotation(
         import nd2 as nd2lib
         import numpy as np
         from magicgui import magicgui
+        from matplotlib.colors import to_rgba
     except ImportError as exc:
         raise ImportError(
             "Annotation requires the 'annotate' extra: "
@@ -185,63 +201,116 @@ def open_for_annotation(
         else:
             viewer.add_image(arr, name=nd2_path.stem)
 
+        class_colors: dict[str, str] = {
+            cls: _LAYER_COLORS[i % len(_LAYER_COLORS)]
+            for i, cls in enumerate(state.classes)
+        }
         class_layers: dict[str, "napari.layers.Shapes"] = {}
-        for i, cls in enumerate(state.classes):
+        for cls, base_color in class_colors.items():
             existing_shapes: list[list[list[float]]] = []
+            existing_t_starts: list[int] = []
             existing_t_ends: list[int] = []
             for a in state.annotations:
                 if a.label == cls:
                     existing_shapes.append(_bbox_to_shape(a.bbox))
+                    existing_t_starts.append(a.t_start)
                     existing_t_ends.append(
                         a.t_end if a.t_end is not None else _NO_DEATH
                     )
             props = {
+                "t_start": np.array(existing_t_starts or [], dtype=int),
                 "t_end": np.array(existing_t_ends or [], dtype=int),
-                "death_label": np.array(
-                    [_death_label(t) for t in existing_t_ends], dtype=object
+                "life_label": np.array(
+                    [
+                        _life_label(s, e)
+                        for s, e in zip(existing_t_starts, existing_t_ends)
+                    ],
+                    dtype=object,
                 ),
             }
             layer = viewer.add_shapes(
                 existing_shapes if existing_shapes else None,
                 shape_type="rectangle",
-                edge_color=_LAYER_COLORS[i % len(_LAYER_COLORS)],
+                edge_color=base_color,
                 face_color="transparent",
                 edge_width=2,
                 name=cls,
                 ndim=2,
                 properties=props,
                 text={
-                    "string": "{death_label}",
+                    "string": "{life_label}",
                     "size": 12,
-                    "color": _LAYER_COLORS[i % len(_LAYER_COLORS)],
+                    "color": base_color,
                     "anchor": "upper_left",
                     "translation": [-12, 0],
                 },
             )
             try:
                 layer.current_properties = {
+                    "t_start": np.array([0], dtype=int),
                     "t_end": np.array([_NO_DEATH], dtype=int),
-                    "death_label": np.array([""], dtype=object),
+                    "life_label": np.array([""], dtype=object),
                 }
             except Exception:
                 pass
             class_layers[cls] = layer
 
+        def _refresh_one_layer(layer) -> None:
+            """Dim shapes whose lifecycle excludes the current T."""
+            n = len(layer.data)
+            if n == 0:
+                return
+            current_t = (
+                int(viewer.dims.current_step[t_dim_in_viewer])
+                if t_dim_in_viewer is not None
+                else 0
+            )
+            t_starts = layer.properties.get(
+                "t_start", np.zeros(n, dtype=int)
+            )
+            t_ends = layer.properties.get(
+                "t_end", np.full(n, _NO_DEATH, dtype=int)
+            )
+            base = class_colors.get(layer.name, "red")
+            colors = np.zeros((n, 4))
+            for i in range(n):
+                ts = int(t_starts[i]) if i < len(t_starts) else 0
+                te = int(t_ends[i]) if i < len(t_ends) else _NO_DEATH
+                alive_end = te if te >= 0 else 10**9
+                alpha = 1.0 if ts <= current_t <= alive_end else 0.25
+                colors[i] = to_rgba(base, alpha=alpha)
+            layer.edge_color = colors
+
+        def _refresh_all_layers(event=None) -> None:
+            for layer in class_layers.values():
+                _refresh_one_layer(layer)
+
+        viewer.dims.events.current_step.connect(_refresh_all_layers)
+        for _layer in class_layers.values():
+            _layer.events.data.connect(
+                lambda e=None, l=_layer: _refresh_one_layer(l)
+            )
+        _refresh_all_layers()
+
         def _collect() -> list[Annotation]:
             out: list[Annotation] = []
             now = datetime.now().isoformat(timespec="seconds")
             for cls, layer in class_layers.items():
+                t_starts = layer.properties.get(
+                    "t_start", np.array([], dtype=int)
+                )
                 t_ends = layer.properties.get(
                     "t_end", np.array([], dtype=int)
                 )
                 for i, rect in enumerate(layer.data):
+                    t_start = int(t_starts[i]) if i < len(t_starts) else 0
                     t_end_raw = int(t_ends[i]) if i < len(t_ends) else _NO_DEATH
                     t_end = None if t_end_raw < 0 else t_end_raw
                     out.append(
                         Annotation(
                             bbox=_shape_to_bbox(rect),
                             label=cls,
-                            t_start=0,
+                            t_start=t_start,
                             t_end=t_end,
                             created=now,
                         )
@@ -259,30 +328,90 @@ def open_for_annotation(
             viewer.status = msg
             print(msg)
 
-        def _apply_t_end(layer, indices: list[int], value: int) -> bool:
-            """Write `value` into the t_end property at `indices`. Return True
-            if the write was persisted (verified by read-back)."""
-            t_ends = layer.properties["t_end"].copy()
-            labels = layer.properties["death_label"].copy()
+        def _apply_lifecycle(
+            layer, indices: list[int], field: str, value: int
+        ) -> bool:
+            """Write `value` into the `field` property at `indices`.
+
+            `field` is either ``"t_start"`` or ``"t_end"``. Returns True if the
+            write was persisted (verified by read-back).
+            """
+            arr = layer.properties[field].copy()
             for i in indices:
-                t_ends[i] = value
-                labels[i] = _death_label(value)
+                arr[i] = value
             new_props = dict(layer.properties)
-            new_props["t_end"] = t_ends
-            new_props["death_label"] = labels
+            new_props[field] = arr
+            t_starts = new_props["t_start"]
+            t_ends = new_props["t_end"]
+            new_props["life_label"] = np.array(
+                [
+                    _life_label(int(t_starts[i]), int(t_ends[i]))
+                    for i in range(len(arr))
+                ],
+                dtype=object,
+            )
             layer.properties = new_props
             layer.refresh()
-            read_back = layer.properties["t_end"]
+            _refresh_one_layer(layer)
+            read_back = layer.properties[field]
             return all(int(read_back[i]) == value for i in indices)
+
+        def _require_selection(action_name: str):
+            layer = _active_class_layer()
+            if layer is None:
+                _report(
+                    "first click a class shape layer "
+                    "(single/doublet/...) in the layer list"
+                )
+                return None, None
+            if not layer.selected_data:
+                _report(
+                    f"no shape selected. To {action_name}: switch to the "
+                    "'select shapes' tool (arrow icon in the layer toolbar), "
+                    "click a rectangle, then click this button."
+                )
+                return None, None
+            return layer, list(layer.selected_data)
 
         @magicgui(call_button="Save annotations")
         def save_widget() -> None:
             state.annotations = _collect()
             save(state, json_out)
             n_dead = sum(1 for a in state.annotations if a.t_end is not None)
+            n_born_late = sum(1 for a in state.annotations if a.t_start > 0)
             _report(
                 f"saved {len(state.annotations)} annotations "
-                f"({n_dead} with death marked) -> {json_out}"
+                f"({n_born_late} with birth, {n_dead} with death) -> {json_out}"
+            )
+
+        @magicgui(call_button="Mark birth of selected at current T")
+        def mark_birth_widget() -> None:
+            if t_dim_in_viewer is None:
+                _report("this file has no time axis; nothing to mark")
+                return
+            layer, indices = _require_selection("mark birth")
+            if layer is None:
+                return
+            current_t = int(viewer.dims.current_step[t_dim_in_viewer])
+            if not _apply_lifecycle(layer, indices, "t_start", current_t):
+                _report("WARNING: birth mark did NOT persist on read-back.")
+                return
+            _report(
+                f"marked {len(indices)} shape(s) in '{layer.name}' "
+                f"as born at T={current_t}"
+            )
+
+        @magicgui(call_button="Clear birth of selected (reset to T=0)")
+        def clear_birth_widget() -> None:
+            layer, indices = _require_selection("clear birth")
+            if layer is None:
+                return
+            if not _apply_lifecycle(layer, indices, "t_start", 0):
+                _report("WARNING: clear-birth did NOT persist on read-back.")
+                return
+            _report(
+                f"reset birth to T=0 for {len(indices)} shape(s) "
+                f"in '{layer.name}'"
             )
 
         @magicgui(call_button="Mark death of selected at current T")
@@ -290,28 +419,12 @@ def open_for_annotation(
             if t_dim_in_viewer is None:
                 _report("this file has no time axis; nothing to mark")
                 return
-            layer = _active_class_layer()
+            layer, indices = _require_selection("mark death")
             if layer is None:
-                _report(
-                    "first click a class shape layer (single/doublet/...) "
-                    "in the left layer list"
-                )
-                return
-            if not layer.selected_data:
-                _report(
-                    "no shape selected. Switch to the 'select shapes' tool "
-                    "(arrow icon in the layer toolbar), click a rectangle, "
-                    "then click this button."
-                )
                 return
             current_t = int(viewer.dims.current_step[t_dim_in_viewer])
-            indices = list(layer.selected_data)
-            ok = _apply_t_end(layer, indices, current_t)
-            if not ok:
-                _report(
-                    "WARNING: death mark did NOT persist on read-back. "
-                    "Please report this with your napari version."
-                )
+            if not _apply_lifecycle(layer, indices, "t_end", current_t):
+                _report("WARNING: death mark did NOT persist on read-back.")
                 return
             _report(
                 f"marked {len(indices)} shape(s) in '{layer.name}' "
@@ -320,21 +433,23 @@ def open_for_annotation(
 
         @magicgui(call_button="Clear death of selected")
         def clear_death_widget() -> None:
-            layer = _active_class_layer()
+            layer, indices = _require_selection("clear death")
             if layer is None:
-                _report("first click a class shape layer in the layer list")
                 return
-            if not layer.selected_data:
-                _report("no shape selected; use the 'select shapes' tool")
-                return
-            indices = list(layer.selected_data)
-            ok = _apply_t_end(layer, indices, _NO_DEATH)
-            if not ok:
+            if not _apply_lifecycle(layer, indices, "t_end", _NO_DEATH):
                 _report("WARNING: clear-death did NOT persist on read-back.")
                 return
-            _report(f"cleared death of {len(indices)} shape(s) in '{layer.name}'")
+            _report(
+                f"cleared death of {len(indices)} shape(s) in '{layer.name}'"
+            )
 
         viewer.window.add_dock_widget(save_widget, name="Save", area="right")
+        viewer.window.add_dock_widget(
+            mark_birth_widget, name="Mark birth", area="right"
+        )
+        viewer.window.add_dock_widget(
+            clear_birth_widget, name="Clear birth", area="right"
+        )
         viewer.window.add_dock_widget(
             mark_death_widget, name="Mark death", area="right"
         )
