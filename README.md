@@ -72,31 +72,35 @@ Opens the file in napari. One shape layer per class, colour-coded
 3. Draw around each cell. The bbox is visible at every timepoint — cells
    don't move much, no need to redraw.
 
-**To mark a cell as born partway through** (appears mid-recording):
+**Lifecycle model.** Each bbox has three optional fields, exposed as
+button rows in the **Lifecycle** dock on the right:
 
-1. Scrub the T slider to the frame the cell first appears.
+- **`t_start`** — first frame the cell/debris is visible (defaults to 0).
+- **`t_end`** — last frame visible (e.g. cell drifts out of FOV). Default
+  unset = visible until the end of the recording.
+- **`t_death`** — frame the cell is marked dead. May be earlier than
+  `t_end` if the corpse is still visible afterwards.
+
+Bboxes are **hidden entirely** outside their visibility range
+`[t_start, t_end]`. A `↑T=N` label sits above the box whenever it's
+visible and `t_start > 0`; a `†T=N` label appears alongside only at
+frames at or after `t_death` (so scrubbing back before death shows the
+box without the dagger).
+
+**To mark any lifecycle field:**
+
+1. Scrub the T slider to the relevant frame.
 2. **Switch the layer toolbar from the rectangle tool to the *select
    shapes* tool** (arrow icon, second from the left). This is the step
    most users miss — leaving the rectangle tool active means clicking on
    a box draws a new one instead of selecting it.
-3. Click the box of that cell.
-4. Click **Mark birth of selected at current T** in the right dock.
-5. A `↑T=<frame>` label appears above the box and the box dims to 25 %
-   opacity on frames before that T.
+3. Click the box.
+4. In the **Lifecycle** dock, click the relevant **Mark @ current T**
+   button under Birth, End, or Death.
 
-**To mark a cell as dead:**
-
-1. Scrub the T slider to the frame where the cell dies.
-2. Switch to the select-shapes tool, click the box.
-3. Click **Mark death of selected at current T**.
-4. A `†T=<frame>` label appears, and the box dims on frames after that T.
-
-If a cell both appears late and dies later, both markers show:
-`↑T=5 †T=42`.
-
-**To clear a mark**: same select-tool flow, click the box, click
-**Clear birth of selected** (resets `t_start` to 0) or
-**Clear death of selected** (resets `t_end` to unset).
+**To clear a mark**, same select flow, then click the matching **Clear**
+button. Each clear resets just that one field — birth back to 0, end
+back to "visible until end", death back to unset.
 
 If you ever see "WARNING: ... did NOT persist", the napari install is
 misbehaving — tell me with the napari version.

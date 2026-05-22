@@ -11,24 +11,27 @@ CLI:
     nikon-control-annotate path/to/file.nd2 --classes single doublet dividing
 
 Lifecycle model: each bbox is **persistent across the whole recording** by
-default (cells don't move much, no need to redraw per frame). The bbox is
-considered alive on every frame ``t`` with ``t_start <= t <= t_end`` (where
-``t_end`` defaults to "end of recording" if not set).
+default (cells don't move much, no need to redraw per frame). Three
+distinct fields describe its lifecycle:
 
-- If a cell **appears** partway through (mitosis, drifts in, etc.), select
-  its bbox at the frame of appearance and click "Mark birth of selected at
-  current T". Its ``t_start`` is recorded.
-- If a cell **dies**, select its bbox at the last alive frame and click
-  "Mark death of selected at current T". Its ``t_end`` is recorded.
+- ``t_start`` — first frame the cell/debris is visible. Defaults to 0.
+- ``t_end``   — last frame visible (e.g. cell drifts out of FOV).
+  Defaults to ``None`` = visible until end of recording.
+- ``t_death`` — frame the cell is marked dead (the cell may still be
+  visible as a corpse afterwards). Defaults to ``None``.
 
-Shapes outside their alive range are dimmed (25 % opacity) so the user can
-still see them spatially while making clear they aren't "alive" at the
-current T.
+In the napari viewer:
 
-Schema (stable, version 0.2):
+- A bbox is **hidden** outside its visibility range ``[t_start, t_end]``.
+- A ``↑T=N`` label sits above the bbox whenever it's visible and
+  ``t_start > 0``.
+- A ``†T=N`` label appears alongside whenever the current frame is at or
+  after ``t_death`` (and the bbox is still visible).
+
+Schema (stable, version 0.3):
 
     {
-        "schema_version": "0.2",
+        "schema_version": "0.3",
         "source": "<path to nd2>",
         "image_shape": [...],
         "axes": ["T", "C", "Y", "X"],
@@ -40,17 +43,22 @@ Schema (stable, version 0.2):
                 "bbox": [y0, x0, y1, x1],
                 "label": "single",
                 "t_start": 0,
-                "t_end": null,            # null = alive until end of recording
+                "t_end": null,            # null = visible until end of recording
+                "t_death": null,          # null = no death marker recorded
                 "z": 0,
                 "notes": "",
-                "created": "2026-05-18T14:00:00"
+                "created": "2026-05-22T14:00:00"
             },
             ...
         ]
     }
 
-v0.1 files (with a per-annotation ``t`` field) are auto-migrated on load:
-``t`` is dropped, the annotation is treated as alive for the whole recording.
+Older files are auto-migrated on load:
+
+- v0.1: the per-annotation ``t`` field is dropped, annotation treated as
+  alive for the whole recording.
+- v0.2: the old ``t_end`` was the death marker; it's moved into
+  ``t_death`` and the new ``t_end`` (visibility end) is left ``None``.
 """
 from __future__ import annotations
 
@@ -59,10 +67,10 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-SCHEMA_VERSION = "0.2"
+SCHEMA_VERSION = "0.3"
 DEFAULT_CLASSES: tuple[str, ...] = ("single", "doublet", "debris")
 _LAYER_COLORS = ("red", "yellow", "cyan", "magenta", "lime")
-_NO_DEATH = -1  # sentinel stored in napari properties for "alive until end"
+_UNSET = -1  # sentinel in napari properties for None-valued lifecycle fields
 
 
 @dataclass
@@ -71,6 +79,7 @@ class Annotation:
     label: str
     t_start: int = 0
     t_end: int | None = None
+    t_death: int | None = None
     z: int = 0
     notes: str = ""
     created: str = field(
@@ -98,20 +107,32 @@ def save(ann: AnnotationFile, path: Path) -> None:
     path.write_text(json.dumps(payload, indent=2))
 
 
-def _upgrade_annotation(a: dict) -> dict:
-    """Migrate per-annotation dict from any older schema to v0.2."""
-    a.pop("t", None)  # v0.1 had a single per-frame t; we no longer track it
+def _upgrade_annotation(a: dict, from_version: str) -> dict:
+    """Migrate per-annotation dict from any older schema to v0.3."""
+    # v0.1 had a single per-frame `t`; we no longer track it.
+    a.pop("t", None)
     a.setdefault("t_start", 0)
+    # v0.2 used `t_end` as the death marker. In v0.3, t_end means "last
+    # visible frame" and death goes into its own field.
+    if from_version == "0.2":
+        old_t_end = a.get("t_end")
+        if old_t_end is not None and "t_death" not in a:
+            a["t_death"] = old_t_end
+            a["t_end"] = None
     a.setdefault("t_end", None)
+    a.setdefault("t_death", None)
     return a
 
 
 def load(path: Path) -> AnnotationFile:
     payload = json.loads(path.read_text())
     raw_anns = payload.pop("annotations", [])
+    from_version = payload.get("schema_version", "0.1")
     payload["schema_version"] = SCHEMA_VERSION
     af = AnnotationFile(**payload)
-    af.annotations = [Annotation(**_upgrade_annotation(a)) for a in raw_anns]
+    af.annotations = [
+        Annotation(**_upgrade_annotation(a, from_version)) for a in raw_anns
+    ]
     return af
 
 
@@ -131,13 +152,19 @@ def _bbox_to_shape(bbox: list[float]) -> list[list[float]]:
     return [[y0, x0], [y0, x1], [y1, x1], [y1, x0]]
 
 
-def _life_label(t_start: int, t_end: int) -> str:
-    """Text shown above bboxes inside napari — birth and/or death markers."""
+def _compute_label(t_start: int, t_death: int, current_t: int) -> str:
+    """Text shown above a bbox inside napari at the current T frame.
+
+    The birth marker is always shown whenever ``t_start > 0`` — it sits
+    above the bbox as a static reminder. The death marker only appears once
+    we're at or past the death frame, so scrubbing back to before the death
+    shows the bbox without the dagger.
+    """
     parts = []
     if t_start > 0:
         parts.append(f"↑T={t_start}")
-    if t_end >= 0:
-        parts.append(f"†T={t_end}")
+    if t_death >= 0 and current_t >= t_death:
+        parts.append(f"†T={t_death}")
     return " ".join(parts)
 
 
@@ -151,7 +178,6 @@ def open_for_annotation(
         import napari
         import nd2 as nd2lib
         import numpy as np
-        from magicgui import magicgui
         from matplotlib.colors import to_rgba
     except ImportError as exc:
         raise ImportError(
@@ -210,22 +236,25 @@ def open_for_annotation(
             existing_shapes: list[list[list[float]]] = []
             existing_t_starts: list[int] = []
             existing_t_ends: list[int] = []
+            existing_t_deaths: list[int] = []
             for a in state.annotations:
                 if a.label == cls:
                     existing_shapes.append(_bbox_to_shape(a.bbox))
                     existing_t_starts.append(a.t_start)
                     existing_t_ends.append(
-                        a.t_end if a.t_end is not None else _NO_DEATH
+                        a.t_end if a.t_end is not None else _UNSET
+                    )
+                    existing_t_deaths.append(
+                        a.t_death if a.t_death is not None else _UNSET
                     )
             props = {
                 "t_start": np.array(existing_t_starts or [], dtype=int),
                 "t_end": np.array(existing_t_ends or [], dtype=int),
+                "t_death": np.array(existing_t_deaths or [], dtype=int),
+                # life_label is recomputed on every T change by _refresh_one_layer;
+                # initial value is just a placeholder.
                 "life_label": np.array(
-                    [
-                        _life_label(s, e)
-                        for s, e in zip(existing_t_starts, existing_t_ends)
-                    ],
-                    dtype=object,
+                    [""] * len(existing_shapes), dtype=object
                 ),
             }
             layer = viewer.add_shapes(
@@ -248,7 +277,8 @@ def open_for_annotation(
             try:
                 layer.current_properties = {
                     "t_start": np.array([0], dtype=int),
-                    "t_end": np.array([_NO_DEATH], dtype=int),
+                    "t_end": np.array([_UNSET], dtype=int),
+                    "t_death": np.array([_UNSET], dtype=int),
                     "life_label": np.array([""], dtype=object),
                 }
             except Exception:
@@ -256,7 +286,7 @@ def open_for_annotation(
             class_layers[cls] = layer
 
         def _refresh_one_layer(layer) -> None:
-            """Dim shapes whose lifecycle excludes the current T."""
+            """Hide shapes outside [t_start, t_end] and re-compute labels."""
             n = len(layer.data)
             if n == 0:
                 return
@@ -269,17 +299,27 @@ def open_for_annotation(
                 "t_start", np.zeros(n, dtype=int)
             )
             t_ends = layer.properties.get(
-                "t_end", np.full(n, _NO_DEATH, dtype=int)
+                "t_end", np.full(n, _UNSET, dtype=int)
+            )
+            t_deaths = layer.properties.get(
+                "t_death", np.full(n, _UNSET, dtype=int)
             )
             base = class_colors.get(layer.name, "red")
             colors = np.zeros((n, 4))
+            labels = np.empty(n, dtype=object)
             for i in range(n):
                 ts = int(t_starts[i]) if i < len(t_starts) else 0
-                te = int(t_ends[i]) if i < len(t_ends) else _NO_DEATH
-                alive_end = te if te >= 0 else 10**9
-                alpha = 1.0 if ts <= current_t <= alive_end else 0.25
+                te = int(t_ends[i]) if i < len(t_ends) else _UNSET
+                td = int(t_deaths[i]) if i < len(t_deaths) else _UNSET
+                visible_end = te if te >= 0 else 10**9
+                in_fov = ts <= current_t <= visible_end
+                alpha = 1.0 if in_fov else 0.0
                 colors[i] = to_rgba(base, alpha=alpha)
+                labels[i] = _compute_label(ts, td, current_t) if in_fov else ""
             layer.edge_color = colors
+            new_props = dict(layer.properties)
+            new_props["life_label"] = labels
+            layer.properties = new_props
 
         def _refresh_all_layers(event=None) -> None:
             for layer in class_layers.values():
@@ -302,16 +342,20 @@ def open_for_annotation(
                 t_ends = layer.properties.get(
                     "t_end", np.array([], dtype=int)
                 )
+                t_deaths = layer.properties.get(
+                    "t_death", np.array([], dtype=int)
+                )
                 for i, rect in enumerate(layer.data):
                     t_start = int(t_starts[i]) if i < len(t_starts) else 0
-                    t_end_raw = int(t_ends[i]) if i < len(t_ends) else _NO_DEATH
-                    t_end = None if t_end_raw < 0 else t_end_raw
+                    t_end_raw = int(t_ends[i]) if i < len(t_ends) else _UNSET
+                    t_death_raw = int(t_deaths[i]) if i < len(t_deaths) else _UNSET
                     out.append(
                         Annotation(
                             bbox=_shape_to_bbox(rect),
                             label=cls,
                             t_start=t_start,
-                            t_end=t_end,
+                            t_end=None if t_end_raw < 0 else t_end_raw,
+                            t_death=None if t_death_raw < 0 else t_death_raw,
                             created=now,
                         )
                     )
@@ -333,23 +377,16 @@ def open_for_annotation(
         ) -> bool:
             """Write `value` into the `field` property at `indices`.
 
-            `field` is either ``"t_start"`` or ``"t_end"``. Returns True if the
-            write was persisted (verified by read-back).
+            ``field`` is one of ``"t_start"``, ``"t_end"``, ``"t_death"``.
+            Returns True if the write persisted (verified by read-back).
+            ``_refresh_one_layer`` is called afterwards to rebuild the label
+            string and edge colors for the new lifecycle state.
             """
             arr = layer.properties[field].copy()
             for i in indices:
                 arr[i] = value
             new_props = dict(layer.properties)
             new_props[field] = arr
-            t_starts = new_props["t_start"]
-            t_ends = new_props["t_end"]
-            new_props["life_label"] = np.array(
-                [
-                    _life_label(int(t_starts[i]), int(t_ends[i]))
-                    for i in range(len(arr))
-                ],
-                dtype=object,
-            )
             layer.properties = new_props
             layer.refresh()
             _refresh_one_layer(layer)
@@ -373,89 +410,102 @@ def open_for_annotation(
                 return None, None
             return layer, list(layer.selected_data)
 
-        @magicgui(call_button="Save annotations")
-        def save_widget() -> None:
-            state.annotations = _collect()
-            save(state, json_out)
-            n_dead = sum(1 for a in state.annotations if a.t_end is not None)
-            n_born_late = sum(1 for a in state.annotations if a.t_start > 0)
-            _report(
-                f"saved {len(state.annotations)} annotations "
-                f"({n_born_late} with birth, {n_dead} with death) -> {json_out}"
+        def _current_t() -> int:
+            return (
+                int(viewer.dims.current_step[t_dim_in_viewer])
+                if t_dim_in_viewer is not None
+                else 0
             )
 
-        @magicgui(call_button="Mark birth of selected at current T")
-        def mark_birth_widget() -> None:
-            if t_dim_in_viewer is None:
+        def _set_field(field: str, value: int, label: str) -> None:
+            if t_dim_in_viewer is None and value >= 0:
                 _report("this file has no time axis; nothing to mark")
                 return
-            layer, indices = _require_selection("mark birth")
+            layer, indices = _require_selection(label)
             if layer is None:
                 return
-            current_t = int(viewer.dims.current_step[t_dim_in_viewer])
-            if not _apply_lifecycle(layer, indices, "t_start", current_t):
-                _report("WARNING: birth mark did NOT persist on read-back.")
+            if not _apply_lifecycle(layer, indices, field, value):
+                _report(
+                    f"WARNING: {field} write did NOT persist on read-back."
+                )
                 return
-            _report(
-                f"marked {len(indices)} shape(s) in '{layer.name}' "
-                f"as born at T={current_t}"
-            )
+            if value < 0:
+                _report(
+                    f"cleared {field} for {len(indices)} shape(s) "
+                    f"in '{layer.name}'"
+                )
+            else:
+                _report(
+                    f"set {field}={value} for {len(indices)} shape(s) "
+                    f"in '{layer.name}'"
+                )
 
-        @magicgui(call_button="Clear birth of selected (reset to T=0)")
-        def clear_birth_widget() -> None:
-            layer, indices = _require_selection("clear birth")
-            if layer is None:
-                return
-            if not _apply_lifecycle(layer, indices, "t_start", 0):
-                _report("WARNING: clear-birth did NOT persist on read-back.")
-                return
-            _report(
-                f"reset birth to T=0 for {len(indices)} shape(s) "
-                f"in '{layer.name}'"
-            )
+        from magicgui.widgets import Container, Label, PushButton
 
-        @magicgui(call_button="Mark death of selected at current T")
-        def mark_death_widget() -> None:
-            if t_dim_in_viewer is None:
-                _report("this file has no time axis; nothing to mark")
-                return
-            layer, indices = _require_selection("mark death")
-            if layer is None:
-                return
-            current_t = int(viewer.dims.current_step[t_dim_in_viewer])
-            if not _apply_lifecycle(layer, indices, "t_end", current_t):
-                _report("WARNING: death mark did NOT persist on read-back.")
-                return
-            _report(
-                f"marked {len(indices)} shape(s) in '{layer.name}' "
-                f"as dead at T={current_t}"
-            )
+        def _btn(text: str, action) -> "PushButton":
+            b = PushButton(text=text)
+            b.clicked.connect(action)
+            return b
 
-        @magicgui(call_button="Clear death of selected")
-        def clear_death_widget() -> None:
-            layer, indices = _require_selection("clear death")
-            if layer is None:
-                return
-            if not _apply_lifecycle(layer, indices, "t_end", _NO_DEATH):
-                _report("WARNING: clear-death did NOT persist on read-back.")
-                return
-            _report(
-                f"cleared death of {len(indices)} shape(s) in '{layer.name}'"
-            )
+        save_btn = _btn(
+            "Save annotations",
+            lambda: (
+                setattr(state, "annotations", _collect()),
+                save(state, json_out),
+                _report(
+                    f"saved {len(state.annotations)} annotations "
+                    f"({sum(1 for a in state.annotations if a.t_start > 0)} with birth, "
+                    f"{sum(1 for a in state.annotations if a.t_end is not None)} with end, "
+                    f"{sum(1 for a in state.annotations if a.t_death is not None)} with death) "
+                    f"-> {json_out}"
+                ),
+            ),
+        )
 
-        viewer.window.add_dock_widget(save_widget, name="Save", area="right")
-        viewer.window.add_dock_widget(
-            mark_birth_widget, name="Mark birth", area="right"
+        birth_mark = _btn(
+            "Mark @ current T",
+            lambda: _set_field("t_start", _current_t(), "mark birth"),
         )
-        viewer.window.add_dock_widget(
-            clear_birth_widget, name="Clear birth", area="right"
+        birth_clear = _btn(
+            "Clear (reset to T=0)",
+            lambda: _set_field("t_start", 0, "clear birth"),
         )
-        viewer.window.add_dock_widget(
-            mark_death_widget, name="Mark death", area="right"
+
+        end_mark = _btn(
+            "Mark @ current T",
+            lambda: _set_field("t_end", _current_t(), "mark end"),
         )
-        viewer.window.add_dock_widget(
-            clear_death_widget, name="Clear death", area="right"
+        end_clear = _btn(
+            "Clear (visible until end)",
+            lambda: _set_field("t_end", _UNSET, "clear end"),
         )
+
+        death_mark = _btn(
+            "Mark @ current T",
+            lambda: _set_field("t_death", _current_t(), "mark death"),
+        )
+        death_clear = _btn(
+            "Clear",
+            lambda: _set_field("t_death", _UNSET, "clear death"),
+        )
+
+        def _row(widgets):
+            return Container(widgets=widgets, layout="horizontal", labels=False)
+
+        panel = Container(
+            widgets=[
+                Label(value="↑ Birth (first visible frame)"),
+                _row([birth_mark, birth_clear]),
+                Label(value="→ End of visibility (cell leaves FOV)"),
+                _row([end_mark, end_clear]),
+                Label(value="† Death (cell marked dead)"),
+                _row([death_mark, death_clear]),
+                save_btn,
+            ],
+            layout="vertical",
+            labels=False,
+        )
+        viewer.window.add_dock_widget(panel, name="Lifecycle", area="right")
 
         napari.run()
 
