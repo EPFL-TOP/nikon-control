@@ -4,13 +4,19 @@ from nikon_control.annotate import (
     Annotation,
     AnnotationFile,
     DEFAULT_CLASSES,
+    Keyframe,
     SCHEMA_VERSION,
     _bbox_to_shape,
     _compute_label,
+    _interpolate_bbox,
     _shape_to_bbox,
     load,
     save,
 )
+
+
+def _kf(t, bbox):
+    return Keyframe(t=t, bbox=bbox)
 
 
 def test_save_load_roundtrip(tmp_path):
@@ -21,10 +27,16 @@ def test_save_load_roundtrip(tmp_path):
         channels=["BF", "GFP", "DAPI"],
         annotator="ch",
         annotations=[
-            Annotation(bbox=[10.0, 20.0, 100.0, 200.0], label="single"),
             Annotation(
-                bbox=[300.0, 400.0, 380.0, 480.0],
+                label="single",
+                keyframes=[_kf(0, [10.0, 20.0, 100.0, 200.0])],
+            ),
+            Annotation(
                 label="doublet",
+                keyframes=[
+                    _kf(5, [300.0, 400.0, 380.0, 480.0]),
+                    _kf(25, [310.0, 420.0, 390.0, 500.0]),
+                ],
                 t_start=5,
                 t_end=50,
                 t_deaths=[42, 47],
@@ -39,14 +51,22 @@ def test_save_load_roundtrip(tmp_path):
     assert loaded.source == af.source
     assert loaded.classes == list(DEFAULT_CLASSES)
     assert len(loaded.annotations) == 2
-    assert loaded.annotations[0].bbox == [10.0, 20.0, 100.0, 200.0]
-    assert loaded.annotations[0].t_start == 0
-    assert loaded.annotations[0].t_end is None
-    assert loaded.annotations[0].t_deaths == []
-    assert loaded.annotations[1].label == "doublet"
-    assert loaded.annotations[1].t_start == 5
-    assert loaded.annotations[1].t_end == 50
-    assert loaded.annotations[1].t_deaths == [42, 47]
+
+    a0 = loaded.annotations[0]
+    assert a0.label == "single"
+    assert len(a0.keyframes) == 1
+    assert a0.keyframes[0].bbox == [10.0, 20.0, 100.0, 200.0]
+    assert a0.bbox == [10.0, 20.0, 100.0, 200.0]  # property = first keyframe
+    assert a0.t_deaths == []
+
+    a1 = loaded.annotations[1]
+    assert a1.label == "doublet"
+    assert len(a1.keyframes) == 2
+    assert a1.keyframes[0].t == 5
+    assert a1.keyframes[1].t == 25
+    assert a1.t_start == 5
+    assert a1.t_end == 50
+    assert a1.t_deaths == [42, 47]
 
 
 def test_default_classes_includes_fission_fusion():
@@ -54,30 +74,24 @@ def test_default_classes_includes_fission_fusion():
 
 
 def test_compute_label_is_time_aware():
-    # No markers when nothing is set
     assert _compute_label(0, [], 0) == ""
-    # Birth marker is always shown when t_start > 0 (independent of current_t)
     assert _compute_label(5, [], 0) == "↑T=5"
     assert _compute_label(5, [], 100) == "↑T=5"
-    # Single death: hidden before t_death, shown at and after
     assert _compute_label(0, [42], 0) == ""
     assert _compute_label(0, [42], 41) == ""
     assert _compute_label(0, [42], 42) == "†T=42"
     assert _compute_label(0, [42], 100) == "†T=42"
-    # Both birth and death
     assert _compute_label(5, [42], 0) == "↑T=5"
     assert _compute_label(5, [42], 50) == "↑T=5 †T=42"
 
 
 def test_compute_label_with_multiple_deaths():
-    # Doublet: two cells dying at different times
     deaths = [42, 50]
-    assert _compute_label(0, deaths, 41) == ""        # nothing yet
-    assert _compute_label(0, deaths, 42) == "†T=42"   # first death only
-    assert _compute_label(0, deaths, 49) == "†T=42"   # second still pending
-    assert _compute_label(0, deaths, 50) == "†T=42,50"  # both now in the past
+    assert _compute_label(0, deaths, 41) == ""
+    assert _compute_label(0, deaths, 42) == "†T=42"
+    assert _compute_label(0, deaths, 49) == "†T=42"
+    assert _compute_label(0, deaths, 50) == "†T=42,50"
     assert _compute_label(0, deaths, 99) == "†T=42,50"
-    # Birth + two deaths
     assert _compute_label(5, deaths, 50) == "↑T=5 †T=42,50"
 
 
@@ -86,6 +100,40 @@ def test_bbox_shape_roundtrip():
     assert len(shape) == 4
     assert all(len(v) == 2 for v in shape)
     assert _shape_to_bbox(shape) == [10.0, 20.0, 100.0, 200.0]
+
+
+def test_interpolate_single_keyframe_is_constant():
+    kfs = [_kf(10, [0.0, 0.0, 10.0, 20.0])]
+    # Before, at, and after the keyframe — all snap to the single value.
+    assert _interpolate_bbox(kfs, 0) == [0.0, 0.0, 10.0, 20.0]
+    assert _interpolate_bbox(kfs, 10) == [0.0, 0.0, 10.0, 20.0]
+    assert _interpolate_bbox(kfs, 500) == [0.0, 0.0, 10.0, 20.0]
+
+
+def test_interpolate_between_two_keyframes():
+    kfs = [_kf(0, [0.0, 0.0, 10.0, 10.0]), _kf(10, [20.0, 30.0, 40.0, 50.0])]
+    # At the keyframes themselves
+    assert _interpolate_bbox(kfs, 0) == [0.0, 0.0, 10.0, 10.0]
+    assert _interpolate_bbox(kfs, 10) == [20.0, 30.0, 40.0, 50.0]
+    # Midpoint should be midpoint
+    assert _interpolate_bbox(kfs, 5) == [10.0, 15.0, 25.0, 30.0]
+    # Quarter-way
+    out = _interpolate_bbox(kfs, 2)
+    assert out[0] == 4.0  # 0 + 0.2 * (20 - 0)
+
+
+def test_interpolate_snaps_outside_range():
+    kfs = [_kf(10, [0.0, 0.0, 10.0, 10.0]), _kf(20, [20.0, 20.0, 30.0, 30.0])]
+    # Before the first keyframe → snap to first
+    assert _interpolate_bbox(kfs, 0) == [0.0, 0.0, 10.0, 10.0]
+    # After the last keyframe → snap to last
+    assert _interpolate_bbox(kfs, 99) == [20.0, 20.0, 30.0, 30.0]
+
+
+def test_interpolate_with_unsorted_keyframes():
+    kfs = [_kf(20, [20.0, 20.0, 30.0, 30.0]), _kf(0, [0.0, 0.0, 10.0, 10.0])]
+    # Interpolation should still work — keyframes get sorted internally.
+    assert _interpolate_bbox(kfs, 10) == [10.0, 10.0, 20.0, 20.0]
 
 
 def test_load_migrates_v0_1(tmp_path):
@@ -114,19 +162,14 @@ def test_load_migrates_v0_1(tmp_path):
     loaded = load(p)
 
     assert loaded.schema_version == SCHEMA_VERSION
-    assert len(loaded.annotations) == 1
     a = loaded.annotations[0]
+    assert len(a.keyframes) == 1
+    assert a.keyframes[0].bbox == [10.0, 20.0, 100.0, 200.0]
     assert a.bbox == [10.0, 20.0, 100.0, 200.0]
-    assert a.t_start == 0
-    assert a.t_end is None
     assert a.t_deaths == []
-    assert not hasattr(a, "t")
-    assert not hasattr(a, "t_death")
 
 
 def test_load_migrates_v0_2(tmp_path):
-    # v0.2 used t_end as the death frame. v0.3+ splits these; t_end becomes
-    # "last visible" and the old value moves into t_deaths.
     payload = {
         "schema_version": "0.2",
         "source": "/some/path.nd2",
@@ -152,15 +195,17 @@ def test_load_migrates_v0_2(tmp_path):
 
     loaded = load(p)
 
-    assert loaded.schema_version == SCHEMA_VERSION
     a = loaded.annotations[0]
     assert a.t_start == 7
     assert a.t_end is None
     assert a.t_deaths == [42]
+    # v0.2 bbox migrates into a single keyframe at t_start
+    assert len(a.keyframes) == 1
+    assert a.keyframes[0].t == 7
+    assert a.keyframes[0].bbox == [1.0, 2.0, 3.0, 4.0]
 
 
 def test_load_migrates_v0_3(tmp_path):
-    # v0.3 had a scalar `t_death`; v0.4 generalises to a list `t_deaths`.
     payload = {
         "schema_version": "0.3",
         "source": "/some/path.nd2",
@@ -197,7 +242,45 @@ def test_load_migrates_v0_3(tmp_path):
 
     loaded = load(p)
 
-    assert loaded.schema_version == SCHEMA_VERSION
     assert loaded.annotations[0].t_deaths == [42]
     assert loaded.annotations[1].t_deaths == []
-    assert not hasattr(loaded.annotations[0], "t_death")
+    # Migration also folds bbox into keyframes
+    assert len(loaded.annotations[0].keyframes) == 1
+    assert loaded.annotations[0].keyframes[0].bbox == [1.0, 2.0, 3.0, 4.0]
+
+
+def test_load_migrates_v0_4(tmp_path):
+    payload = {
+        "schema_version": "0.4",
+        "source": "/some/path.nd2",
+        "image_shape": [60, 3, 1024, 1024],
+        "axes": ["T", "C", "Y", "X"],
+        "channels": ["BF"],
+        "classes": ["single", "doublet"],
+        "annotator": "",
+        "annotations": [
+            {
+                "bbox": [10.0, 20.0, 100.0, 200.0],
+                "label": "single",
+                "t_start": 3,
+                "t_end": None,
+                "t_deaths": [42],
+                "z": 0,
+                "notes": "",
+                "created": "2026-06-11T14:00:00",
+            }
+        ],
+    }
+    p = tmp_path / "v0_4.annotations.json"
+    p.write_text(json.dumps(payload))
+
+    loaded = load(p)
+
+    assert loaded.schema_version == SCHEMA_VERSION
+    a = loaded.annotations[0]
+    assert len(a.keyframes) == 1
+    assert a.keyframes[0].t == 3  # placed at t_start
+    assert a.keyframes[0].bbox == [10.0, 20.0, 100.0, 200.0]
+    assert a.t_start == 3
+    assert a.t_deaths == [42]
+    assert not hasattr(a, "bbox") or a.bbox == [10.0, 20.0, 100.0, 200.0]

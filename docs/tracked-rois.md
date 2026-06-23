@@ -1,7 +1,8 @@
-# Time-dependent ROIs — design proposal
+# Time-dependent ROIs — implementation notes
 
-**Status**: proposal. Not implemented. Awaiting sign-off on the UX before
-writing the code.
+**Status**: implemented in schema v0.5. Sign-off on UX received
+2026-06-23 (approach A, snap outside the range, ``t_start`` defaults to
+the T at draw time).
 
 ## Problem
 
@@ -152,18 +153,34 @@ it) or it would override the existing keyframe. Step 5 is the explicit
 
 v0.4 → v0.5 migration: existing `bbox` becomes `keyframes: [{t: t_start, bbox: bbox}]`.
 
-## Open questions for you
+## Locked-in answers
 
-1. **(A) vs (B)** above — drag-and-keyframe vs explicit per-keyframe shapes.
-2. **Interpolation default**: linear between keyframes. Should bboxes
-   *outside* the keyframe range (i.e. before the first keyframe or after
-   the last, but still inside `[t_start, t_end]`) snap to the nearest
-   keyframe? My default: yes, snap.
-3. **Default behaviour on draw**: when a user draws a new bbox at T=k,
-   should the annotation's `t_start = k` (cell first appears here) or
-   `t_start = 0` (current default)? I'd lean toward `t_start = k` so the
-   keyframe and the bbox-first-visible are consistent.
+1. **Approach A** (ndim=2 shape layer, drag-and-keyframe).
+2. **Snap** outside the keyframe range to the nearest end-keyframe.
+3. **t_start = current_T** when a new bbox is drawn.
 
-Once you sign off (or redirect), implementation should take a single
-session: dataclass change, migration, on-T-change refresh logic, and the
-"Add keyframe at current T" button.
+## Implementation summary (v0.5)
+
+- ``Keyframe`` dataclass added; ``Annotation.keyframes`` is the source of
+  truth. The legacy ``bbox`` attribute survives as a Python ``@property``
+  returning the first keyframe's bbox for callers that don't yet know
+  about the multi-keyframe model, but it's no longer stored in the JSON.
+- napari stores the per-shape keyframe list as a JSON string in
+  ``properties["keyframes_json"]`` — same workaround as ``t_deaths_json``
+  because napari shape-layer properties are 1-D scalar arrays.
+- ``_refresh_one_layer`` runs on every T change. For each shape it
+  decodes the keyframes, calls ``_interpolate_bbox`` to compute the bbox
+  at the current T, and overwrites ``layer.data[i]`` if it changed.
+  Reentrancy is guarded by a module-local ``refreshing`` set so the
+  ``layer.data = ...`` assignment doesn't re-trigger the data event.
+- New shapes are detected in ``_on_data_change``: any shape whose
+  ``keyframes_json`` is empty is treated as freshly drawn, its bbox
+  read from ``layer.data[i]``, and seeded as the single keyframe at
+  the current T (which also becomes ``t_start``).
+- The Lifecycle dock has a new **⊞ ROI keyframes** row with two buttons:
+  *Add @ current T* (captures the shape's current bbox as a keyframe)
+  and *Drop @ current T* (removes the keyframe at the current T;
+  refuses to leave a shape with zero keyframes).
+- Schema migration v0.4 → v0.5: each annotation's old ``bbox`` becomes
+  a single keyframe at ``t_start``. Round-tripping a v0.4 file through
+  load/save produces an equivalent v0.5 file.
