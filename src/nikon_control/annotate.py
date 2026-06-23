@@ -282,10 +282,16 @@ def open_for_annotation(
 
     if json_out.exists():
         state = load(json_out)
+        # Always merge in current DEFAULT_CLASSES — that way an existing
+        # annotation file written by an older version automatically gains
+        # any new built-in categories the next time it's opened. Append, so
+        # existing class order (and layer colour assignment) is preserved.
+        extras = list(DEFAULT_CLASSES)
         if classes is not None:
-            for c in classes:
-                if c not in state.classes:
-                    state.classes.append(c)
+            extras.extend(classes)
+        for c in extras:
+            if c not in state.classes:
+                state.classes.append(c)
     else:
         state = AnnotationFile(
             source=str(nd2_path),
