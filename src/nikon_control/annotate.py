@@ -28,15 +28,15 @@ In the napari viewer:
 - A ``†T=N`` label appears alongside whenever the current frame is at or
   after ``t_death`` (and the bbox is still visible).
 
-Schema (stable, version 0.3):
+Schema (stable, version 0.4):
 
     {
-        "schema_version": "0.3",
+        "schema_version": "0.4",
         "source": "<path to nd2>",
         "image_shape": [...],
         "axes": ["T", "C", "Y", "X"],
-        "channels": ["BF", "GFP", ...],
-        "classes": ["single", "doublet", "debris"],
+        "channels": ["BF", "GFP", "DAPI"],
+        "classes": ["single", "doublet", "debris", "fission_fusion"],
         "annotator": "",
         "annotations": [
             {
@@ -44,10 +44,10 @@ Schema (stable, version 0.3):
                 "label": "single",
                 "t_start": 0,
                 "t_end": null,            # null = visible until end of recording
-                "t_death": null,          # null = no death marker recorded
+                "t_deaths": [],           # one entry per dying cell; [] = none
                 "z": 0,
                 "notes": "",
-                "created": "2026-05-22T14:00:00"
+                "created": "2026-06-11T14:00:00"
             },
             ...
         ]
@@ -55,10 +55,12 @@ Schema (stable, version 0.3):
 
 Older files are auto-migrated on load:
 
-- v0.1: the per-annotation ``t`` field is dropped, annotation treated as
+- v0.1: the per-annotation ``t`` field is dropped; annotation treated as
   alive for the whole recording.
-- v0.2: the old ``t_end`` was the death marker; it's moved into
-  ``t_death`` and the new ``t_end`` (visibility end) is left ``None``.
+- v0.2: the old ``t_end`` was the death marker; it's moved into ``t_deaths``
+  as a single-element list and the new ``t_end`` (visibility end) is left
+  ``None``.
+- v0.3: a single ``t_death`` becomes ``t_deaths = [t_death]``.
 """
 from __future__ import annotations
 
@@ -67,8 +69,13 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-SCHEMA_VERSION = "0.3"
-DEFAULT_CLASSES: tuple[str, ...] = ("single", "doublet", "debris")
+SCHEMA_VERSION = "0.4"
+DEFAULT_CLASSES: tuple[str, ...] = (
+    "single",
+    "doublet",
+    "debris",
+    "fission_fusion",
+)
 _LAYER_COLORS = ("red", "yellow", "cyan", "magenta", "lime")
 _UNSET = -1  # sentinel in napari properties for None-valued lifecycle fields
 
@@ -79,7 +86,7 @@ class Annotation:
     label: str
     t_start: int = 0
     t_end: int | None = None
-    t_death: int | None = None
+    t_deaths: list[int] = field(default_factory=list)
     z: int = 0
     notes: str = ""
     created: str = field(
@@ -108,19 +115,26 @@ def save(ann: AnnotationFile, path: Path) -> None:
 
 
 def _upgrade_annotation(a: dict, from_version: str) -> dict:
-    """Migrate per-annotation dict from any older schema to v0.3."""
+    """Migrate per-annotation dict from any older schema to v0.4."""
     # v0.1 had a single per-frame `t`; we no longer track it.
     a.pop("t", None)
     a.setdefault("t_start", 0)
-    # v0.2 used `t_end` as the death marker. In v0.3, t_end means "last
-    # visible frame" and death goes into its own field.
+    # v0.2 used `t_end` as the death marker. In v0.3+, t_end means "last
+    # visible frame" and death has its own field.
     if from_version == "0.2":
         old_t_end = a.get("t_end")
         if old_t_end is not None and "t_death" not in a:
             a["t_death"] = old_t_end
             a["t_end"] = None
+    # v0.3 had a single scalar t_death; v0.4 generalises to a list to
+    # cover doublets (and future categories) where each cell dies
+    # separately.
+    if "t_deaths" not in a:
+        single = a.pop("t_death", None)
+        a["t_deaths"] = [single] if single is not None else []
+    else:
+        a.pop("t_death", None)
     a.setdefault("t_end", None)
-    a.setdefault("t_death", None)
     return a
 
 
@@ -152,19 +166,22 @@ def _bbox_to_shape(bbox: list[float]) -> list[list[float]]:
     return [[y0, x0], [y0, x1], [y1, x1], [y1, x0]]
 
 
-def _compute_label(t_start: int, t_death: int, current_t: int) -> str:
+def _compute_label(
+    t_start: int, t_deaths: list[int], current_t: int
+) -> str:
     """Text shown above a bbox inside napari at the current T frame.
 
-    The birth marker is always shown whenever ``t_start > 0`` — it sits
-    above the bbox as a static reminder. The death marker only appears once
-    we're at or past the death frame, so scrubbing back to before the death
-    shows the bbox without the dagger.
+    The birth marker is always shown when ``t_start > 0`` — a static
+    reminder of when the cell appeared. Death markers are added one per
+    death that's already happened (``d <= current_t``), so scrubbing back
+    before each death hides it.
     """
     parts = []
     if t_start > 0:
         parts.append(f"↑T={t_start}")
-    if t_death >= 0 and current_t >= t_death:
-        parts.append(f"†T={t_death}")
+    past_deaths = sorted(d for d in t_deaths if d <= current_t)
+    if past_deaths:
+        parts.append("†T=" + ",".join(str(d) for d in past_deaths))
     return " ".join(parts)
 
 
@@ -231,12 +248,23 @@ def open_for_annotation(
             cls: _LAYER_COLORS[i % len(_LAYER_COLORS)]
             for i, cls in enumerate(state.classes)
         }
+        def _encode_deaths(deaths: list[int]) -> str:
+            return json.dumps(sorted(set(int(d) for d in deaths)))
+
+        def _decode_deaths(s: str) -> list[int]:
+            if not s:
+                return []
+            try:
+                return [int(x) for x in json.loads(s)]
+            except (ValueError, json.JSONDecodeError):
+                return []
+
         class_layers: dict[str, "napari.layers.Shapes"] = {}
         for cls, base_color in class_colors.items():
             existing_shapes: list[list[list[float]]] = []
             existing_t_starts: list[int] = []
             existing_t_ends: list[int] = []
-            existing_t_deaths: list[int] = []
+            existing_t_deaths: list[str] = []  # JSON-encoded lists
             for a in state.annotations:
                 if a.label == cls:
                     existing_shapes.append(_bbox_to_shape(a.bbox))
@@ -244,13 +272,14 @@ def open_for_annotation(
                     existing_t_ends.append(
                         a.t_end if a.t_end is not None else _UNSET
                     )
-                    existing_t_deaths.append(
-                        a.t_death if a.t_death is not None else _UNSET
-                    )
+                    existing_t_deaths.append(_encode_deaths(a.t_deaths))
             props = {
                 "t_start": np.array(existing_t_starts or [], dtype=int),
                 "t_end": np.array(existing_t_ends or [], dtype=int),
-                "t_death": np.array(existing_t_deaths or [], dtype=int),
+                # t_deaths is a per-shape JSON-encoded list of ints — napari
+                # properties are 1-D so we serialise the list to a string and
+                # decode on read.
+                "t_deaths_json": np.array(existing_t_deaths or [], dtype=object),
                 # life_label is recomputed on every T change by _refresh_one_layer;
                 # initial value is just a placeholder.
                 "life_label": np.array(
@@ -278,7 +307,7 @@ def open_for_annotation(
                 layer.current_properties = {
                     "t_start": np.array([0], dtype=int),
                     "t_end": np.array([_UNSET], dtype=int),
-                    "t_death": np.array([_UNSET], dtype=int),
+                    "t_deaths_json": np.array(["[]"], dtype=object),
                     "life_label": np.array([""], dtype=object),
                 }
             except Exception:
@@ -301,8 +330,8 @@ def open_for_annotation(
             t_ends = layer.properties.get(
                 "t_end", np.full(n, _UNSET, dtype=int)
             )
-            t_deaths = layer.properties.get(
-                "t_death", np.full(n, _UNSET, dtype=int)
+            t_deaths_json = layer.properties.get(
+                "t_deaths_json", np.array(["[]"] * n, dtype=object)
             )
             base = class_colors.get(layer.name, "red")
             colors = np.zeros((n, 4))
@@ -310,12 +339,16 @@ def open_for_annotation(
             for i in range(n):
                 ts = int(t_starts[i]) if i < len(t_starts) else 0
                 te = int(t_ends[i]) if i < len(t_ends) else _UNSET
-                td = int(t_deaths[i]) if i < len(t_deaths) else _UNSET
+                deaths = _decode_deaths(
+                    t_deaths_json[i] if i < len(t_deaths_json) else "[]"
+                )
                 visible_end = te if te >= 0 else 10**9
                 in_fov = ts <= current_t <= visible_end
                 alpha = 1.0 if in_fov else 0.0
                 colors[i] = to_rgba(base, alpha=alpha)
-                labels[i] = _compute_label(ts, td, current_t) if in_fov else ""
+                labels[i] = (
+                    _compute_label(ts, deaths, current_t) if in_fov else ""
+                )
             layer.edge_color = colors
             new_props = dict(layer.properties)
             new_props["life_label"] = labels
@@ -342,20 +375,22 @@ def open_for_annotation(
                 t_ends = layer.properties.get(
                     "t_end", np.array([], dtype=int)
                 )
-                t_deaths = layer.properties.get(
-                    "t_death", np.array([], dtype=int)
+                t_deaths_json = layer.properties.get(
+                    "t_deaths_json", np.array([], dtype=object)
                 )
                 for i, rect in enumerate(layer.data):
                     t_start = int(t_starts[i]) if i < len(t_starts) else 0
                     t_end_raw = int(t_ends[i]) if i < len(t_ends) else _UNSET
-                    t_death_raw = int(t_deaths[i]) if i < len(t_deaths) else _UNSET
+                    deaths = _decode_deaths(
+                        t_deaths_json[i] if i < len(t_deaths_json) else "[]"
+                    )
                     out.append(
                         Annotation(
                             bbox=_shape_to_bbox(rect),
                             label=cls,
                             t_start=t_start,
                             t_end=None if t_end_raw < 0 else t_end_raw,
-                            t_death=None if t_death_raw < 0 else t_death_raw,
+                            t_deaths=deaths,
                             created=now,
                         )
                     )
@@ -375,12 +410,11 @@ def open_for_annotation(
         def _apply_lifecycle(
             layer, indices: list[int], field: str, value: int
         ) -> bool:
-            """Write `value` into the `field` property at `indices`.
+            """Write a scalar ``value`` into ``field`` at ``indices``.
 
-            ``field`` is one of ``"t_start"``, ``"t_end"``, ``"t_death"``.
-            Returns True if the write persisted (verified by read-back).
-            ``_refresh_one_layer`` is called afterwards to rebuild the label
-            string and edge colors for the new lifecycle state.
+            ``field`` is one of ``"t_start"`` or ``"t_end"``. Returns True if
+            the write persisted. Per-shape death lists are handled separately
+            by ``_modify_deaths``.
             """
             arr = layer.properties[field].copy()
             for i in indices:
@@ -392,6 +426,29 @@ def open_for_annotation(
             _refresh_one_layer(layer)
             read_back = layer.properties[field]
             return all(int(read_back[i]) == value for i in indices)
+
+        def _modify_deaths(layer, indices: list[int], op: str, t: int = 0) -> bool:
+            """Edit the per-shape JSON-encoded death list.
+
+            ``op`` is one of ``"add"`` (append ``t``), ``"pop"`` (drop the
+            most recent), or ``"clear"`` (empty the list).
+            """
+            arr = layer.properties["t_deaths_json"].copy()
+            for i in indices:
+                current = _decode_deaths(arr[i])
+                if op == "add":
+                    current.append(int(t))
+                elif op == "pop" and current:
+                    current = sorted(current)[:-1]
+                elif op == "clear":
+                    current = []
+                arr[i] = _encode_deaths(current)
+            new_props = dict(layer.properties)
+            new_props["t_deaths_json"] = arr
+            layer.properties = new_props
+            layer.refresh()
+            _refresh_one_layer(layer)
+            return True
 
         def _require_selection(action_name: str):
             layer = _active_class_layer()
@@ -447,20 +504,40 @@ def open_for_annotation(
             b.clicked.connect(action)
             return b
 
-        save_btn = _btn(
-            "Save annotations",
-            lambda: (
-                setattr(state, "annotations", _collect()),
-                save(state, json_out),
+        def _save_now() -> None:
+            state.annotations = _collect()
+            save(state, json_out)
+            _report(
+                f"saved {len(state.annotations)} annotations "
+                f"({sum(1 for a in state.annotations if a.t_start > 0)} with birth, "
+                f"{sum(1 for a in state.annotations if a.t_end is not None)} with end, "
+                f"{sum(1 for a in state.annotations if a.t_deaths)} with death) "
+                f"-> {json_out}"
+            )
+
+        def _death_op(op: str) -> None:
+            if op == "add" and t_dim_in_viewer is None:
+                _report("this file has no time axis; nothing to mark")
+                return
+            layer, indices = _require_selection(f"{op} death")
+            if layer is None:
+                return
+            t = _current_t() if op == "add" else 0
+            _modify_deaths(layer, indices, op, t)
+            if op == "add":
                 _report(
-                    f"saved {len(state.annotations)} annotations "
-                    f"({sum(1 for a in state.annotations if a.t_start > 0)} with birth, "
-                    f"{sum(1 for a in state.annotations if a.t_end is not None)} with end, "
-                    f"{sum(1 for a in state.annotations if a.t_death is not None)} with death) "
-                    f"-> {json_out}"
-                ),
-            ),
-        )
+                    f"added death T={t} on {len(indices)} shape(s) in '{layer.name}'"
+                )
+            elif op == "pop":
+                _report(
+                    f"dropped last death on {len(indices)} shape(s) in '{layer.name}'"
+                )
+            else:
+                _report(
+                    f"cleared all deaths on {len(indices)} shape(s) in '{layer.name}'"
+                )
+
+        save_btn = _btn("Save annotations", _save_now)
 
         birth_mark = _btn(
             "Mark @ current T",
@@ -480,13 +557,17 @@ def open_for_annotation(
             lambda: _set_field("t_end", _UNSET, "clear end"),
         )
 
-        death_mark = _btn(
-            "Mark @ current T",
-            lambda: _set_field("t_death", _current_t(), "mark death"),
+        death_add = _btn(
+            "Add @ current T",
+            lambda: _death_op("add"),
+        )
+        death_pop = _btn(
+            "Drop last",
+            lambda: _death_op("pop"),
         )
         death_clear = _btn(
-            "Clear",
-            lambda: _set_field("t_death", _UNSET, "clear death"),
+            "Clear all",
+            lambda: _death_op("clear"),
         )
 
         def _row(widgets):
@@ -498,8 +579,10 @@ def open_for_annotation(
                 _row([birth_mark, birth_clear]),
                 Label(value="→ End of visibility (cell leaves FOV)"),
                 _row([end_mark, end_clear]),
-                Label(value="† Death (cell marked dead)"),
-                _row([death_mark, death_clear]),
+                Label(
+                    value="† Deaths (multi-cell categories — add one entry per dying cell)"
+                ),
+                _row([death_add, death_pop, death_clear]),
                 save_btn,
             ],
             layout="vertical",

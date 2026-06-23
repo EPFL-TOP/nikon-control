@@ -72,20 +72,26 @@ Opens the file in napari. One shape layer per class, colour-coded
 3. Draw around each cell. The bbox is visible at every timepoint — cells
    don't move much, no need to redraw.
 
-**Lifecycle model.** Each bbox has three optional fields, exposed as
-button rows in the **Lifecycle** dock on the right:
+**Lifecycle model.** Each bbox has these fields, exposed as button rows
+in the **Lifecycle** dock on the right:
 
 - **`t_start`** — first frame the cell/debris is visible (defaults to 0).
 - **`t_end`** — last frame visible (e.g. cell drifts out of FOV). Default
   unset = visible until the end of the recording.
-- **`t_death`** — frame the cell is marked dead. May be earlier than
-  `t_end` if the corpse is still visible afterwards.
+- **`t_deaths`** — *list* of frames at which each cell dies. A single
+  cell has at most one entry; a doublet may have two (one per cell);
+  future multi-cell categories can have more.
 
 Bboxes are **hidden entirely** outside their visibility range
 `[t_start, t_end]`. A `↑T=N` label sits above the box whenever it's
-visible and `t_start > 0`; a `†T=N` label appears alongside only at
-frames at or after `t_death` (so scrubbing back before death shows the
-box without the dagger).
+visible and `t_start > 0`. Death markers `†T=N` are added one per death
+that's already happened at the current frame — so a doublet that loses
+its first cell at T=42 and the second at T=50 shows nothing before T=42,
+`†T=42` between T=42 and T=49, and `†T=42,50` from T=50 onwards.
+
+**Default classes**: `single`, `doublet`, `debris`, `fission_fusion` (the
+last covers cells that repeatedly split and merge — name is a placeholder,
+tell me if there's a better term).
 
 **To mark any lifecycle field:**
 
@@ -98,12 +104,17 @@ box without the dagger).
 4. In the **Lifecycle** dock, click the relevant **Mark @ current T**
    button under Birth, End, or Death.
 
-**To clear a mark**, same select flow, then click the matching **Clear**
-button. Each clear resets just that one field — birth back to 0, end
-back to "visible until end", death back to unset.
+**To clear a mark**, same select flow, then click the matching button:
+*Clear birth* resets to T=0; *Clear end* removes the visibility-end
+marker; for deaths there are **Drop last** (pops the most recent death)
+and **Clear all** (empties the death list).
 
 If you ever see "WARNING: ... did NOT persist", the napari install is
 misbehaving — tell me with the napari version.
+
+**Time-dependent ROIs (for drifting debris / migrating cells)** —
+proposed but not yet implemented. See
+[docs/tracked-rois.md](docs/tracked-rois.md).
 
 **To save:** click **Save annotations** in the right dock. Output is
 `<file>.annotations.json` next to the ND2. The status bar reports how
