@@ -7,6 +7,7 @@ from nikon_control.annotate import (
     Keyframe,
     SCHEMA_VERSION,
     _bbox_to_shape,
+    _bboxes_close,
     _compute_label,
     _interpolate_bbox,
     _shape_to_bbox,
@@ -93,6 +94,20 @@ def test_compute_label_with_multiple_deaths():
     assert _compute_label(0, deaths, 50) == "†T=42,50"
     assert _compute_label(0, deaths, 99) == "†T=42,50"
     assert _compute_label(5, deaths, 50) == "↑T=5 †T=42,50"
+
+
+def test_bboxes_close_equal_and_near():
+    assert _bboxes_close([0, 0, 10, 20], [0, 0, 10, 20])
+    assert _bboxes_close([0.0, 0.0, 10.0, 20.0], [1e-9, 0.0, 10.0, 20.0])
+
+
+def test_bboxes_close_rejects_different_values():
+    assert not _bboxes_close([0, 0, 10, 20], [0, 0, 10, 21])
+    assert not _bboxes_close([0, 0, 10, 20], [5, 0, 15, 20])
+
+
+def test_bboxes_close_length_mismatch_returns_false():
+    assert not _bboxes_close([0, 0, 10, 20], [0, 0, 10])
 
 
 def test_bbox_shape_roundtrip():

@@ -113,26 +113,28 @@ If you ever see "WARNING: ... did NOT persist", the napari install is
 misbehaving — tell me with the napari version.
 
 **Time-dependent ROIs (for drifting debris / migrating cells).** Each
-bbox can carry multiple keyframes. Static cells need only the one
+bbox carries a list of keyframes. Static cells need only the one
 keyframe placed when the box was drawn; drifting cells/debris can have
 several, and the displayed bbox is linearly interpolated between
 neighbouring keyframes (T outside the range snaps to the nearest one).
 
-To add a keyframe:
+**Dragging a shape at any T automatically records a keyframe there**
+— no button click needed. Workflow:
 
 1. Scrub to the T where the cell has moved.
-2. Switch to the select-shapes tool, select the box, and **drag/resize
-   it** to the cell's new position.
-3. Click **Add @ current T** in the **⊞ ROI keyframes** row of the
-   Lifecycle dock. Your dragged bbox is captured as a keyframe at the
-   current T.
-4. Repeat as needed at other T values where the cell drifts further.
+2. Switch to the select-shapes tool, select the box, drag/resize it to
+   the cell's new position. A `auto-added keyframe @ T=<frame>` status
+   appears in napari's status bar.
+3. Repeat at other T values as the cell drifts further.
 
-To drop a keyframe: scrub to its T, select the shape, click
-**Drop @ current T**. The tool refuses to leave a shape with zero
+The **Add @ current T** button in the **⊞ ROI keyframes** row exists as
+an explicit capture (e.g. to pin the current interpolated bbox as an
+authoritative keyframe without moving it). **Drop @ current T** removes
+the keyframe at the current T — refuses to leave a shape with zero
 keyframes.
 
-Detailed design notes in [docs/tracked-rois.md](docs/tracked-rois.md).
+Detailed design + implementation notes in
+[docs/tracked-rois.md](docs/tracked-rois.md).
 
 **To save:** click **Save annotations** in the right dock. Output is
 `<file>.annotations.json` next to the ND2. The status bar reports how

@@ -212,6 +212,13 @@ def _bbox_to_shape(bbox: list[float]) -> list[list[float]]:
     return [[y0, x0], [y0, x1], [y1, x1], [y1, x0]]
 
 
+def _bboxes_close(a: list[float], b: list[float], atol: float = 1e-6) -> bool:
+    """True if two bboxes agree component-wise within ``atol``."""
+    if len(a) != len(b):
+        return False
+    return all(abs(float(a[i]) - float(b[i])) <= atol for i in range(len(a)))
+
+
 def _interpolate_bbox(keyframes: list[Keyframe], t: int) -> list[float]:
     """Linear interpolation between surrounding keyframes; snap outside the range.
 
@@ -270,6 +277,7 @@ def open_for_annotation(
         import napari
         import nd2 as nd2lib
         import numpy as np
+        from magicgui.widgets import Container, Label, PushButton
         from matplotlib.colors import to_rgba
     except ImportError as exc:
         raise ImportError(
@@ -329,6 +337,22 @@ def open_for_annotation(
             cls: _LAYER_COLORS[i % len(_LAYER_COLORS)]
             for i, cls in enumerate(state.classes)
         }
+
+        # Persistent status label at the top of the Lifecycle dock. Updated by
+        # _refresh_one_layer / _on_data_change so per-class shape counts are
+        # always visible without relying on the transient viewer.status.
+        status_label = Label(value="shapes: (nothing drawn yet)")
+
+        def _update_status_label() -> None:
+            parts = []
+            for cls, layer in class_layers.items():
+                nshapes = len(layer.data)
+                if nshapes > 0:
+                    parts.append(f"{cls}={nshapes}")
+            status_label.value = (
+                "shapes: " + ", ".join(parts) if parts else "shapes: (none)"
+            )
+
         def _encode_deaths(deaths: list[int]) -> str:
             return json.dumps(sorted(set(int(d) for d in deaths)))
 
@@ -362,6 +386,65 @@ def open_for_annotation(
         # fires events.data, which would normally re-enter _on_data_change.
         refreshing: set[str] = set()
 
+        def _reset_current_properties(layer) -> None:
+            """Re-assert per-shape defaults so freshly-drawn shapes carry the
+            empty ``keyframes_json`` sentinel that ``_on_data_change`` uses to
+            detect them.
+
+            Rationale (bug fixed 2026-07-13): napari re-derives
+            ``current_properties`` from the last row of the property arrays
+            after every ``layer.properties = ...`` assignment. Without this
+            call, shape #1's real encoded keyframe becomes the default for
+            shape #2, and the seeding contract silently breaks — shape #2
+            then inherits shape #1's keyframes and disappears on the next
+            refresh.
+            """
+            try:
+                layer.current_properties = {
+                    "t_start": np.array([0], dtype=int),
+                    "t_end": np.array([_UNSET], dtype=int),
+                    "t_deaths_json": np.array(["[]"], dtype=object),
+                    "keyframes_json": np.array([""], dtype=object),
+                    "life_label": np.array([""], dtype=object),
+                }
+            except Exception:
+                pass
+
+        # Property length invariants: every property array must be length
+        # ``len(layer.data)``. napari sometimes lags this by one when it hasn't
+        # yet auto-extended props from current_properties. ``_pad_props``
+        # normalises everything before any write.
+        _PROP_DEFAULTS = {
+            "t_start": (0, int),
+            "t_end": (_UNSET, int),
+            "t_deaths_json": ("[]", object),
+            "keyframes_json": ("", object),
+            "life_label": ("", object),
+        }
+
+        def _pad_props(layer) -> dict:
+            n = len(layer.data)
+            out: dict = {}
+            for key, (default, dtype) in _PROP_DEFAULTS.items():
+                cur = layer.properties.get(key, np.array([], dtype=dtype))
+                lst = list(cur)
+                while len(lst) < n:
+                    lst.append(default)
+                if len(lst) > n:
+                    lst = lst[:n]
+                out[key] = np.array(lst, dtype=dtype)
+            return out
+
+        def _current_t_or_zero() -> int:
+            return (
+                int(viewer.dims.current_step[t_dim_in_viewer])
+                if t_dim_in_viewer is not None
+                else 0
+            )
+
+        # Create one shape layer per class. Existing annotations are seeded
+        # with their persisted keyframes; freshly drawn shapes get an empty
+        # keyframes_json placeholder that ``_on_data_change`` will populate.
         for cls, base_color in class_colors.items():
             existing_shapes: list[list[list[float]]] = []
             existing_t_starts: list[int] = []
@@ -370,8 +453,6 @@ def open_for_annotation(
             existing_keyframes: list[str] = []
             for a in state.annotations:
                 if a.label == cls:
-                    # Start at the first-keyframe bbox; _refresh_one_layer
-                    # will interpolate on every T change.
                     existing_shapes.append(_bbox_to_shape(a.bbox))
                     existing_t_starts.append(a.t_start)
                     existing_t_ends.append(
@@ -384,7 +465,6 @@ def open_for_annotation(
                 "t_end": np.array(existing_t_ends or [], dtype=int),
                 "t_deaths_json": np.array(existing_t_deaths or [], dtype=object),
                 "keyframes_json": np.array(existing_keyframes or [], dtype=object),
-                # life_label recomputed by _refresh_one_layer on every T change.
                 "life_label": np.array(
                     [""] * len(existing_shapes), dtype=object
                 ),
@@ -406,26 +486,8 @@ def open_for_annotation(
                     "translation": [-12, 0],
                 },
             )
-            try:
-                layer.current_properties = {
-                    "t_start": np.array([0], dtype=int),
-                    "t_end": np.array([_UNSET], dtype=int),
-                    "t_deaths_json": np.array(["[]"], dtype=object),
-                    # Empty keyframes_json signals to _on_data_change that this
-                    # shape was freshly drawn and needs initialisation.
-                    "keyframes_json": np.array([""], dtype=object),
-                    "life_label": np.array([""], dtype=object),
-                }
-            except Exception:
-                pass
+            _reset_current_properties(layer)
             class_layers[cls] = layer
-
-        def _current_t_or_zero() -> int:
-            return (
-                int(viewer.dims.current_step[t_dim_in_viewer])
-                if t_dim_in_viewer is not None
-                else 0
-            )
 
         def _refresh_one_layer(layer) -> None:
             """Interpolate bboxes, hide outside [t_start, t_end], rebuild labels."""
@@ -433,36 +495,29 @@ def open_for_annotation(
             if n == 0:
                 return
             current_t = _current_t_or_zero()
-            t_starts = layer.properties.get("t_start", np.zeros(n, dtype=int))
-            t_ends = layer.properties.get(
-                "t_end", np.full(n, _UNSET, dtype=int)
-            )
-            t_deaths_json = layer.properties.get(
-                "t_deaths_json", np.array(["[]"] * n, dtype=object)
-            )
-            kfs_json = layer.properties.get(
-                "keyframes_json", np.array([""] * n, dtype=object)
-            )
+            props = _pad_props(layer)
+            t_starts = props["t_start"]
+            t_ends = props["t_end"]
+            t_deaths_json = props["t_deaths_json"]
+            kfs_json = props["keyframes_json"]
             base = class_colors.get(layer.name, "red")
             colors = np.zeros((n, 4))
             labels = np.empty(n, dtype=object)
+            new_bboxes: list = []
             new_data: list = []
             for i in range(n):
-                ts = int(t_starts[i]) if i < len(t_starts) else 0
-                te = int(t_ends[i]) if i < len(t_ends) else _UNSET
-                deaths = _decode_deaths(
-                    t_deaths_json[i] if i < len(t_deaths_json) else "[]"
-                )
-                kfs = _decode_keyframes(
-                    kfs_json[i] if i < len(kfs_json) else ""
-                )
+                ts = int(t_starts[i])
+                te = int(t_ends[i])
+                deaths = _decode_deaths(t_deaths_json[i])
+                kfs = _decode_keyframes(kfs_json[i])
                 if kfs:
                     bbox = _interpolate_bbox(kfs, current_t)
-                    new_data.append(np.array(_bbox_to_shape(bbox)))
                 else:
                     # Freshly drawn shape — _on_data_change hasn't yet seeded
-                    # its keyframes. Leave the existing vertices untouched.
-                    new_data.append(layer.data[i])
+                    # its keyframes. Read the bbox back from the vertices.
+                    bbox = _shape_to_bbox(layer.data[i])
+                new_bboxes.append(bbox)
+                new_data.append(np.array(_bbox_to_shape(bbox)))
                 visible_end = te if te >= 0 else 10**9
                 in_fov = ts <= current_t <= visible_end
                 alpha = 1.0 if in_fov else 0.0
@@ -470,12 +525,15 @@ def open_for_annotation(
                 labels[i] = (
                     _compute_label(ts, deaths, current_t) if in_fov else ""
                 )
+            props["life_label"] = np.array(labels, dtype=object)
             refreshing.add(layer.name)
             try:
-                # Only reassign data if any vertex changed; saves a redraw and
-                # avoids losing the user's selection unnecessarily.
+                # Compare current vs new at the bbox level (robust across
+                # dtypes and possible ndim quirks) rather than at the vertex
+                # array level. Skip layer.data reassignment when nothing moved
+                # — this preserves the user's selection during T scrubs.
                 if any(
-                    not np.array_equal(np.asarray(new_data[i]), np.asarray(layer.data[i]))
+                    not _bboxes_close(new_bboxes[i], _shape_to_bbox(layer.data[i]))
                     for i in range(n)
                 ):
                     selected = set(layer.selected_data)
@@ -485,56 +543,84 @@ def open_for_annotation(
                     except Exception:
                         pass
                 layer.edge_color = colors
-                new_props = dict(layer.properties)
-                new_props["life_label"] = labels
-                layer.properties = new_props
+                layer.properties = props
             finally:
                 refreshing.discard(layer.name)
+            _reset_current_properties(layer)
+            _update_status_label()
 
         def _refresh_all_layers(event=None) -> None:
             for layer in class_layers.values():
                 _refresh_one_layer(layer)
 
         def _on_data_change(event=None, layer=None) -> None:
-            """Detect newly drawn shapes and seed their keyframes.
+            """React to any change of the layer's shapes.
 
-            A new shape arrives with the placeholder ``current_properties``
-            (empty ``keyframes_json``). We snapshot the shape's bbox at the
-            current T as its first keyframe and set ``t_start`` accordingly.
+            Handles three cases:
+
+            1. **Newly drawn shape**: ``keyframes_json`` is empty (from the
+               ``current_properties`` sentinel). We snapshot its current bbox
+               as a first keyframe at ``current_t`` and set ``t_start``.
+
+            2. **Vertex drag / resize on an existing shape**: the shape's
+               current vertices no longer match its interpolated bbox at
+               ``current_t``. We treat the drag as an implicit "update
+               keyframe at current T" — the keyframe at ``current_t`` (or a
+               newly-inserted one) is set to the dragged bbox. Without this,
+               the following ``_refresh_one_layer`` would recompute the
+               interpolated bbox from stale keyframes and silently revert
+               the user's drag.
+
+            3. **Delete**: n drops; property arrays are re-padded and
+               visuals refresh.
             """
             if layer.name in refreshing:
                 return
             n = len(layer.data)
             if n == 0:
+                _update_status_label()
                 return
-            kfs_json = layer.properties.get(
-                "keyframes_json", np.array([], dtype=object)
-            )
-            starts = layer.properties.get("t_start", np.array([], dtype=int))
-            new_kfs = list(kfs_json)
-            new_starts = list(int(s) for s in starts)
-            # Properties may lag layer.data by one element when napari hasn't
-            # yet auto-extended them from current_properties.
-            while len(new_kfs) < n:
-                new_kfs.append("")
-            while len(new_starts) < n:
-                new_starts.append(0)
-            changed = False
+            props = _pad_props(layer)
             current_t = _current_t_or_zero()
+            new_kfs = list(props["keyframes_json"])
+            new_starts = list(int(s) for s in props["t_start"])
+            seeded = 0
+            auto_kf = 0
             for i in range(n):
                 if not new_kfs[i]:
+                    # Case 1 — freshly drawn shape.
                     bbox = _shape_to_bbox(layer.data[i])
                     new_kfs[i] = _encode_keyframes(
                         [Keyframe(t=current_t, bbox=bbox)]
                     )
                     new_starts[i] = current_t
-                    changed = True
-            if changed:
-                new_props = dict(layer.properties)
-                new_props["keyframes_json"] = np.array(new_kfs, dtype=object)
-                new_props["t_start"] = np.array(new_starts, dtype=int)
-                layer.properties = new_props
-                _refresh_one_layer(layer)
+                    seeded += 1
+                else:
+                    # Case 2 — existing shape. Detect drag/resize by
+                    # comparing the current geometry to what interpolation
+                    # would give at current_t; auto-add/update a keyframe if
+                    # they differ.
+                    kfs = _decode_keyframes(new_kfs[i])
+                    current_bbox = _shape_to_bbox(layer.data[i])
+                    interp_bbox = _interpolate_bbox(kfs, current_t)
+                    if not _bboxes_close(interp_bbox, current_bbox):
+                        kfs = [kf for kf in kfs if kf.t != current_t]
+                        kfs.append(Keyframe(t=current_t, bbox=current_bbox))
+                        new_kfs[i] = _encode_keyframes(kfs)
+                        auto_kf += 1
+            props["keyframes_json"] = np.array(new_kfs, dtype=object)
+            props["t_start"] = np.array(new_starts, dtype=int)
+            layer.properties = props
+            _reset_current_properties(layer)
+            # events.data fires on any data change — new shape, vertex drag,
+            # resize, delete. Refresh unconditionally so labels / colors /
+            # visibility never go stale.
+            _refresh_one_layer(layer)
+            if auto_kf:
+                _report(
+                    f"auto-added keyframe @ T={current_t} on "
+                    f"{auto_kf} shape(s) in '{layer.name}'"
+                )
 
         viewer.dims.events.current_step.connect(_refresh_all_layers)
         for _layer in class_layers.values():
@@ -608,13 +694,12 @@ def open_for_annotation(
             the write persisted. Per-shape death lists are handled separately
             by ``_modify_deaths``.
             """
-            arr = layer.properties[field].copy()
+            props = _pad_props(layer)
+            arr = props[field]
             for i in indices:
                 arr[i] = value
-            new_props = dict(layer.properties)
-            new_props[field] = arr
-            layer.properties = new_props
-            layer.refresh()
+            layer.properties = props
+            _reset_current_properties(layer)
             _refresh_one_layer(layer)
             read_back = layer.properties[field]
             return all(int(read_back[i]) == value for i in indices)
@@ -625,7 +710,8 @@ def open_for_annotation(
             ``op`` is one of ``"add"`` (append ``t``), ``"pop"`` (drop the
             most recent), or ``"clear"`` (empty the list).
             """
-            arr = layer.properties["t_deaths_json"].copy()
+            props = _pad_props(layer)
+            arr = props["t_deaths_json"]
             for i in indices:
                 current = _decode_deaths(arr[i])
                 if op == "add":
@@ -635,10 +721,8 @@ def open_for_annotation(
                 elif op == "clear":
                     current = []
                 arr[i] = _encode_deaths(current)
-            new_props = dict(layer.properties)
-            new_props["t_deaths_json"] = arr
-            layer.properties = new_props
-            layer.refresh()
+            layer.properties = props
+            _reset_current_properties(layer)
             _refresh_one_layer(layer)
             return True
 
@@ -689,8 +773,6 @@ def open_for_annotation(
                     f"in '{layer.name}'"
                 )
 
-        from magicgui.widgets import Container, Label, PushButton
-
         def _btn(text: str, action) -> "PushButton":
             b = PushButton(text=text)
             b.clicked.connect(action)
@@ -699,13 +781,15 @@ def open_for_annotation(
         def _save_now() -> None:
             state.annotations = _collect()
             save(state, json_out)
-            _report(
+            msg = (
                 f"saved {len(state.annotations)} annotations "
                 f"({sum(1 for a in state.annotations if a.t_start > 0)} with birth, "
                 f"{sum(1 for a in state.annotations if a.t_end is not None)} with end, "
                 f"{sum(1 for a in state.annotations if a.t_deaths)} with death) "
                 f"-> {json_out}"
             )
+            _report(msg)
+            status_label.value = f"shapes: {len(state.annotations)} saved · " + status_label.value.removeprefix("shapes: ")
 
         def _death_op(op: str) -> None:
             if op == "add" and t_dim_in_viewer is None:
@@ -738,7 +822,8 @@ def open_for_annotation(
             if layer is None:
                 return
             current_t = _current_t()
-            kfs_json = layer.properties["keyframes_json"].copy()
+            props = _pad_props(layer)
+            kfs_json = props["keyframes_json"]
             for i in indices:
                 kfs = _decode_keyframes(kfs_json[i])
                 bbox = _shape_to_bbox(layer.data[i])
@@ -747,9 +832,8 @@ def open_for_annotation(
                 kfs = [kf for kf in kfs if kf.t != current_t]
                 kfs.append(Keyframe(t=current_t, bbox=bbox))
                 kfs_json[i] = _encode_keyframes(kfs)
-            new_props = dict(layer.properties)
-            new_props["keyframes_json"] = kfs_json
-            layer.properties = new_props
+            layer.properties = props
+            _reset_current_properties(layer)
             _refresh_one_layer(layer)
             _report(
                 f"added keyframe @ T={current_t} for {len(indices)} shape(s) in '{layer.name}'"
@@ -764,7 +848,8 @@ def open_for_annotation(
             if layer is None:
                 return
             current_t = _current_t()
-            kfs_json = layer.properties["keyframes_json"].copy()
+            props = _pad_props(layer)
+            kfs_json = props["keyframes_json"]
             removed_count = 0
             skipped_last = 0
             for i in indices:
@@ -777,9 +862,8 @@ def open_for_annotation(
                     continue  # refuse to leave the shape with zero keyframes
                 kfs_json[i] = _encode_keyframes(remaining)
                 removed_count += 1
-            new_props = dict(layer.properties)
-            new_props["keyframes_json"] = kfs_json
-            layer.properties = new_props
+            layer.properties = props
+            _reset_current_properties(layer)
             _refresh_one_layer(layer)
             msg = f"removed keyframe @ T={current_t} on {removed_count} shape(s)"
             if skipped_last:
@@ -830,6 +914,7 @@ def open_for_annotation(
 
         panel = Container(
             widgets=[
+                status_label,
                 Label(value="↑ Birth (first visible frame)"),
                 _row([birth_mark, birth_clear]),
                 Label(value="→ End of visibility (cell leaves FOV)"),
@@ -848,6 +933,7 @@ def open_for_annotation(
             labels=False,
         )
         viewer.window.add_dock_widget(panel, name="Lifecycle", area="right")
+        _update_status_label()
 
         napari.run()
 
