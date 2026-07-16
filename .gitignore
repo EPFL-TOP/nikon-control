@@ -13,6 +13,12 @@ dist/
 /data/*
 !/data/.gitkeep
 
+# large binary artifacts (microscopy data + model weights) — never commit
+*.nd2
+*.pth
+*.pt
+*.ckpt
+
 # generated overlays / debug outputs
 /out/
 

@@ -50,100 +50,98 @@ pytest
 
 The `nd2` extra is optional — omit it if you only have `.tif` test images.
 
-## Annotation tool
+## Annotation workflow
 
-To label cells in ND2 files for detector training:
+Two steps: an automated **pre-annotation** pass that places ROIs with the
+trained model, then a **Bokeh dashboard** where a human reviews, curates,
+and categorises. Both share the v0.5 annotation schema
+([src/nikon_control/schema.py](src/nikon_control/schema.py)); annotations
+are stored as `<file>.annotations.json` next to each ND2.
+
+### 1. Pre-annotate with the model
 
 ```sh
-pip install -e '.[annotate]'
-nikon-control-annotate path/to/file.nd2
-nikon-control-annotate path/to/file.nd2 --classes single doublet dividing
+pip install -e '.[detect]'
+nikon-control-preannotate path/to/file.nd2 cell_detection_model.pth --device cuda
+# → path/to/file.annotations.json   (omit --device to auto-pick; CPU on Mac)
 ```
 
-Opens the file in napari. One shape layer per class, colour-coded
-(red `single`, yellow `doublet`, cyan `debris`).
+Runs the trained Faster R-CNN on the brightfield channel at every
+timepoint, links detections into tracks (IoU association), and writes one
+provisional annotation (label `cell`) per tracked object, with a keyframe
+per timepoint (RDP-simplified). The human then reclassifies each `cell`
+as `single` / `doublet` / etc. in the dashboard.
 
-**To draw boxes:**
+### 2. Review & curate in the dashboard
 
-1. Click the class name in the **layer list on the left** (e.g. `single`)
-   to make that layer active.
-2. In the **layer toolbar** (small icons that appeared above the layer
-   list), pick the **rectangle tool**.
-3. Draw around each cell. The bbox is visible at every timepoint — cells
-   don't move much, no need to redraw.
+```sh
+pip install -e '.[dashboard]'
+nikon-control-dashboard --data-dir path/to/folder --show
+# multi-user / remote: add --allow-websocket-origin host:5006
+```
 
-**Lifecycle model.** Each bbox has these fields, exposed as button rows
-in the **Lifecycle** dock on the right:
+Opens in the browser. Pick an ND2, then:
 
-- **`t_start`** — first frame the cell/debris is visible (defaults to 0).
-- **`t_end`** — last frame visible (e.g. cell drifts out of FOV). Default
-  unset = visible until the end of the recording.
-- **`t_deaths`** — *list* of frames at which each cell dies. A single
-  cell has at most one entry; a doublet may have two (one per cell);
-  future multi-cell categories can have more.
+- **Detect cells** — the `Detect cells (refresh)` button runs the model
+  in-process (no terminal needed) and populates provisional `cell` tracks.
+  Re-running refreshes the `cell` boxes but **keeps** anything you already
+  reclassified. Point it at the model with `--weights` (below) or the
+  "Detection model (.pth)" field (auto-filled from any `.pth` in the data
+  folder).
+- **Detect debris** — the `Detect debris (refresh)` button finds *moving*
+  debris with no model: a temporal-median background is subtracted (static
+  cell + fixed structures drop out) and the transients are tracked with a
+  velocity tracker (debris moves too fast for the cell IoU tracker). Fixed
+  bubbles may show up as short tracks — delete the ones you don't want.
+- **Navigate time** — the T slider plus `◀ Prev` / `Next ▶` buttons.
+- **Track numbers** — each box shows `#N class` so you can confirm a track
+  stays on the same cell as you scrub; boxes are coloured per class (see
+  the legend).
+- **Draw / move / resize / delete ROIs** with the box-edit tool
+  (delete = shift-click). A drag at any frame auto-records a keyframe
+  there, so drifting debris tracks correctly.
+- **Category** — tap a box, pick its class from the dropdown.
+- **Lifecycle** — `Mark birth @T`, `Mark end @T` (leaves FOV), and
+  `Add death @T` (multiple allowed, e.g. a doublet's two cells).
+- **Channel + contrast** — annotate on BF, flip to mCherry-H2B or GFP to
+  judge single-vs-doublet or death.
+- **Save** writes back to the sibling JSON.
 
-Bboxes are **hidden entirely** outside their visibility range
-`[t_start, t_end]`. A `↑T=N` label sits above the box whenever it's
-visible and `t_start > 0`. Death markers `†T=N` are added one per death
-that's already happened at the current frame — so a doublet that loses
-its first cell at T=42 and the second at T=50 shows nothing before T=42,
-`†T=42` between T=42 and T=49, and `†T=42,50` from T=50 onwards.
+Boxes are hidden outside their `[t_start, t_end]` window; `↑T=` / `†T=`
+markers show birth/death at the current frame. Default classes:
+`single`, `doublet`, `debris`, `fission_fusion`.
 
-**Default classes**: `single`, `doublet`, `debris`, `fission_fusion` (the
-last covers cells that repeatedly split and merge — name is a placeholder,
-tell me if there's a better term).
+To enable in-dashboard detection, pass the model path at launch:
 
-**To mark any lifecycle field:**
+```sh
+nikon-control-dashboard --data-dir path/to/folder \
+    --weights cell_detection_model.pth --show
+```
 
-1. Scrub the T slider to the relevant frame.
-2. **Switch the layer toolbar from the rectangle tool to the *select
-   shapes* tool** (arrow icon, second from the left). This is the step
-   most users miss — leaving the rectangle tool active means clicking on
-   a box draws a new one instead of selecting it.
-3. Click the box.
-4. In the **Lifecycle** dock, click the relevant **Mark @ current T**
-   button under Birth, End, or Death.
+**Typical workflow — classify a track and record its death:**
 
-**To clear a mark**, same select flow, then click the matching button:
-*Clear birth* resets to T=0; *Clear end* removes the visibility-end
-marker; for deaths there are **Drop last** (pops the most recent death)
-and **Clear all** (empties the death list).
+1. Click `Detect cells (refresh)` (or open an ND2 that already has a
+   pre-annotation). Provisional `cell` boxes appear.
+2. Tap a box (tap tool). It selects the whole track (all timepoints).
+3. Choose `single` (or `doublet`, …) in the Category dropdown — the box
+   recolours.
+4. Scrub with the slider / `Next ▶` to the frame where the cell dies,
+   then click `Add death @T`. (For a doublet, do it again at the second
+   cell's death frame.)
+5. If the cell leaves the FOV, `Mark end @T` at the last visible frame.
+6. `Save annotations`.
 
-If you ever see "WARNING: ... did NOT persist", the napari install is
-misbehaving — tell me with the napari version.
+The lifecycle/keyframe model is documented in
+[docs/tracked-rois.md](docs/tracked-rois.md). The correctness-critical
+logic lives in the GUI-free, unit-tested
+[dashboard/state.py](src/nikon_control/dashboard/state.py).
 
-**Time-dependent ROIs (for drifting debris / migrating cells).** Each
-bbox carries a list of keyframes. Static cells need only the one
-keyframe placed when the box was drawn; drifting cells/debris can have
-several, and the displayed bbox is linearly interpolated between
-neighbouring keyframes (T outside the range snaps to the nearest one).
+### Legacy: napari annotator
 
-**Dragging a shape at any T automatically records a keyframe there**
-— no button click needed. Workflow:
-
-1. Scrub to the T where the cell has moved.
-2. Switch to the select-shapes tool, select the box, drag/resize it to
-   the cell's new position. A `auto-added keyframe @ T=<frame>` status
-   appears in napari's status bar.
-3. Repeat at other T values as the cell drifts further.
-
-The **Add @ current T** button in the **⊞ ROI keyframes** row exists as
-an explicit capture (e.g. to pin the current interpolated bbox as an
-authoritative keyframe without moving it). **Drop @ current T** removes
-the keyframe at the current T — refuses to leave a shape with zero
-keyframes.
-
-Detailed design + implementation notes in
-[docs/tracked-rois.md](docs/tracked-rois.md).
-
-**To save:** click **Save annotations** in the right dock. Output is
-`<file>.annotations.json` next to the ND2. The status bar reports how
-many annotations were saved and how many have a death marked.
-
-Schema documented in [src/nikon_control/annotate.py](src/nikon_control/annotate.py).
-Bounding boxes only (no masks). Each annotation has optional `t_start` and
-`t_end` recording the cell's lifecycle; defaults mean "alive the whole
-recording".
+The original `nikon-control-annotate` (napari) is retained but
+**superseded** by the dashboard above — it proved unstable for multi-user
+Windows/RDP use, which is why we moved to Bokeh. Its data model is
+unchanged (now in `schema.py`).
 
 ### Training-format export (planned, not built)
 

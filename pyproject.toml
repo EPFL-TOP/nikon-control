@@ -12,6 +12,22 @@ dependencies = [
 
 [project.optional-dependencies]
 nd2 = ["nd2>=0.10"]
+# Detection + tracking pipeline (runs the trained Faster R-CNN).
+detect = [
+  "nd2>=0.10",
+  "torch>=2.2",
+  "torchvision>=0.17",
+  "scipy>=1.10",
+]
+# Bokeh annotation dashboard (the replacement for the napari tool).
+dashboard = [
+  "nd2>=0.10",
+  "torch>=2.2",
+  "torchvision>=0.17",
+  "scipy>=1.10",
+  "bokeh>=3.4",
+]
+# Legacy napari annotator (superseded by the Bokeh dashboard).
 annotate = [
   "nd2>=0.10",
   "napari[all]>=0.4.18",
@@ -22,6 +38,8 @@ dev = ["pytest>=7"]
 [project.scripts]
 nikon-control = "nikon_control.cli:main"
 nikon-control-annotate = "nikon_control.annotate:main"
+nikon-control-preannotate = "nikon_control.preannotate:main"
+nikon-control-dashboard = "nikon_control.dashboard.launch:main"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]
