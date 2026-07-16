@@ -28,10 +28,15 @@ nikon-control-dashboard --data-dir "Z:\experiments\2026-07" ^
 
 `--data-dir` and `--weights` only set the *starting* folder/model —
 annotators without terminal access can navigate to any folder, ND2, and
-`.pth` from the in-page file browser (Folder field + Up / Refresh /
-Subfolders dropdown). So a fixed launch like
-`nikon-control-dashboard --show` (starting in the current folder) is
-enough; users browse from there.
+`.pth` from the in-page file browser: a **Drive / volume** dropdown to
+switch between drive letters (C:, E:, G:, network mounts), plus the Folder
+field + Up / Refresh / Subfolders dropdown. So a fixed launch like
+`nikon-control-dashboard --show` is enough; users browse from there.
+
+Site defaults are baked in (edit `_DEFAULT_DATA_DIRS` / `_DEFAULT_WEIGHTS`
+in `src/nikon_control/dashboard/app.py`): the browser starts in
+`G:\PROJECTS-02\Samuel` when the launch folder has no ND2s, and the model
+defaults to `E:\PROJECTS-01\Clement\cell_detection_model.pth`.
 
 If the `nikon-control-dashboard` command isn't found (console script not on
 PATH), the module form always works:

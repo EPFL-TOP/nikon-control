@@ -80,9 +80,10 @@ nikon-control-dashboard --data-dir path/to/folder --show
 # multi-user / remote: add --allow-websocket-origin host:5006
 ```
 
-Opens in the browser. **Open a file** without the terminal: use the folder
-field + Up / Refresh / Subfolders dropdown to navigate, pick the ND2 from
-the dropdown, click **Load**. The detection model is picked the same way
+Opens in the browser. **Open a file** without the terminal: use the
+**Drive / volume** dropdown to switch drives (C:, E:, G:, …), the folder
+field + Up / Refresh / Subfolders dropdown to navigate, then pick the ND2
+from the dropdown and click **Load**. The detection model is picked the same way
 (dropdown of `.pth` in the folder, or paste a path). `--data-dir` /
 `--weights` at launch just set the starting folder — you can browse
 anywhere from the page. Then:

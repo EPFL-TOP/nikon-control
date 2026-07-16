@@ -29,6 +29,28 @@ _DEFAULT_WEIGHTS = [
     r"E:\PROJECTS-01\Clement\cell_detection_model.pth",
 ]
 
+# Fallback data folders the browser starts in when the launch folder has no
+# ND2 files. Add site-specific defaults here.
+_DEFAULT_DATA_DIRS = [
+    r"G:\PROJECTS-02\Samuel",
+]
+
+
+def _list_drives() -> list[str]:
+    """Available volumes to jump between: Windows drive letters, or the root
+    and /Volumes mounts on macOS/Linux."""
+    if os.name == "nt":
+        return [f"{c}:\\" for c in string.ascii_uppercase
+                if os.path.exists(f"{c}:\\")]
+    vols = ["/"]
+    v = Path("/Volumes")
+    if v.exists():
+        try:
+            vols += [str(p) for p in sorted(v.iterdir()) if p.is_dir()]
+        except Exception:
+            pass
+    return vols
+
 
 def _class_color(classes: list[str]) -> dict[str, str]:
     return {c: _PALETTE[i % len(_PALETTE)] for i, c in enumerate(classes)}
@@ -73,6 +95,17 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
     from ..preannotate import detect_and_track, detect_debris
 
     data_dir = Path(data_dir)
+    # Start the browser at a site-default data folder when the launch folder
+    # has no ND2s (e.g. a bare `--show` launch from the cwd).
+    try:
+        has_nd2 = any(data_dir.glob("*.nd2"))
+    except Exception:
+        has_nd2 = False
+    if not has_nd2:
+        for cand in _DEFAULT_DATA_DIRS:
+            if Path(cand).is_dir():
+                data_dir = Path(cand)
+                break
     # Fall back to a site default model if none was provided at launch.
     if not weights_path:
         for cand in _DEFAULT_WEIGHTS:
@@ -84,6 +117,8 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
     # In-page file browser so users who can't use a terminal can navigate to
     # the ND2 and the model without --data-dir/--weights. Server-side listing
     # (the browser only shows the lists); safe for multi-user RDP.
+    drive_select = Select(title="Drive / volume", value="",
+                          options=_list_drives(), width=150)
     dir_input = TextInput(title="Folder", value=str(data_dir))
     up_btn = Button(label="⬆ Up", width=70)
     refresh_btn = Button(label="⟳ Refresh", width=90)
@@ -201,6 +236,11 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
     def _on_up(*_) -> None:
         dir_input.value = str(Path(dir_input.value).expanduser().parent)
         _rescan()
+
+    def _on_drive(attr, old, new) -> None:
+        if new:
+            dir_input.value = new
+            _rescan()
 
     def _on_weights_pick(attr, old, new) -> None:
         if new and new != "(none)":
@@ -672,6 +712,7 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
     dir_input.on_change("value", lambda a, o, n: None)  # typing; Refresh applies
     refresh_btn.on_click(_rescan)
     up_btn.on_click(_on_up)
+    drive_select.on_change("value", _on_drive)
     subdir_select.on_change("value", _on_subdir)
     weights_select.on_change("value", _on_weights_pick)
     detect_btn.on_click(do_detect)
@@ -733,8 +774,11 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
     save_btn.on_click(do_save)
 
     # ---- layout --------------------------------------------------------
+    # Middle column: file / detection / view. Right column: everything to do
+    # with annotating (category, lifecycle, save) + the class legend.
     controls = column(
         Div(text="<b>Open a file</b>"),
+        drive_select,
         dir_input,
         row(up_btn, refresh_btn),
         subdir_select,
@@ -747,12 +791,16 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
         chan_select, contrast,
         row(prev_btn, play_btn, next_btn),
         row(t_slider, speed_select),
+        width=360,
+    )
+    annotate_col = column(
+        Div(text="<h3 style='margin:2px 0'>Annotation</h3>"),
+        legend,
         Div(text="<b>Editing ROIs</b> — pick the <i>Box Edit</i> tool (top-"
                  "right toolbar). <b>Add</b>: click-drag on empty area. "
                  "<b>Move</b>: drag a box. <b>Delete</b>: tap to select then "
                  "press Backspace (or Shift-click). <b>Resize</b>: delete and "
-                 "redraw. A new box gets the default category — set it in the "
-                 "dropdown below.",
+                 "redraw. A new box gets the default category — set it below.",
             styles={"font-size": "11px", "color": "#666"}),
         Div(text="<b>Selected ROI</b> — tap a box first (it turns white)"),
         label_select,
@@ -776,10 +824,9 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
         row(kf_add, kf_drop),
         save_btn,
         status,
-        width=380,
+        width=480,
     )
-    legend_col = column(legend, width=150)
-    doc.add_root(row(column(fig, progress_div), controls, legend_col))
+    doc.add_root(row(column(fig, progress_div), controls, annotate_col))
     doc.title = "nikon-control — cell annotation"
 
     def _cleanup(session_context) -> None:
