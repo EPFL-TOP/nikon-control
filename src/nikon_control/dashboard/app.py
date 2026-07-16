@@ -11,6 +11,8 @@ effects so it can be constructed in a test with a bare ``Document``.
 """
 from __future__ import annotations
 
+import os
+import string
 from pathlib import Path
 
 import numpy as np
@@ -20,6 +22,12 @@ from .state import DashboardState
 
 # distinct line colours per class (cycled)
 _PALETTE = ["#ff3b30", "#ffcc00", "#34c759", "#00c7be", "#ff9500", "#af52de"]
+
+# Fallback model locations tried when --weights isn't given and no .pth sits
+# in the data folder. Add site-specific defaults here.
+_DEFAULT_WEIGHTS = [
+    r"E:\PROJECTS-01\Clement\cell_detection_model.pth",
+]
 
 
 def _class_color(classes: list[str]) -> dict[str, str]:
@@ -65,6 +73,12 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
     from ..preannotate import detect_and_track, detect_debris
 
     data_dir = Path(data_dir)
+    # Fall back to a site default model if none was provided at launch.
+    if not weights_path:
+        for cand in _DEFAULT_WEIGHTS:
+            if Path(cand).exists():
+                weights_path = cand
+                break
 
     # ---- widgets (created empty; populated on load) --------------------
     # In-page file browser so users who can't use a terminal can navigate to
@@ -380,10 +394,11 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
             return
         colors = _class_color(st.classes)
         chips = "".join(
-            f'<span style="color:{colors[c]}">■</span> {c} &nbsp; '
+            f'<div style="margin:3px 0"><span style="color:{colors[c]};'
+            f'font-size:16px">■</span> {c}</div>'
             for c in st.classes
         )
-        legend.text = "<b>Classes:</b> " + chips
+        legend.text = "<b>Classes</b>" + chips
 
     # ---- edit reconciliation (BoxEditTool -> controller) ---------------
     def on_box_data_change(attr, old, new) -> None:
@@ -547,10 +562,11 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
                     ctx["detector"] = det
                 else:
                     det.score_threshold = score_slider.value
+                dev = det.device.upper()  # CUDA or CPU — surfaced to the user
 
                 def prog(done, total):
                     if done % 10 == 0 or done == total:
-                        _tick(f"Detecting… frame {done}/{total}")
+                        _tick(f"Detecting on {dev}… frame {done}/{total}")
 
                 anns = detect_and_track(
                     det, ctx["plane"], ctx["bf_index"], st.n_t,
@@ -563,9 +579,11 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
                     _render_boxes()
                     detect_btn.disabled = False
                     progress_div.text = ""
+                    cpu_hint = (" — running on CPU (slow); see docs to install "
+                                "the CUDA build of torch for GPU") if dev == "CPU" else ""
                     status.text = (
-                        f"Detected {n} '{ctx['default_label']}' track(s). "
-                        "Curated tracks were kept. Review & save."
+                        f"Detected {n} '{ctx['default_label']}' track(s) on "
+                        f"{dev}. Curated tracks kept. Review & save.{cpu_hint}"
                     )
                 doc.add_next_tick_callback(finish)
             except Exception as exc:
@@ -729,7 +747,6 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
         chan_select, contrast,
         row(prev_btn, play_btn, next_btn),
         row(t_slider, speed_select),
-        legend,
         Div(text="<b>Editing ROIs</b> — pick the <i>Box Edit</i> tool (top-"
                  "right toolbar). <b>Add</b>: click-drag on empty area. "
                  "<b>Move</b>: drag a box. <b>Delete</b>: tap to select then "
@@ -761,7 +778,8 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
         status,
         width=380,
     )
-    doc.add_root(row(column(fig, progress_div), controls))
+    legend_col = column(legend, width=150)
+    doc.add_root(row(column(fig, progress_div), controls, legend_col))
     doc.title = "nikon-control — cell annotation"
 
     def _cleanup(session_context) -> None:

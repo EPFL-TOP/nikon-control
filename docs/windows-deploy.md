@@ -51,6 +51,34 @@ nikon-control-dashboard --data-dir "Z:\exp" --port 5006 ^
 then open `http://myserver.epfl.ch:5006` in a browser. Multiple users can
 each open the URL — every browser tab is its own independent session.
 
+### GPU acceleration (make detection fast)
+
+The dashboard shows the device it used, e.g. *"Detected N tracks on
+**CUDA**"* or *"…on **CPU** (slow)…"* in the status line after `Detect
+cells`. If it says CPU, detection is running on the processor — on Windows
+`pip install torch` installs the **CPU-only** build by default, so the
+NVIDIA GPU is never used.
+
+To install the CUDA build (in the same conda env), replace torch with a
+CUDA wheel:
+
+```bat
+conda activate single-cells
+pip uninstall -y torch torchvision
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+```
+
+(Use `cu124` instead of `cu121` for very new drivers; `cu118` for older
+ones — any that your driver supports.) Verify:
+
+```bat
+python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+```
+
+It should print `True <your GPU>`. Then the dashboard's Detect will report
+**CUDA** and run ~10–50 ms/frame instead of ~0.5–0.7 s/frame. Debris
+detection is CPU-based (classical image processing) and unaffected.
+
 ## Prerequisites (both tools)
 
 - Windows 10 / 11 / Server with RDP enabled.
