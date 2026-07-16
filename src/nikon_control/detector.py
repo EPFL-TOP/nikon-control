@@ -218,9 +218,19 @@ class CellDetector:
                 f"{len(missing)} missing, {len(unexpected)} unexpected keys. "
                 "Is this the right architecture / checkpoint?"
             )
-        model.eval().to(device)
+        # Move to the RESOLVED device (self.device), not the raw `device`
+        # arg — which is None in the auto-detect path, making .to(None) a
+        # no-op that leaves the model on CPU while inputs go to CUDA.
+        model.eval().to(self.device)
         self._model = model
         self._torch = torch
+        # fail loudly if the model didn't land where inputs will go
+        param_dev = next(model.parameters()).device.type
+        want = "cuda" if str(self.device).startswith("cuda") else str(self.device)
+        if param_dev != want:
+            raise RuntimeError(
+                f"model on '{param_dev}' but device is '{self.device}'"
+            )
 
     def detect_frame(self, bf_plane: np.ndarray) -> list[Detection]:
         """Detect cells in a single 2D brightfield plane."""
