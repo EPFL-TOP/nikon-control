@@ -65,20 +65,20 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
     from ..preannotate import detect_and_track, detect_debris
 
     data_dir = Path(data_dir)
-    nd2_files = sorted(p.name for p in data_dir.glob("*.nd2"))
-    # If no weights given at launch, auto-discover a .pth in the data dir so
-    # the Detect button works without the user hunting for the path.
-    if not weights_path:
-        found = sorted(data_dir.glob("*.pth"))
-        if found:
-            weights_path = str(found[0])
 
     # ---- widgets (created empty; populated on load) --------------------
-    file_select = Select(
-        title="ND2 file", value=nd2_files[0] if nd2_files else "",
-        options=nd2_files,
-    )
+    # In-page file browser so users who can't use a terminal can navigate to
+    # the ND2 and the model without --data-dir/--weights. Server-side listing
+    # (the browser only shows the lists); safe for multi-user RDP.
+    dir_input = TextInput(title="Folder", value=str(data_dir))
+    up_btn = Button(label="⬆ Up", width=70)
+    refresh_btn = Button(label="⟳ Refresh", width=90)
+    subdir_select = Select(title="Subfolders (pick to open)", value="",
+                           options=[])
+    file_select = Select(title="ND2 file", value="", options=[])
     load_btn = Button(label="Load", button_type="primary")
+    weights_select = Select(title="Model (.pth) in this folder", value="",
+                            options=[])
     t_slider = Slider(start=0, end=1, value=0, step=1, title="T (frame)")
     prev_btn = Button(label="◀ Prev", width=80)
     play_btn = Button(label="▶ Play", width=90)
@@ -99,6 +99,11 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
     legend = Div(text="", styles={"font-size": "11px"})
     status = Div(text="Pick an ND2 file and click Load.",
                  styles={"font-size": "12px"})
+    # large progress banner shown UNDER the image during detection
+    progress_div = Div(text="", styles={
+        "font-size": "22px", "font-weight": "bold", "color": "#0a7",
+        "padding": "8px 4px",
+    })
 
     def _btn(label, kind="default"):
         return Button(label=label, button_type=kind, width=150)
@@ -144,7 +149,48 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
     # ---- mutable session context --------------------------------------
     ctx: dict = {"state": None, "plane": None, "n_c": 1, "channels": [],
                  "syncing": False, "default_label": "cell",
-                 "selected_ids": [], "json_mtime": None, "play_cb": None}
+                 "selected_ids": [], "json_mtime": None, "play_cb": None,
+                 "frame_loading": False, "data_dir": data_dir}
+
+    # ---- in-page directory browser ------------------------------------
+    def _rescan(*_) -> None:
+        d = Path(dir_input.value).expanduser()
+        try:
+            entries = sorted(d.iterdir(), key=lambda x: x.name.lower())
+        except Exception as exc:
+            status.text = f"⚠ cannot read folder '{d}': {exc}"
+            return
+        subs = [p.name for p in entries if p.is_dir() and not p.name.startswith(".")]
+        nd2s = [p.name for p in entries if p.suffix.lower() == ".nd2"]
+        pths = [p.name for p in entries if p.suffix.lower() == ".pth"]
+        ctx["data_dir"] = d
+        subdir_select.options = ["(open a subfolder…)"] + subs
+        subdir_select.value = "(open a subfolder…)"
+        file_select.options = nd2s
+        file_select.value = nd2s[0] if nd2s else ""
+        weights_select.options = ["(none)"] + pths
+        # auto-fill the model path from this folder if not already valid
+        if pths and (not weights_input.value
+                     or not Path(weights_input.value).exists()):
+            weights_input.value = str(d / pths[0])
+            weights_select.value = pths[0]
+        else:
+            weights_select.value = "(none)"
+        status.text = (f"{len(nd2s)} ND2, {len(pths)} model(s) in {d} — "
+                       "pick an ND2 and click Load.")
+
+    def _on_subdir(attr, old, new) -> None:
+        if new and not new.startswith("("):
+            dir_input.value = str(Path(dir_input.value).expanduser() / new)
+            _rescan()
+
+    def _on_up(*_) -> None:
+        dir_input.value = str(Path(dir_input.value).expanduser().parent)
+        _rescan()
+
+    def _on_weights_pick(attr, old, new) -> None:
+        if new and new != "(none)":
+            weights_input.value = str(ctx["data_dir"] / new)
 
     def _on_select(attr, old, new) -> None:
         # Track selection by STABLE ID, not row index. box_src.data is
@@ -259,7 +305,7 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
             status.text = "No ND2 file selected."
             return
         _stop_play()  # stop any running playback before switching files
-        path = data_dir / name
+        path = ctx["data_dir"] / name
         # close a previously-open file when switching ND2s
         prev = ctx.get("nd2_file")
         if prev is not None:
@@ -416,15 +462,36 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
         _render_image()
 
     def _advance_frame() -> None:
+        # Playback tick. The frame read (dask/ND2 disk decode) is done in a
+        # worker thread so it never blocks the shared Bokeh IOLoop (which
+        # would stall other annotators' sessions on the RDP server). An
+        # in-flight guard drops ticks while a read is pending, so frames are
+        # dropped rather than queued unboundedly at high fps.
         st = ctx["state"]
-        if st is None:
+        if st is None or ctx.get("frame_loading"):
             return
         new_t = st.current_t + 1
         if new_t >= st.n_t:
-            new_t = 0  # loop back to the start
-        t_slider.value = new_t   # fires on_t -> boxes
-        st.set_t(new_t)
-        _render_image()
+            new_t = 0  # loop
+        ctx["frame_loading"] = True
+        c = _chan_index()
+
+        def work(tt=new_t, cc=c):
+            try:
+                plane = ctx["plane"](tt, cc)
+            except Exception:
+                plane = None
+
+            def apply():
+                ctx["frame_loading"] = False
+                if plane is None:
+                    return
+                st.set_t(tt)
+                t_slider.value = tt      # fires on_t -> boxes (cheap)
+                img_src.data = {"image": [plane]}
+            doc.add_next_tick_callback(apply)
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _stop_play() -> None:
         cb = ctx.get("play_cb")
@@ -434,6 +501,7 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
             except Exception:
                 pass
             ctx["play_cb"] = None
+        ctx["frame_loading"] = False
         play_btn.label = "▶ Play"
 
     def toggle_play() -> None:
@@ -468,7 +536,7 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
         status.text = "Loading detection model…"
 
         def _tick(msg: str) -> None:
-            doc.add_next_tick_callback(lambda: setattr(status, "text", msg))
+            doc.add_next_tick_callback(lambda: setattr(progress_div, "text", msg))
 
         def work() -> None:
             try:
@@ -494,6 +562,7 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
                     ctx["selected_ids"] = []
                     _render_boxes()
                     detect_btn.disabled = False
+                    progress_div.text = ""
                     status.text = (
                         f"Detected {n} '{ctx['default_label']}' track(s). "
                         "Curated tracks were kept. Review & save."
@@ -502,6 +571,7 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
             except Exception as exc:
                 def fail(exc=exc):
                     detect_btn.disabled = False
+                    progress_div.text = ""
                     status.text = f"⚠ Detection failed: {exc}"
                 doc.add_next_tick_callback(fail)
 
@@ -516,7 +586,7 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
         status.text = "Detecting debris (motion-based)…"
 
         def _tick(msg):
-            doc.add_next_tick_callback(lambda: setattr(status, "text", msg))
+            doc.add_next_tick_callback(lambda: setattr(progress_div, "text", msg))
 
         # Snapshot the current cell boxes so debris whose centre falls inside
         # a cell (the cell's own texture flicker, or a doublet's lobes /
@@ -558,20 +628,34 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
                     _render_boxes()
                     _render_legend()
                     detect_debris_btn.disabled = False
+                    progress_div.text = ""
+                    warn = ""
+                    if not cell_anns:
+                        warn = (
+                            " ⚠ No cell ROIs present, so debris ON cells was "
+                            "NOT excluded — run 'Detect cells' first for best "
+                            "results."
+                        )
                     status.text = (
                         f"Detected {n} debris track(s). Review & save. "
-                        "(fixed bubbles may appear — delete if unwanted)"
+                        f"(fixed bubbles may appear — delete if unwanted).{warn}"
                     )
                 doc.add_next_tick_callback(finish)
             except Exception as exc:
                 def fail(exc=exc):
                     detect_debris_btn.disabled = False
+                    progress_div.text = ""
                     status.text = f"⚠ Debris detection failed: {exc}"
                 doc.add_next_tick_callback(fail)
 
         threading.Thread(target=work, daemon=True).start()
 
     load_btn.on_click(do_load)
+    dir_input.on_change("value", lambda a, o, n: None)  # typing; Refresh applies
+    refresh_btn.on_click(_rescan)
+    up_btn.on_click(_on_up)
+    subdir_select.on_change("value", _on_subdir)
+    weights_select.on_change("value", _on_weights_pick)
     detect_btn.on_click(do_detect)
     detect_debris_btn.on_click(do_detect_debris)
     prev_btn.on_click(lambda: _step_t(-1))
@@ -632,8 +716,13 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
 
     # ---- layout --------------------------------------------------------
     controls = column(
+        Div(text="<b>Open a file</b>"),
+        dir_input,
+        row(up_btn, refresh_btn),
+        subdir_select,
         row(file_select, load_btn),
         Div(text="<b>Detection</b>"),
+        weights_select,
         weights_input, score_slider,
         row(detect_btn, detect_debris_btn),
         Div(text="<b>View</b>"),
@@ -641,6 +730,13 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
         row(prev_btn, play_btn, next_btn),
         row(t_slider, speed_select),
         legend,
+        Div(text="<b>Editing ROIs</b> — pick the <i>Box Edit</i> tool (top-"
+                 "right toolbar). <b>Add</b>: click-drag on empty area. "
+                 "<b>Move</b>: drag a box. <b>Delete</b>: tap to select then "
+                 "press Backspace (or Shift-click). <b>Resize</b>: delete and "
+                 "redraw. A new box gets the default category — set it in the "
+                 "dropdown below.",
+            styles={"font-size": "11px", "color": "#666"}),
         Div(text="<b>Selected ROI</b> — tap a box first (it turns white)"),
         label_select,
         Div(text="<i>For most cells: just set the category, then mark death. "
@@ -665,10 +761,11 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
         status,
         width=380,
     )
-    doc.add_root(row(fig, controls))
+    doc.add_root(row(column(fig, progress_div), controls))
     doc.title = "nikon-control — cell annotation"
 
     def _cleanup(session_context) -> None:
+        _stop_play()  # cancel the playback periodic callback
         fobj = ctx.get("nd2_file")
         if fobj is not None:
             try:
@@ -681,5 +778,6 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
     except Exception:
         pass  # bare Document (tests) has no session lifecycle
 
-    if nd2_files:
-        do_load()
+    _rescan()  # populate the browser from the launch folder
+    if file_select.value:
+        do_load()  # auto-load the first ND2 if the launch folder has one

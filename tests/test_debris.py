@@ -33,6 +33,25 @@ def test_velocity_tracker_keeps_two_crossing_objects_separate():
     assert all(len(tr.frames) == 5 for tr in tracks)
 
 
+def test_velocity_tracker_static_track_does_not_jump_to_far_transient():
+    # a static blob at (1000,1000); at t=3 its own detection is missing and a
+    # transient appears 350px away (within max_dist but far). Adaptive gating
+    # must NOT let the established static track jump to it (the "static debris
+    # that moves" bug).
+    per_frame = [
+        [_d(1000, 1000)],
+        [_d(1000, 1000)],
+        [_d(1000, 1000)],
+        [_d(1000, 650)],   # static missing this frame; transient 350px away
+        [_d(1000, 1000)],
+    ]
+    tracks = VelocityTracker(max_dist=500, base_gate=100).track(per_frame)
+    static = max(tracks, key=lambda t: len(t.frames))
+    xs = [(b[1] + b[3]) / 2 for b in static.bboxes]
+    # the static track's x-centres stay near 1000 — it never jumps to ~650
+    assert all(abs(x - 1000) < 60 for x in xs)
+
+
 def test_velocity_tracker_bridges_one_missed_frame():
     per_frame = [
         [_d(100, 100)],

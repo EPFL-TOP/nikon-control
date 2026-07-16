@@ -161,9 +161,33 @@ class VelocityTracker:
     max_age: frames a track may go unmatched before it closes.
     """
 
-    def __init__(self, max_dist: float = 150.0, max_age: int = 2):
+    def __init__(
+        self,
+        max_dist: float = 150.0,
+        max_age: int = 2,
+        base_gate: float = 100.0,
+        vel_factor: float = 2.0,
+    ):
+        # Gating is velocity-adaptive to avoid the "static debris that jumps"
+        # artefact: an established track's match gate is
+        # ``base_gate + vel_factor*speed`` (capped at ``max_dist``), so a
+        # stationary blob (speed≈0) uses a tight ``base_gate`` and cannot grab
+        # a far transient when its own detection momentarily drops, while a
+        # genuinely fast track keeps a wide gate. A brand-new track (velocity
+        # not yet known) uses the full ``max_dist`` so a fast crosser's first
+        # step can still link.
         self.max_dist = max_dist
         self.max_age = max_age
+        self.base_gate = base_gate
+        self.vel_factor = vel_factor
+
+    def _gate(self, a: dict) -> float:
+        import math
+
+        if len(a["track"].frames) < 2:  # velocity not yet established
+            return self.max_dist
+        speed = math.hypot(a["vy"], a["vx"])
+        return min(self.max_dist, self.base_gate + self.vel_factor * speed)
 
     def track(self, per_frame: Sequence[Sequence[Detection]]) -> list[Track]:
         import math
@@ -198,7 +222,7 @@ class VelocityTracker:
             matched_d: set[int] = set()
             for ai, di in pairs:
                 py, px = active[ai]["cy"] + active[ai]["vy"], active[ai]["cx"] + active[ai]["vx"]
-                if math.dist((py, px), centers[di]) <= self.max_dist:
+                if math.dist((py, px), centers[di]) <= self._gate(active[ai]):
                     a = active[ai]
                     cy, cx = centers[di]
                     a["vy"], a["vx"] = cy - a["cy"], cx - a["cx"]

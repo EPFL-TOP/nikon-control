@@ -3,7 +3,55 @@
 Target setup: a Windows machine that several lab members RDP into to run
 the annotation tool against ND2 files on a shared drive.
 
-## Prerequisites
+> The current tool is the **Bokeh dashboard** (`nikon-control-dashboard`).
+> The napari `nikon-control-annotate` tool below is retired/legacy. Jump to
+> [Running the dashboard](#running-the-dashboard) if it's already installed.
+
+## Running the dashboard
+
+In a conda env (or the venv), with the package installed
+(`pip install -e ".[dashboard]"`):
+
+```bat
+conda activate single-cells
+nikon-control-dashboard --data-dir "Z:\experiments\2026-07" ^
+    --weights "C:\Tools\nikon-control\cell_detection_model.pth" --show
+```
+
+- `--data-dir` — folder of `.nd2` files (their `.annotations.json` sidecars
+  are written alongside). Pick the file from the dropdown in the browser.
+- `--weights` — path to `cell_detection_model.pth` (enables the in-app
+  *Detect cells* button; also auto-discovered if a `.pth` sits in the data
+  folder).
+- `--show` — opens a browser tab automatically. It serves at
+  <http://localhost:5006>.
+
+`--data-dir` and `--weights` only set the *starting* folder/model —
+annotators without terminal access can navigate to any folder, ND2, and
+`.pth` from the in-page file browser (Folder field + Up / Refresh /
+Subfolders dropdown). So a fixed launch like
+`nikon-control-dashboard --show` (starting in the current folder) is
+enough; users browse from there.
+
+If the `nikon-control-dashboard` command isn't found (console script not on
+PATH), the module form always works:
+
+```bat
+python -m nikon_control.dashboard.launch --data-dir "Z:\experiments\2026-07" --show
+```
+
+**Reaching it from another machine** (not the server console): add the
+server's hostname so Bokeh accepts the websocket, and browse to it:
+
+```bat
+nikon-control-dashboard --data-dir "Z:\exp" --port 5006 ^
+    --allow-websocket-origin myserver.epfl.ch:5006
+```
+
+then open `http://myserver.epfl.ch:5006` in a browser. Multiple users can
+each open the URL — every browser tab is its own independent session.
+
+## Prerequisites (both tools)
 
 - Windows 10 / 11 / Server with RDP enabled.
 - Python **3.11** (recommended) or 3.12.
@@ -37,8 +85,12 @@ cd nikon-control
 py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-pip install -e ".[annotate]"
+pip install -e ".[dashboard]"     # the current Bokeh tool + detection
+# pip install -e ".[annotate]"    # only if you still need the legacy napari tool
 ```
+
+(Installing into a conda env instead of a venv is fine — `conda activate
+<env>` then the same `pip install -e ".[dashboard]"`.)
 
 If `Activate.ps1` is blocked by execution policy, run once (current user
 only):
@@ -55,9 +107,10 @@ nikon-control-annotate --help
 
 Should print the CLI usage. If it does, napari + nd2 are wired correctly.
 
-## Launcher for end users
+## Launcher for the legacy napari tool
 
-Most annotators will not want to touch PowerShell. Create a batch file
+*(Skip this if you're using the Bokeh dashboard above.)* Most annotators
+will not want to touch PowerShell. Create a batch file
 `C:\Tools\nikon-control\annotate.bat`:
 
 ```bat
