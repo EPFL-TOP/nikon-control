@@ -128,26 +128,29 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
     load_btn = Button(label="Load", button_type="primary")
     weights_select = Select(title="Model (.pth) in this folder", value="",
                             options=[])
-    t_slider = Slider(start=0, end=1, value=0, step=1, title="T (frame)")
+    # widths kept within the 360px middle column so nothing bleeds into the
+    # annotation column on the right
+    t_slider = Slider(start=0, end=1, value=0, step=1, title="T (frame)",
+                      width=230)
     prev_btn = Button(label="◀ Prev", width=80)
     play_btn = Button(label="▶ Play", width=90)
     next_btn = Button(label="Next ▶", width=80)
     speed_select = Select(title="Speed (fps)", value="5",
                           options=["2", "5", "10", "20"], width=110)
-    chan_select = Select(title="Channel", value="", options=[])
+    chan_select = Select(title="Channel", value="", options=[], width=340)
     contrast = RangeSlider(start=0, end=65535, value=(0, 65535),
-                           step=1, title="Contrast")
+                           step=1, title="Contrast", width=340)
     label_select = Select(title="Category (applies to selected)",
-                          value="", options=[])
+                          value="", options=[], width=300)
     weights_input = TextInput(title="Detection model (.pth)",
                               value=weights_path)
     score_slider = Slider(start=0.1, end=0.95, value=0.5, step=0.05,
                           title="Detection score threshold")
     detect_btn = Button(label="Detect cells (refresh)", button_type="warning")
     detect_debris_btn = Button(label="Detect debris (refresh)", button_type="warning")
-    legend = Div(text="", styles={"font-size": "11px"})
+    legend = Div(text="", styles={"font-size": "11px"}, width=460)
     status = Div(text="Pick an ND2 file and click Load.",
-                 styles={"font-size": "12px"})
+                 styles={"font-size": "12px"}, width=460)
     # large progress banner shown UNDER the image during detection
     progress_div = Div(text="", styles={
         "font-size": "22px", "font-weight": "bold", "color": "#0a7",
@@ -793,40 +796,42 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
         row(t_slider, speed_select),
         width=360,
     )
+    _help = dict(styles={"font-size": "11px", "color": "#666"}, width=460)
     annotate_col = column(
-        Div(text="<h3 style='margin:2px 0'>Annotation</h3>"),
+        Div(text="<h3 style='margin:2px 0'>Annotation</h3>", width=460),
         legend,
         Div(text="<b>Editing ROIs</b> — pick the <i>Box Edit</i> tool (top-"
                  "right toolbar). <b>Add</b>: click-drag on empty area. "
                  "<b>Move</b>: drag a box. <b>Delete</b>: tap to select then "
                  "press Backspace (or Shift-click). <b>Resize</b>: delete and "
                  "redraw. A new box gets the default category — set it below.",
-            styles={"font-size": "11px", "color": "#666"}),
-        Div(text="<b>Selected ROI</b> — tap a box first (it turns white)"),
+            **_help),
+        Div(text="<b>Selected ROI</b> — tap a box first (it turns white)",
+            width=460),
         label_select,
         Div(text="<i>For most cells: just set the category, then mark death. "
                  "Birth / End / Keyframe below are only for the special cases "
-                 "described.</i>",
-            styles={"font-size": "11px", "color": "#666"}),
+                 "described.</i>", **_help),
         Div(text="† <b>Death</b> — frame a cell dies (it stays visible as a "
-                 "corpse). A doublet can have two deaths."),
+                 "corpse). A doublet can have two deaths.", **_help),
         row(death_add, death_pop, death_clear),
         Div(text="↑ <b>Birth</b> — first frame the cell exists. Only if it "
                  "appears mid-movie (enters, or born from a division). "
-                 "Default: from frame 0."),
+                 "Default: from frame 0.", **_help),
         row(birth_mark, birth_clear),
         Div(text="→ <b>End</b> — last frame visible. Only if the cell leaves "
-                 "the FOV (not for death). Default: to the last frame."),
+                 "the FOV (not for death). Default: to the last frame.", **_help),
         row(end_mark, end_clear),
         Div(text="⊞ <b>Keyframe</b> — only for a moving ROI: drag the box to "
                  "follow the object, then Add, and it interpolates between. "
-                 "Static cells never need this."),
+                 "Static cells never need this.", **_help),
         row(kf_add, kf_drop),
         save_btn,
         status,
         width=480,
     )
-    doc.add_root(row(column(fig, progress_div), controls, annotate_col))
+    doc.add_root(row(column(fig, progress_div), controls, annotate_col,
+                     spacing=25))
     doc.title = "nikon-control — cell annotation"
 
     def _cleanup(session_context) -> None:
