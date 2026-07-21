@@ -78,6 +78,32 @@ def test_update_box_same_t_replaces_keyframe():
     assert a.keyframes[0].bbox == cwh_to_bbox(120, 120, 40, 40)
 
 
+def test_resize_keeps_center_and_affects_all_keyframes():
+    st = DashboardState(_af(), n_t=100)
+    st.set_t(0)
+    i = st.add_box(100, 100, 40, 40, "cell")   # keyframe at t=0
+    st.set_t(20)
+    st.update_box(i, 300, 300, 40, 40)          # 2nd keyframe at t=20 (moved)
+    st.resize(i, 80, 60)                         # resize whole track
+    a = st.ann(i)
+    assert len(a.keyframes) == 2                 # resize didn't add a keyframe
+    for k in a.keyframes:
+        w = k.bbox[3] - k.bbox[1]
+        h = k.bbox[2] - k.bbox[0]
+        assert (round(w), round(h)) == (80, 60)
+    # centres preserved: kf0 ~ (100,100), kf1 ~ (300,300)
+    k0 = sorted(a.keyframes, key=lambda k: k.t)[0]
+    cy0 = (k0.bbox[0] + k0.bbox[2]) / 2
+    cx0 = (k0.bbox[1] + k0.bbox[3]) / 2
+    assert (round(cy0), round(cx0)) == (100, 100)
+
+
+def test_size_of_returns_first_keyframe_wh():
+    st = DashboardState(_af(), n_t=10)
+    i = st.add_box(50, 50, 120, 90, "cell")
+    assert st.size_of(i) == (120.0, 90.0)
+
+
 def test_delete_removes_annotation():
     st = DashboardState(_af(), n_t=10)
     i = st.add_box(1, 1, 2, 2, "cell")

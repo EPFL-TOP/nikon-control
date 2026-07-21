@@ -141,6 +141,26 @@ class DashboardState:
         if box_id in self._order:
             self._order.remove(box_id)
 
+    def resize(self, box_id: str, w: float, h: float) -> None:
+        """Set width/height on every keyframe of the box, keeping each
+        keyframe's centre — resizes the whole track uniformly (does not add a
+        keyframe or make the size drift over time)."""
+        a = self._by_id[box_id]
+        w = max(1.0, float(w))
+        h = max(1.0, float(h))
+        for k in a.keyframes:
+            cy = (k.bbox[0] + k.bbox[2]) / 2.0
+            cx = (k.bbox[1] + k.bbox[3]) / 2.0
+            k.bbox = [cy - h / 2.0, cx - w / 2.0, cy + h / 2.0, cx + w / 2.0]
+
+    def size_of(self, box_id: str) -> tuple[float, float]:
+        """(width, height) of the box's first keyframe."""
+        a = self._by_id[box_id]
+        if not a.keyframes:
+            return (0.0, 0.0)
+        b = a.keyframes[0].bbox
+        return (b[3] - b[1], b[2] - b[0])
+
     # ---- write: category + lifecycle ----------------------------------
     def set_label(self, box_id: str, label: str) -> None:
         self._by_id[box_id].label = label

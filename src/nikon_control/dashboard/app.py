@@ -93,6 +93,7 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
         RangeSlider,
         Select,
         Slider,
+        Spinner,
         TextInput,
     )
     from bokeh.plotting import figure
@@ -149,6 +150,10 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
                           value=_PICK_CATEGORY, options=[_PICK_CATEGORY],
                           width=300)
     add_roi_btn = Button(label="➕ Add ROI", button_type="primary", width=150)
+    width_spin = Spinner(title="ROI width (px)", low=4, high=4000, step=2,
+                         value=110, width=145)
+    height_spin = Spinner(title="ROI height (px)", low=4, high=4000, step=2,
+                          value=110, width=145)
     weights_input = TextInput(title="Detection model (.pth)",
                               value=weights_path)
     score_slider = Slider(start=0.1, end=0.95, value=0.5, step=0.05,
@@ -209,7 +214,8 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
     ctx: dict = {"state": None, "plane": None, "n_c": 1, "channels": [],
                  "syncing": False, "default_label": "cell",
                  "selected_ids": [], "json_mtime": None, "play_cb": None,
-                 "frame_loading": False, "data_dir": data_dir}
+                 "frame_loading": False, "data_dir": data_dir,
+                 "syncing_size": False}
 
     # ---- in-page directory browser ------------------------------------
     def _rescan(*_) -> None:
@@ -264,6 +270,18 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
         data = box_src.data
         ids = data.get("id", [])
         ctx["selected_ids"] = [ids[i] for i in new if i < len(ids)]
+        # Reflect the selected box's size in the spinners (guarded so this
+        # doesn't trigger a resize of what we just selected).
+        st = ctx["state"]
+        sel = _selected_ids()
+        if sel and st is not None:
+            w, h = st.size_of(sel[0])
+            ctx["syncing_size"] = True
+            try:
+                width_spin.value = round(w)
+                height_spin.value = round(h)
+            finally:
+                ctx["syncing_size"] = False
         # Textual confirmation of what's selected — but not during a
         # programmatic re-render (syncing), which would clobber other status.
         if not ctx["syncing"]:
@@ -277,6 +295,19 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
                 status.text = "No box selected."
 
     box_src.selected.on_change("indices", _on_select)
+
+    def _on_size_change(attr, old, new) -> None:
+        # user edited width/height spinner -> resize the selected box(es)
+        if ctx["syncing_size"] or ctx["state"] is None:
+            return
+        ids = _selected_ids()
+        if not ids:
+            status.text = "Select a box first, then set its width/height."
+            return
+        w, h = float(width_spin.value or 1), float(height_spin.value or 1)
+        for i in ids:
+            ctx["state"].resize(i, w, h)
+        _render_boxes()
 
     def _selected_ids() -> list[str]:
         st = ctx["state"]
@@ -345,21 +376,20 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
         if st is None:
             return
         plane = ctx["plane"](st.current_t, _chan_index())
-        # Default display window.
-        lo, hi = (float(v) for v in np.percentile(plane, [0.5, 99.5]))
-        # Slider BOUNDS from robust percentiles, not min/max: a single hot
-        # pixel (common in fluorescence) otherwise blows the slider's range
-        # up to ~65535 and squeezes the useful band into a sliver — that's
-        # the "contrast too narrow to adjust" problem. Pad generously so
-        # there's headroom to brighten (drag high down) or darken (up).
-        b_lo, b_hi = (float(v) for v in np.percentile(plane, [0.1, 99.9]))
-        span = max(1.0, b_hi - b_lo)
-        mn = max(0.0, b_lo - 0.25 * span)
-        mx = b_hi + 0.5 * span
+        # Slider spans the full data min..max so the high end can be pushed all
+        # the way up to bright fluorescence (e.g. mCherry nuclei ~5000) — the
+        # earlier percentile cap made that impossible.
+        mn, mx = float(plane.min()), float(plane.max())
+        if mx <= mn:
+            mx = mn + 1.0
+        # Default window near min..max (only the 0.1% tails trimmed, so a lone
+        # hot/dead pixel doesn't wreck it) — plenty of range visible by default.
+        lo, hi = (float(v) for v in np.percentile(plane, [0.1, 99.9]))
         if hi <= lo:
             hi = lo + 1.0
-        # keep the (lo, hi) value inside [start, end]
-        mn, mx = min(mn, lo), max(mx, hi)
+        # ~500 steps across the range so the two handles are smooth to drag
+        # even when the range is large.
+        contrast.step = max(1.0, (mx - mn) / 500.0)
         contrast.start, contrast.end = mn, mx
         contrast.value = (lo, hi)
         mapper.low, mapper.high = lo, hi
@@ -767,6 +797,8 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
     contrast.on_change("value", on_contrast)
     label_select.on_change("value", on_label)
     add_roi_btn.on_click(_add_roi)
+    width_spin.on_change("value", _on_size_change)
+    height_spin.on_change("value", _on_size_change)
     birth_mark.on_click(lambda: _apply_to_selected(lambda st, i: st.mark_birth(i), "Mark birth"))
     birth_clear.on_click(lambda: _apply_to_selected(lambda st, i: st.clear_birth(i)))
     end_mark.on_click(lambda: _apply_to_selected(lambda st, i: st.mark_end(i), "Mark end"))
@@ -845,6 +877,8 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
         Div(text="<b>Selected ROI</b> — tap a box first (it turns white)",
             width=460),
         label_select,
+        Div(text="<i>Resize the selected box (whole track):</i>", **_help),
+        row(width_spin, height_spin),
         Div(text="<i>For most cells: just set the category, then mark death. "
                  "Birth / End / Keyframe below are only for the special cases "
                  "described.</i>", **_help),
