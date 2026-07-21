@@ -176,6 +176,7 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
 
     birth_mark, birth_clear = _btn("Mark birth @T"), _btn("Clear birth")
     end_mark, end_clear = _btn("Mark end @T"), _btn("Clear end")
+    divide_mark, divide_clear = _btn("Mark division @T"), _btn("Clear division")
     death_add, death_pop, death_clear = (
         _btn("Add death @T"), _btn("Drop last death"), _btn("Clear deaths")
     )
@@ -819,6 +820,8 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
     birth_clear.on_click(lambda: _apply_to_selected(lambda st, i: st.clear_birth(i)))
     end_mark.on_click(lambda: _apply_to_selected(lambda st, i: st.mark_end(i), "Mark end"))
     end_clear.on_click(lambda: _apply_to_selected(lambda st, i: st.clear_end(i)))
+    divide_mark.on_click(lambda: _apply_to_selected(lambda st, i: st.mark_division(i)))
+    divide_clear.on_click(lambda: _apply_to_selected(lambda st, i: st.clear_division(i)))
     death_add.on_click(lambda: _apply_to_selected(lambda st, i: st.add_death(i)))
     death_pop.on_click(lambda: _apply_to_selected(lambda st, i: st.pop_death(i)))
     death_clear.on_click(lambda: _apply_to_selected(lambda st, i: st.clear_deaths(i)))
@@ -902,6 +905,10 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
         Div(text="† <b>Death</b> — frame a cell dies (it stays visible as a "
                  "corpse). A doublet can have two deaths.", **_help),
         row(death_add, death_pop, death_clear),
+        Div(text="⑂ <b>Division</b> — frame a single cell divides. The track "
+                 "reads as its category (e.g. single) before this frame and "
+                 "<b>doublet</b> after (the box recolours).", **_help),
+        row(divide_mark, divide_clear),
         Div(text="↑ <b>Birth</b> — first frame the cell exists. Only if it "
                  "appears mid-movie (enters, or born from a division). "
                  "Default: from frame 0.", **_help),

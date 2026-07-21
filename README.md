@@ -106,16 +106,21 @@ anywhere from the page. Then:
 - **Draw / move / resize / delete ROIs** with the box-edit tool
   (delete = shift-click). A drag at any frame auto-records a keyframe
   there, so drifting debris tracks correctly.
-- **Category** — tap a box, pick its class from the dropdown.
-- **Lifecycle** — `Mark birth @T`, `Mark end @T` (leaves FOV), and
-  `Add death @T` (multiple allowed, e.g. a doublet's two cells).
+- **Category** — tap a box, pick its class from the dropdown. Resize with
+  the width/height spinners or the **±10%** buttons; add a fresh box with
+  **➕ Add ROI**.
+- **Lifecycle** — `Mark birth @T`, `Mark end @T` (leaves FOV),
+  `Add death @T` (multiple allowed, e.g. a doublet's two cells), and
+  `Mark division @T` for a cell that divides — the track reads as its
+  category (e.g. single) before that frame and **doublet** after, and the
+  box recolours at the division frame.
 - **Channel + contrast** — annotate on BF, flip to mCherry-H2B or GFP to
   judge single-vs-doublet or death.
 - **Save** writes back to the sibling JSON.
 
-Boxes are hidden outside their `[t_start, t_end]` window; `↑T=` / `†T=`
-markers show birth/death at the current frame. Default classes:
-`single`, `doublet`, `debris`, `fission_fusion`.
+Boxes are hidden outside their `[t_start, t_end]` window; `↑T=` / `⑂T=` /
+`†T=` markers show birth / division / death at the current frame. Default
+classes: `single`, `doublet`, `debris`, `fission_fusion`.
 
 To enable in-dashboard detection, pass the model path at launch:
 

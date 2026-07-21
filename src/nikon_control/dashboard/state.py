@@ -91,12 +91,15 @@ class DashboardState:
                 {
                     "id": i,
                     "num": n,
-                    "label": a.label,
+                    # effective class at this frame: flips to doublet after a
+                    # division, so colour/text track the change over time
+                    "label": a.label_at(t),
                     "cx": cx,
                     "cy": cy,
                     "w": w,
                     "h": h,
-                    "marker": _compute_label(a.t_start, a.t_deaths, t),
+                    "marker": _compute_label(a.t_start, a.t_deaths, t,
+                                             a.t_divide),
                 }
             )
         return rows
@@ -191,6 +194,14 @@ class DashboardState:
 
     def clear_birth(self, box_id: str) -> None:
         self._by_id[box_id].t_start = 0
+
+    def mark_division(self, box_id: str, t: int | None = None) -> None:
+        """Mark the frame the cell divides — its class reads as its base
+        label before this frame and 'doublet' from this frame on."""
+        self._by_id[box_id].t_divide = self._t(t)
+
+    def clear_division(self, box_id: str) -> None:
+        self._by_id[box_id].t_divide = None
 
     def mark_end(self, box_id: str, t: int | None = None) -> bool:
         """Set last-visible frame. Refuses (returns False) if earlier than

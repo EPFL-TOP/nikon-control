@@ -30,13 +30,16 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-SCHEMA_VERSION = "0.5"
+SCHEMA_VERSION = "0.6"
 DEFAULT_CLASSES: tuple[str, ...] = (
     "single",
     "doublet",
     "debris",
     "fission_fusion",
 )
+
+# Class a track becomes at/after its division frame (single -> doublet).
+POST_DIVISION_LABEL = "doublet"
 
 
 @dataclass
@@ -52,6 +55,7 @@ class Annotation:
     t_start: int = 0
     t_end: int | None = None
     t_deaths: list[int] = field(default_factory=list)
+    t_divide: int | None = None  # frame the cell divides (single -> doublet)
     z: int = 0
     notes: str = ""
     created: str = field(
@@ -72,6 +76,13 @@ class Annotation:
     def visible_at(self, t: int) -> bool:
         end = self.t_end if self.t_end is not None else 10**9
         return self.t_start <= t <= end
+
+    def label_at(self, t: int) -> str:
+        """Effective class at frame ``t``: the base ``label`` before division,
+        and ``POST_DIVISION_LABEL`` ("doublet") from the division frame on."""
+        if self.t_divide is not None and t >= self.t_divide:
+            return POST_DIVISION_LABEL
+        return self.label
 
 
 @dataclass
@@ -105,6 +116,7 @@ def save(ann: AnnotationFile, path: Path) -> None:
                 "t_start": a.t_start,
                 "t_end": a.t_end,
                 "t_deaths": list(a.t_deaths),
+                "t_divide": a.t_divide,
                 "z": a.z,
                 "notes": a.notes,
                 "created": a.created,
@@ -116,7 +128,7 @@ def save(ann: AnnotationFile, path: Path) -> None:
 
 
 def _upgrade_annotation(a: dict, from_version: str) -> dict:
-    """Migrate per-annotation dict from any older schema to v0.5."""
+    """Migrate per-annotation dict from any older schema to v0.6."""
     # v0.1: drop the per-frame ``t``.
     a.pop("t", None)
     a.setdefault("t_start", 0)
@@ -142,6 +154,8 @@ def _upgrade_annotation(a: dict, from_version: str) -> dict:
             a["keyframes"] = []
     else:
         a.pop("bbox", None)
+    # v0.6: division marker (single -> doublet). Absent in older files.
+    a.setdefault("t_divide", None)
     return a
 
 
@@ -213,15 +227,21 @@ def _interpolate_bbox(keyframes: list[Keyframe], t: int) -> list[float]:
     return list(sorted_kfs[-1].bbox)
 
 
-def _compute_label(t_start: int, t_deaths: list[int], current_t: int) -> str:
+def _compute_label(
+    t_start: int, t_deaths: list[int], current_t: int,
+    t_divide: int | None = None,
+) -> str:
     """Marker text for a bbox at the current T frame.
 
-    The birth marker is shown when ``t_start > 0``. Death markers are added
-    one per death that has already happened (``d <= current_t``).
+    Birth (``↑``) shown when ``t_start > 0``; division (``⑂``) once the
+    current frame is at/after ``t_divide``; deaths (``†``) one per death that
+    has already happened (``d <= current_t``).
     """
     parts = []
     if t_start > 0:
         parts.append(f"↑T={t_start}")
+    if t_divide is not None and current_t >= t_divide:
+        parts.append(f"⑂T={t_divide}")
     past_deaths = sorted(d for d in t_deaths if d <= current_t)
     if past_deaths:
         parts.append("†T=" + ",".join(str(d) for d in past_deaths))
