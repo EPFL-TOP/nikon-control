@@ -27,6 +27,10 @@ def main() -> None:
                    help="path to cell_detection_model.pth (enables the "
                         "in-dashboard Detect button)")
     p.add_argument("--port", type=int, default=5006)
+    p.add_argument("--address", default=None,
+                   help="bind address. Omit for localhost (fine when users "
+                        "RDP into this machine); use 0.0.0.0 to accept "
+                        "connections from other machines' browsers.")
     p.add_argument("--show", action="store_true",
                    help="open a browser tab automatically")
     p.add_argument("--allow-websocket-origin", action="append", default=[],
@@ -42,6 +46,8 @@ def main() -> None:
 
     cmd = [sys.executable, "-m", "bokeh", "serve", server_script,
            "--port", str(args.port)]
+    if args.address:
+        cmd += ["--address", args.address]
     if args.show:
         cmd.append("--show")
     for origin in args.allow_websocket_origin:

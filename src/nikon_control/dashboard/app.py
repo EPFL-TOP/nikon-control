@@ -23,6 +23,11 @@ from .state import DashboardState
 # distinct line colours per class (cycled)
 _PALETTE = ["#ff3b30", "#ffcc00", "#34c759", "#00c7be", "#ff9500", "#af52de"]
 
+# Placeholder for the category dropdown. It's used as a *command* menu
+# (pick a class -> apply to the selected box -> reset to this placeholder),
+# so re-picking the same class for the next cell still fires on_change.
+_PICK_CATEGORY = "— set category —"
+
 # Fallback model locations tried when --weights isn't given and no .pth sits
 # in the data folder. Add site-specific defaults here.
 _DEFAULT_WEIGHTS = [
@@ -140,8 +145,10 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
     chan_select = Select(title="Channel", value="", options=[], width=340)
     contrast = RangeSlider(start=0, end=65535, value=(0, 65535),
                            step=1, title="Contrast", width=340)
-    label_select = Select(title="Category (applies to selected)",
-                          value="", options=[], width=300)
+    label_select = Select(title="Category (applies to selected box)",
+                          value=_PICK_CATEGORY, options=[_PICK_CATEGORY],
+                          width=300)
+    add_roi_btn = Button(label="➕ Add ROI", button_type="primary", width=150)
     weights_input = TextInput(title="Detection model (.pth)",
                               value=weights_path)
     score_slider = Slider(start=0.1, end=0.95, value=0.5, step=0.05,
@@ -338,16 +345,20 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
         if st is None:
             return
         plane = ctx["plane"](st.current_t, _chan_index())
-        mn, mx = float(plane.min()), float(plane.max())
+        # Default display window.
         lo, hi = (float(v) for v in np.percentile(plane, [0.5, 99.5]))
-        # Guard a flat/uniform frame (blank fluo channel, saturation): a
-        # RangeSlider or color mapper with start==end breaks in the browser.
-        if mx <= mn:
-            mx = mn + 1.0
+        # Slider BOUNDS from robust percentiles, not min/max: a single hot
+        # pixel (common in fluorescence) otherwise blows the slider's range
+        # up to ~65535 and squeezes the useful band into a sliver — that's
+        # the "contrast too narrow to adjust" problem. Pad generously so
+        # there's headroom to brighten (drag high down) or darken (up).
+        b_lo, b_hi = (float(v) for v in np.percentile(plane, [0.1, 99.9]))
+        span = max(1.0, b_hi - b_lo)
+        mn = max(0.0, b_lo - 0.25 * span)
+        mx = b_hi + 0.5 * span
         if hi <= lo:
             hi = lo + 1.0
-        # keep the (lo, hi) value inside [start, end] even for saturated
-        # frames where a bumped hi could otherwise exceed mx
+        # keep the (lo, hi) value inside [start, end]
         mn, mx = min(mn, lo), max(mx, hi)
         contrast.start, contrast.end = mn, mx
         contrast.value = (lo, hi)
@@ -422,8 +433,8 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
         bf_idx = next((i for i, c in enumerate(channels) if "bf" in c.lower()), 0)
         chan_select.value = channels[bf_idx]
         ctx["bf_index"] = bf_idx
-        label_select.options = list(af.classes)
-        label_select.value = ctx["default_label"]
+        # label_select options/value are managed by _render_legend (command
+        # menu: stays on the placeholder until the user picks a class)
 
         ctx["state"].set_t(0)
         _autoscale_contrast()
@@ -442,6 +453,10 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
             for c in st.classes
         )
         legend.text = "<b>Classes</b>" + chips
+        # keep the category dropdown in sync with the class list
+        label_select.options = [_PICK_CATEGORY] + list(st.classes)
+        if label_select.value not in label_select.options:
+            label_select.value = _PICK_CATEGORY
 
     # ---- edit reconciliation (BoxEditTool -> controller) ---------------
     def on_box_data_change(attr, old, new) -> None:
@@ -505,9 +520,28 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
             )
 
     def on_label(attr, old, new) -> None:
-        if new:
-            _apply_to_selected(lambda st, i: st.set_label(i, new))
-            _render_legend()  # a new class may have been introduced
+        # command menu: ignore the placeholder, apply the picked class to the
+        # selected box, then reset to the placeholder so the SAME class can be
+        # picked again for the next box (a no-op value change otherwise).
+        if not new or new == _PICK_CATEGORY:
+            return
+        _apply_to_selected(lambda st, i: st.set_label(i, new))
+        _render_legend()  # a new class may have been introduced
+        label_select.value = _PICK_CATEGORY  # re-arm (fires on_label -> ignored)
+
+    def _add_roi() -> None:
+        st = ctx["state"]
+        if st is None:
+            status.text = "Load an ND2 first."
+            return
+        img = img_src.data["image"][0]
+        H, W = img.shape[-2], img.shape[-1]
+        side = 110.0  # ~a 40x cell; user resizes as needed
+        new_id = st.add_box(W / 2.0, H / 2.0, side, side, ctx["default_label"])
+        ctx["selected_ids"] = [new_id]  # select it so it highlights
+        _render_boxes()
+        status.text = ("Added an ROI at the centre — drag/resize it, then set "
+                       "its category.")
 
     def _step_t(delta: int) -> None:
         if ctx["state"] is None:
@@ -732,6 +766,7 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
     chan_select.on_change("value", on_channel)
     contrast.on_change("value", on_contrast)
     label_select.on_change("value", on_label)
+    add_roi_btn.on_click(_add_roi)
     birth_mark.on_click(lambda: _apply_to_selected(lambda st, i: st.mark_birth(i), "Mark birth"))
     birth_clear.on_click(lambda: _apply_to_selected(lambda st, i: st.clear_birth(i)))
     end_mark.on_click(lambda: _apply_to_selected(lambda st, i: st.mark_end(i), "Mark end"))
@@ -800,12 +835,13 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
     annotate_col = column(
         Div(text="<h3 style='margin:2px 0'>Annotation</h3>", width=460),
         legend,
-        Div(text="<b>Editing ROIs</b> — pick the <i>Box Edit</i> tool (top-"
-                 "right toolbar). <b>Add</b>: click-drag on empty area. "
-                 "<b>Move</b>: drag a box. <b>Delete</b>: tap to select then "
-                 "press Backspace (or Shift-click). <b>Resize</b>: delete and "
-                 "redraw. A new box gets the default category — set it below.",
+        Div(text="<b>Add / edit ROIs</b> — click <b>➕ Add ROI</b> for a new "
+                 "box at the centre, then drag/resize it. Or use the "
+                 "<i>Box Edit</i> tool (toolbar) to draw directly. "
+                 "<b>Move</b>: drag. <b>Delete</b>: select then Backspace "
+                 "(or Shift-click).",
             **_help),
+        add_roi_btn,
         Div(text="<b>Selected ROI</b> — tap a box first (it turns white)",
             width=460),
         label_select,

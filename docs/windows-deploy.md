@@ -84,6 +84,59 @@ It should print `True <your GPU>`. Then the dashboard's Detect will report
 **CUDA** and run ~10–50 ms/frame instead of ~0.5–0.7 s/frame. Debris
 detection is CPU-based (classical image processing) and unaffected.
 
+### Multiple users on the Windows Server
+
+The dashboard is a **web server**: you run **one** server process, and every
+user connects to it with a **browser** — each browser tab is its own
+independent session (its own file, ROIs, and undo state; the model/GPU are
+shared). You do *not* run one per user.
+
+**How users connect:**
+
+- Users who **RDP into this same server**: each opens a browser in their RDP
+  session to `http://localhost:5006`. `localhost` is per-machine, so all
+  sessions on the server reach the one process. No extra flags needed.
+- Users on **their own machines** (not RDP): start the server bound to the
+  network and allow their origin, then they browse to the server's hostname:
+
+  ```bat
+  nikon-control-dashboard --address 0.0.0.0 --port 5006 ^
+      --allow-websocket-origin myserver.epfl.ch:5006
+  ```
+
+  then they open `http://myserver.epfl.ch:5006`. (Open port 5006 in the
+  firewall.)
+
+**Keep it running independent of your login (important).** On Windows,
+processes started in an interactive session are **killed when that user logs
+off**. So if you launch it from your account and log off, it dies for
+everyone. Options, most robust first:
+
+1. **Run it as a Windows service** with [NSSM](https://nssm.cc) so it starts
+   at boot and survives any logoff:
+
+   ```bat
+   nssm install NikonDashboard "C:\ProgramData\miniconda3\envs\single-cells\python.exe" ^
+       "-m" "nikon_control.dashboard.launch" "--data-dir" "G:\PROJECTS-02\Samuel" ^
+       "--weights" "E:\PROJECTS-01\Clement\cell_detection_model.pth" "--port" "5006"
+   nssm start NikonDashboard
+   ```
+
+   (Use the full path to the env's `python.exe`. Set the service to run as an
+   account that can read the data/model drives.) Now anyone can use
+   `http://localhost:5006` at any time without you being logged in.
+
+2. **Disconnect, don't log off.** If you start it in your RDP session and
+   click *Disconnect* (not *Sign out*), the session and its process stay
+   alive and other RDP users can still reach `localhost:5006`. Fragile — a
+   reboot or accidental sign-out stops it — so prefer the service.
+
+**Concurrency is safe:** two people editing *different* ND2s are fully
+independent. If two open the *same* file, the one who saves second is warned
+that the file changed on disk and is refused rather than silently
+overwriting the other's work (reload, then save). Annotations are written
+next to each ND2 as `<file>.annotations.json`.
+
 ## Prerequisites (both tools)
 
 - Windows 10 / 11 / Server with RDP enabled.
