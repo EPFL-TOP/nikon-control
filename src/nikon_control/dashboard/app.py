@@ -154,6 +154,8 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
                          value=110, width=145)
     height_spin = Spinner(title="ROI height (px)", low=4, high=4000, step=2,
                           value=110, width=145)
+    shrink_btn = Button(label="− 10%", width=95)
+    grow_btn = Button(label="＋ 10%", width=95)
     weights_input = TextInput(title="Detection model (.pth)",
                               value=weights_path)
     score_slider = Slider(start=0.1, end=0.95, value=0.5, step=0.05,
@@ -308,6 +310,18 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
         for i in ids:
             ctx["state"].resize(i, w, h)
         _render_boxes()
+
+    def _scale_selected(factor: float) -> None:
+        st = ctx["state"]
+        if st is None:
+            return
+        ids = _selected_ids()
+        if not ids:
+            status.text = "Select a box first, then use ± 10%."
+            return
+        for i in ids:
+            st.scale(i, factor)
+        _render_boxes()  # restores selection -> _on_select refreshes spinners
 
     def _selected_ids() -> list[str]:
         st = ctx["state"]
@@ -799,6 +813,8 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
     add_roi_btn.on_click(_add_roi)
     width_spin.on_change("value", _on_size_change)
     height_spin.on_change("value", _on_size_change)
+    shrink_btn.on_click(lambda: _scale_selected(0.9))
+    grow_btn.on_click(lambda: _scale_selected(1.1))
     birth_mark.on_click(lambda: _apply_to_selected(lambda st, i: st.mark_birth(i), "Mark birth"))
     birth_clear.on_click(lambda: _apply_to_selected(lambda st, i: st.clear_birth(i)))
     end_mark.on_click(lambda: _apply_to_selected(lambda st, i: st.mark_end(i), "Mark end"))
@@ -879,6 +895,7 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
         label_select,
         Div(text="<i>Resize the selected box (whole track):</i>", **_help),
         row(width_spin, height_spin),
+        row(shrink_btn, grow_btn),
         Div(text="<i>For most cells: just set the category, then mark death. "
                  "Birth / End / Keyframe below are only for the special cases "
                  "described.</i>", **_help),

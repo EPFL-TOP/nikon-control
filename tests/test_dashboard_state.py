@@ -104,6 +104,20 @@ def test_size_of_returns_first_keyframe_wh():
     assert st.size_of(i) == (120.0, 90.0)
 
 
+def test_scale_grows_and_shrinks_about_center():
+    st = DashboardState(_af(), n_t=10)
+    i = st.add_box(200, 200, 100, 100, "cell")  # center (200,200)
+    st.scale(i, 1.1)
+    w, h = st.size_of(i)
+    assert (round(w), round(h)) == (110, 110)
+    st.scale(i, 0.9)  # back down (~99)
+    w2, h2 = st.size_of(i)
+    assert round(w2) == round(110 * 0.9)
+    # centre unchanged
+    b = st.ann(i).keyframes[0].bbox
+    assert (round((b[1] + b[3]) / 2), round((b[0] + b[2]) / 2)) == (200, 200)
+
+
 def test_delete_removes_annotation():
     st = DashboardState(_af(), n_t=10)
     i = st.add_box(1, 1, 2, 2, "cell")

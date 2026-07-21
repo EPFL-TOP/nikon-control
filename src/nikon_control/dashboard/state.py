@@ -153,6 +153,17 @@ class DashboardState:
             cx = (k.bbox[1] + k.bbox[3]) / 2.0
             k.bbox = [cy - h / 2.0, cx - w / 2.0, cy + h / 2.0, cx + w / 2.0]
 
+    def scale(self, box_id: str, factor: float) -> None:
+        """Scale every keyframe's box by ``factor`` about its own centre
+        (e.g. 1.1 = +10%, 0.9 = −10%). Resizes the whole track."""
+        a = self._by_id[box_id]
+        for k in a.keyframes:
+            cy = (k.bbox[0] + k.bbox[2]) / 2.0
+            cx = (k.bbox[1] + k.bbox[3]) / 2.0
+            h = max(1.0, (k.bbox[2] - k.bbox[0]) * factor)
+            w = max(1.0, (k.bbox[3] - k.bbox[1]) * factor)
+            k.bbox = [cy - h / 2.0, cx - w / 2.0, cy + h / 2.0, cx + w / 2.0]
+
     def size_of(self, box_id: str) -> tuple[float, float]:
         """(width, height) of the box's first keyframe."""
         a = self._by_id[box_id]
