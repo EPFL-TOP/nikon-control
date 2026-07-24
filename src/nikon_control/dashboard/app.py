@@ -89,11 +89,13 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
         Div,
         LabelSet,
         LinearColorMapper,
+        PanTool,
         Range1d,
         RangeSlider,
         Select,
         Slider,
         Spinner,
+        TapTool,
         TextInput,
     )
     from bokeh.plotting import figure
@@ -150,6 +152,7 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
                           value=_PICK_CATEGORY, options=[_PICK_CATEGORY],
                           width=300)
     add_roi_btn = Button(label="➕ Add ROI", button_type="primary", width=150)
+    del_roi_btn = Button(label="🗑 Delete ROI", button_type="danger", width=150)
     width_spin = Spinner(title="ROI width (px)", low=4, high=4000, step=2,
                          value=110, width=145)
     height_spin = Spinner(title="ROI height (px)", low=4, high=4000, step=2,
@@ -176,7 +179,9 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
 
     birth_mark, birth_clear = _btn("Mark birth @T"), _btn("Clear birth")
     end_mark, end_clear = _btn("Mark end @T"), _btn("Clear end")
-    divide_mark, divide_clear = _btn("Mark division @T"), _btn("Clear division")
+    divide_mark = _btn("Division→doublet @T")
+    ff_mark = _btn("→fission_fusion @T")
+    class_clear = _btn("Clear class changes")
     death_add, death_pop, death_clear = (
         _btn("Add death @T"), _btn("Drop last death"), _btn("Clear deaths")
     )
@@ -210,8 +215,17 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
         )
     )
     box_tool = BoxEditTool(renderers=[rect_r], empty_value="")
-    fig.add_tools(box_tool)
-    fig.toolbar.active_drag = box_tool
+    tap_tool = TapTool(renderers=[rect_r])
+    fig.add_tools(box_tool, tap_tool)
+    # Tap selects a box. Leave the DEFAULT drag as pan (not Box-Edit) so a
+    # stray click no longer starts drawing a box that sticks to the cursor —
+    # the reported "can't click anywhere else" bug. The user picks the
+    # Box-Edit tool from the toolbar deliberately to move/draw; Add/Delete
+    # buttons cover the common cases without it.
+    fig.toolbar.active_tap = tap_tool
+    pan = fig.select_one(PanTool)
+    if pan is not None:
+        fig.toolbar.active_drag = pan
 
     # ---- mutable session context --------------------------------------
     ctx: dict = {"state": None, "plane": None, "n_c": 1, "channels": [],
@@ -585,8 +599,22 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
         new_id = st.add_box(W / 2.0, H / 2.0, side, side, ctx["default_label"])
         ctx["selected_ids"] = [new_id]  # select it so it highlights
         _render_boxes()
-        status.text = ("Added an ROI at the centre — drag/resize it, then set "
-                       "its category.")
+        status.text = ("Added an ROI at the centre — move it with the Box-Edit "
+                       "tool, resize with the spinners/±10%, set its category.")
+
+    def _delete_roi() -> None:
+        st = ctx["state"]
+        if st is None:
+            return
+        ids = _selected_ids()
+        if not ids:
+            status.text = "Select a box first (tap it), then Delete."
+            return
+        for i in ids:
+            st.delete(i)
+        ctx["selected_ids"] = []
+        _render_boxes()
+        status.text = f"Deleted {len(ids)} ROI(s)."
 
     def _step_t(delta: int) -> None:
         if ctx["state"] is None:
@@ -676,24 +704,46 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
             doc.add_next_tick_callback(lambda: setattr(progress_div, "text", msg))
 
         def work() -> None:
+            from ..detector import CellDetector
+
+            def _make(device=None):
+                d = CellDetector(wpath, device=device,
+                                 score_threshold=score_slider.value)
+                ctx["detector"] = d
+                return d
+
             try:
                 det = ctx.get("detector")
                 if det is None:
-                    from ..detector import CellDetector
-                    det = CellDetector(wpath, score_threshold=score_slider.value)
-                    ctx["detector"] = det
+                    det = _make()
                 else:
                     det.score_threshold = score_slider.value
-                dev = det.device.upper()  # CUDA or CPU — surfaced to the user
+                dev = det.device.upper()
 
                 def prog(done, total):
                     if done % 10 == 0 or done == total:
                         _tick(f"Detecting on {dev}… frame {done}/{total}")
 
-                anns = detect_and_track(
-                    det, ctx["plane"], ctx["bf_index"], st.n_t,
-                    provisional_label=ctx["default_label"], progress_cb=prog,
-                )
+                try:
+                    anns = detect_and_track(
+                        det, ctx["plane"], ctx["bf_index"], st.n_t,
+                        provisional_label=ctx["default_label"], progress_cb=prog,
+                    )
+                except Exception as exc:
+                    # GPU can throw a runtime CUDA error (driver/context/no-GPU
+                    # -access-for-a-service). Fall back to CPU so annotators
+                    # aren't blocked; loud so the GPU issue gets looked at.
+                    if "cuda" in str(exc).lower() and det.device != "cpu":
+                        _tick("⚠ GPU error — retrying on CPU (slower)…")
+                        det = _make(device="cpu")
+                        dev = "CPU"
+                        anns = detect_and_track(
+                            det, ctx["plane"], ctx["bf_index"], st.n_t,
+                            provisional_label=ctx["default_label"],
+                            progress_cb=prog,
+                        )
+                    else:
+                        raise
 
                 def finish():
                     n = st.set_detections(anns, ctx["default_label"])
@@ -701,8 +751,8 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
                     _render_boxes()
                     detect_btn.disabled = False
                     progress_div.text = ""
-                    cpu_hint = (" — running on CPU (slow); see docs to install "
-                                "the CUDA build of torch for GPU") if dev == "CPU" else ""
+                    cpu_hint = (" — on CPU (slow); see docs to enable the GPU "
+                                "(CUDA torch build)") if dev == "CPU" else ""
                     status.text = (
                         f"Detected {n} '{ctx['default_label']}' track(s) on "
                         f"{dev}. Curated tracks kept. Review & save.{cpu_hint}"
@@ -812,6 +862,7 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
     contrast.on_change("value", on_contrast)
     label_select.on_change("value", on_label)
     add_roi_btn.on_click(_add_roi)
+    del_roi_btn.on_click(_delete_roi)
     width_spin.on_change("value", _on_size_change)
     height_spin.on_change("value", _on_size_change)
     shrink_btn.on_click(lambda: _scale_selected(0.9))
@@ -821,7 +872,8 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
     end_mark.on_click(lambda: _apply_to_selected(lambda st, i: st.mark_end(i), "Mark end"))
     end_clear.on_click(lambda: _apply_to_selected(lambda st, i: st.clear_end(i)))
     divide_mark.on_click(lambda: _apply_to_selected(lambda st, i: st.mark_division(i)))
-    divide_clear.on_click(lambda: _apply_to_selected(lambda st, i: st.clear_division(i)))
+    ff_mark.on_click(lambda: _apply_to_selected(lambda st, i: st.mark_fission_fusion(i)))
+    class_clear.on_click(lambda: _apply_to_selected(lambda st, i: st.clear_class_changes(i)))
     death_add.on_click(lambda: _apply_to_selected(lambda st, i: st.add_death(i)))
     death_pop.on_click(lambda: _apply_to_selected(lambda st, i: st.pop_death(i)))
     death_clear.on_click(lambda: _apply_to_selected(lambda st, i: st.clear_deaths(i)))
@@ -886,13 +938,14 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
     annotate_col = column(
         Div(text="<h3 style='margin:2px 0'>Annotation</h3>", width=460),
         legend,
-        Div(text="<b>Add / edit ROIs</b> — click <b>➕ Add ROI</b> for a new "
-                 "box at the centre, then drag/resize it. Or use the "
-                 "<i>Box Edit</i> tool (toolbar) to draw directly. "
-                 "<b>Move</b>: drag. <b>Delete</b>: select then Backspace "
-                 "(or Shift-click).",
+        Div(text="<b>Add / edit ROIs</b> — <b>tap</b> a box to select it. "
+                 "<b>➕ Add ROI</b> makes a new box at the centre; "
+                 "<b>🗑 Delete ROI</b> removes the selected one. To <b>move</b> "
+                 "a box, pick the <i>Box Edit</i> tool in the toolbar and drag "
+                 "it (press <b>Esc</b> if a half-drawn box sticks to the "
+                 "cursor). Resize with the spinners / ±10% below.",
             **_help),
-        add_roi_btn,
+        row(add_roi_btn, del_roi_btn),
         Div(text="<b>Selected ROI</b> — tap a box first (it turns white)",
             width=460),
         label_select,
@@ -905,10 +958,13 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
         Div(text="† <b>Death</b> — frame a cell dies (it stays visible as a "
                  "corpse). A doublet can have two deaths.", **_help),
         row(death_add, death_pop, death_clear),
-        Div(text="⑂ <b>Division</b> — frame a single cell divides. The track "
-                 "reads as its category (e.g. single) before this frame and "
-                 "<b>doublet</b> after (the box recolours).", **_help),
-        row(divide_mark, divide_clear),
+        Div(text="⑂ <b>Class over time</b> — the track reads as its category "
+                 "before the marked frame and switches after (the box "
+                 "recolours). <b>Division→doublet</b> for a single that "
+                 "divides; <b>→fission_fusion</b> for a cell that starts "
+                 "dividing/merging.", **_help),
+        row(divide_mark, ff_mark),
+        class_clear,
         Div(text="↑ <b>Birth</b> — first frame the cell exists. Only if it "
                  "appears mid-movie (enters, or born from a division). "
                  "Default: from frame 0.", **_help),

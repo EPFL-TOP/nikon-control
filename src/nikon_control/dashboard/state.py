@@ -16,6 +16,7 @@ import uuid
 from ..schema import (
     Annotation,
     AnnotationFile,
+    ClassChange,
     Keyframe,
     _compute_label,
     _interpolate_bbox,
@@ -99,7 +100,7 @@ class DashboardState:
                     "w": w,
                     "h": h,
                     "marker": _compute_label(a.t_start, a.t_deaths, t,
-                                             a.t_divide),
+                                             a.class_changes),
                 }
             )
         return rows
@@ -195,13 +196,25 @@ class DashboardState:
     def clear_birth(self, box_id: str) -> None:
         self._by_id[box_id].t_start = 0
 
-    def mark_division(self, box_id: str, t: int | None = None) -> None:
-        """Mark the frame the cell divides — its class reads as its base
-        label before this frame and 'doublet' from this frame on."""
-        self._by_id[box_id].t_divide = self._t(t)
+    def add_class_change(self, box_id: str, label: str,
+                         t: int | None = None) -> None:
+        """Record that the box's class becomes ``label`` from frame ``t`` on
+        (replacing any change already at that frame)."""
+        a = self._by_id[box_id]
+        t = self._t(t)
+        a.class_changes = [c for c in a.class_changes if c.t != t]
+        a.class_changes.append(ClassChange(t=t, label=label))
+        a.class_changes.sort(key=lambda c: c.t)
 
-    def clear_division(self, box_id: str) -> None:
-        self._by_id[box_id].t_divide = None
+    def clear_class_changes(self, box_id: str) -> None:
+        self._by_id[box_id].class_changes = []
+
+    # convenience wrappers for the two known transitions
+    def mark_division(self, box_id: str, t: int | None = None) -> None:
+        self.add_class_change(box_id, "doublet", t)
+
+    def mark_fission_fusion(self, box_id: str, t: int | None = None) -> None:
+        self.add_class_change(box_id, "fission_fusion", t)
 
     def mark_end(self, box_id: str, t: int | None = None) -> bool:
         """Set last-visible frame. Refuses (returns False) if earlier than

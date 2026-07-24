@@ -84,6 +84,27 @@ It should print `True <your GPU>`. Then the dashboard's Detect will report
 **CUDA** and run ~10–50 ms/frame instead of ~0.5–0.7 s/frame. Debris
 detection is CPU-based (classical image processing) and unaffected.
 
+#### If detection throws a CUDA error at runtime
+
+Symptom: *"CUDA error: unknown error … kernel errors might be asynchronously
+reported…"*. The dashboard now **falls back to CPU automatically** (you'll
+see "⚠ GPU error — retrying on CPU"), so annotation isn't blocked — but the
+GPU is worth fixing. Checks, in order:
+
+1. **Is the server running as a Windows service (NSSM)?** Services run in
+   session 0, which often has **no GPU access**. Either run the dashboard
+   from a normal (interactive) login of an account that can use the GPU, or
+   configure the service to run as that account / grant it GPU access. This
+   is the most common cause of "unknown error" on a server.
+2. `nvidia-smi` in the same environment — confirms the driver sees the GPU
+   and it isn't out of memory (another process hogging it).
+3. Driver vs CUDA wheel: a very old driver can't run a newer `cuXXX` wheel —
+   install a wheel your driver supports (`cu118` is the safest older option).
+4. For a real stack trace, set `CUDA_LAUNCH_BLOCKING=1` before launching and
+   reproduce; the error then points at the actual failing op.
+5. Restart the dashboard after any of the above (the detector is cached per
+   session).
+
 ### Multiple users on the Windows Server
 
 The dashboard is a **web server**: you run **one** server process, and every
