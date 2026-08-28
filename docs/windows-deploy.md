@@ -105,6 +105,35 @@ GPU is worth fixing. Checks, in order:
 5. Restart the dashboard after any of the above (the detector is cached per
    session).
 
+#### `WinError 1114` / "c10.dll … initialization routine failed"
+
+torch itself won't load — detection never starts. Causes, in order:
+
+1. **Wrong environment.** If the error path is
+   `...\miniconda3\Lib\site-packages\torch` (the conda **base** env) but you
+   installed torch into `single-cells`, you launched with the wrong Python.
+   `conda activate single-cells` first, then launch — or use that env's
+   python explicitly:
+   `C:\Users\<you>\AppData\Local\miniconda3\envs\single-cells\python.exe -m nikon_control.dashboard.launch --show`.
+   Confirm with `python -c "import torch; print(torch.__file__)"` — the path
+   must be inside `envs\single-cells`.
+2. **Missing Visual C++ Redistributable.** `c10.dll` depends on the
+   VC++ 2015–2022 x64 runtime. Install
+   <https://aka.ms/vs/17/release/vc_redist.x64.exe> and reboot.
+3. **Dirty torch install** (e.g. CUDA wheel over a CPU wheel). Clean reinstall
+   in the right env:
+
+   ```bat
+   conda activate single-cells
+   pip uninstall -y torch torchvision
+   pip cache purge
+   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+   python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+   ```
+
+   That last line must succeed *at the terminal* before the dashboard will
+   work — it isolates the problem from anything in this app.
+
 ### Multiple users on the Windows Server
 
 The dashboard is a **web server**: you run **one** server process, and every

@@ -759,10 +759,21 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
                     )
                 doc.add_next_tick_callback(finish)
             except Exception as exc:
-                def fail(exc=exc):
+                msg = str(exc)
+                hint = ""
+                low = msg.lower()
+                if ("dll" in low or "c10" in low or "winerror 1114" in low
+                        or "initialization routine" in low):
+                    hint = (" — torch failed to load. Check you launched in "
+                            "the env where the CUDA torch is installed "
+                            "(conda activate the right env), install the "
+                            "Microsoft VC++ Redistributable x64, and do a "
+                            "clean reinstall of torch. See docs/windows-deploy.md.")
+
+                def fail(exc=exc, hint=hint):
                     detect_btn.disabled = False
                     progress_div.text = ""
-                    status.text = f"⚠ Detection failed: {exc}"
+                    status.text = f"⚠ Detection failed: {exc}{hint}"
                 doc.add_next_tick_callback(fail)
 
         threading.Thread(target=work, daemon=True).start()
