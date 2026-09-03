@@ -11,71 +11,18 @@ effects so it can be constructed in a test with a bare ``Document``.
 """
 from __future__ import annotations
 
-import os
-import string
 from pathlib import Path
 
 import numpy as np
 
 from ..schema import DEFAULT_CLASSES, AnnotationFile, load, save
+from . import common
 from .state import DashboardState
 
-# distinct line colours per class (cycled)
-_PALETTE = ["#ff3b30", "#ffcc00", "#34c759", "#00c7be", "#ff9500", "#af52de"]
-
-# Placeholder for the category dropdown. It's used as a *command* menu
-# (pick a class -> apply to the selected box -> reset to this placeholder),
-# so re-picking the same class for the next cell still fires on_change.
-_PICK_CATEGORY = "— set category —"
-
-# Fallback model locations tried when --weights isn't given and no .pth sits
-# in the data folder. Add site-specific defaults here.
-_DEFAULT_WEIGHTS = [
-    r"E:\PROJECTS-01\Clement\cell_detection_model.pth",
-]
-
-# Fallback data folders the browser starts in when the launch folder has no
-# ND2 files. Add site-specific defaults here.
-_DEFAULT_DATA_DIRS = [
-    r"G:\PROJECTS-02\Samuel",
-]
-
-
-def _list_drives() -> list[str]:
-    """Available volumes to jump between: Windows drive letters, or the root
-    and /Volumes mounts on macOS/Linux."""
-    if os.name == "nt":
-        return [f"{c}:\\" for c in string.ascii_uppercase
-                if os.path.exists(f"{c}:\\")]
-    vols = ["/"]
-    v = Path("/Volumes")
-    if v.exists():
-        try:
-            vols += [str(p) for p in sorted(v.iterdir()) if p.is_dir()]
-        except Exception:
-            pass
-    return vols
-
-
-def _class_color(classes: list[str]) -> dict[str, str]:
-    return {c: _PALETTE[i % len(_PALETTE)] for i, c in enumerate(classes)}
-
-
-def _plane_extractor(arr, axes: list[str]):
-    def plane(t: int, c: int) -> np.ndarray:
-        idx: list = []
-        for ax in axes:
-            if ax == "T":
-                idx.append(int(t))
-            elif ax == "C":
-                idx.append(int(c))
-            elif ax in ("Y", "X"):
-                idx.append(slice(None))
-            else:
-                idx.append(0)
-        return np.asarray(arr[tuple(idx)])
-
-    return plane
+# Viewer/file-browser pieces are shared with the simplified dashboard so a
+# fix lands once for both — see ``common.py``.
+_PICK_CATEGORY = common.PICK_CATEGORY
+_class_color = common.class_color
 
 
 def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
@@ -83,50 +30,27 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
 
     from bokeh.layouts import column, row
     from bokeh.models import (
-        BoxEditTool,
         Button,
-        ColumnDataSource,
         Div,
-        LabelSet,
-        LinearColorMapper,
-        PanTool,
         Range1d,
         RangeSlider,
         Select,
         Slider,
         Spinner,
-        TapTool,
         TextInput,
     )
-    from bokeh.plotting import figure
 
     from ..preannotate import detect_and_track, detect_debris
 
-    data_dir = Path(data_dir)
-    # Start the browser at a site-default data folder when the launch folder
-    # has no ND2s (e.g. a bare `--show` launch from the cwd).
-    try:
-        has_nd2 = any(data_dir.glob("*.nd2"))
-    except Exception:
-        has_nd2 = False
-    if not has_nd2:
-        for cand in _DEFAULT_DATA_DIRS:
-            if Path(cand).is_dir():
-                data_dir = Path(cand)
-                break
-    # Fall back to a site default model if none was provided at launch.
-    if not weights_path:
-        for cand in _DEFAULT_WEIGHTS:
-            if Path(cand).exists():
-                weights_path = cand
-                break
+    data_dir = common.resolve_data_dir(data_dir)
+    weights_path = common.resolve_weights(weights_path)
 
     # ---- widgets (created empty; populated on load) --------------------
     # In-page file browser so users who can't use a terminal can navigate to
     # the ND2 and the model without --data-dir/--weights. Server-side listing
     # (the browser only shows the lists); safe for multi-user RDP.
     drive_select = Select(title="Drive / volume", value="",
-                          options=_list_drives(), width=150)
+                          options=common.list_drives(), width=150)
     dir_input = TextInput(title="Folder", value=str(data_dir))
     up_btn = Button(label="⬆ Up", width=70)
     refresh_btn = Button(label="⟳ Refresh", width=90)
@@ -188,44 +112,9 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
     kf_add, kf_drop = _btn("Add keyframe @T"), _btn("Drop keyframe @T")
     save_btn = _btn("Save annotations", "success")
 
-    img_src = ColumnDataSource({"image": [np.zeros((2, 2), dtype=np.float32)]})
-    box_src = ColumnDataSource(
-        {"id": [], "num": [], "label": [], "cx": [], "cy": [], "w": [], "h": [],
-         "marker": [], "color": [], "text": []}
-    )
-    mapper = LinearColorMapper(palette="Greys256", low=0, high=65535)
-    fig = figure(width=760, height=760, match_aspect=True,
-                 tools="pan,wheel_zoom,reset", title="(no file loaded)")
-    img_r = fig.image(image="image", x=0, y=0, dw=1, dh=1, source=img_src,
-                      color_mapper=mapper, level="image")
-    rect_r = fig.rect(
-        x="cx", y="cy", width="w", height="h", source=box_src,
-        fill_alpha=0.0, line_color="color", line_width=3,
-        # dim the others and make the selected box unmistakable
-        nonselection_fill_alpha=0.0, nonselection_line_alpha=0.35,
-        selection_fill_color="color", selection_fill_alpha=0.18,
-        selection_line_color="white", selection_line_width=5,
-    )
-    fig.add_layout(
-        LabelSet(
-            x="cx", y="cy", text="text", source=box_src,
-            text_color="white", text_font_size="10pt", text_font_style="bold",
-            background_fill_color="black", background_fill_alpha=0.55,
-            y_offset=12,
-        )
-    )
-    box_tool = BoxEditTool(renderers=[rect_r], empty_value="")
-    tap_tool = TapTool(renderers=[rect_r])
-    fig.add_tools(box_tool, tap_tool)
-    # Tap selects a box. Leave the DEFAULT drag as pan (not Box-Edit) so a
-    # stray click no longer starts drawing a box that sticks to the cursor —
-    # the reported "can't click anywhere else" bug. The user picks the
-    # Box-Edit tool from the toolbar deliberately to move/draw; Add/Delete
-    # buttons cover the common cases without it.
-    fig.toolbar.active_tap = tap_tool
-    pan = fig.select_one(PanTool)
-    if pan is not None:
-        fig.toolbar.active_drag = pan
+    # Shared viewer: image + box overlay, tap-to-select, pan as the default
+    # drag (so a stray click can't start a stuck box) — see common.py.
+    fig, img_src, img_r, box_src, rect_r, mapper = common.build_image_figure()
 
     # ---- mutable session context --------------------------------------
     ctx: dict = {"state": None, "plane": None, "n_c": 1, "channels": [],
@@ -238,13 +127,10 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
     def _rescan(*_) -> None:
         d = Path(dir_input.value).expanduser()
         try:
-            entries = sorted(d.iterdir(), key=lambda x: x.name.lower())
+            subs, nd2s, pths = common.scan_folder(d)
         except Exception as exc:
             status.text = f"⚠ cannot read folder '{d}': {exc}"
             return
-        subs = [p.name for p in entries if p.is_dir() and not p.name.startswith(".")]
-        nd2s = [p.name for p in entries if p.suffix.lower() == ".nd2"]
-        pths = [p.name for p in entries if p.suffix.lower() == ".pth"]
         ctx["data_dir"] = d
         subdir_select.options = ["(open a subfolder…)"] + subs
         subdir_select.value = "(open a subfolder…)"
@@ -405,28 +291,14 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
         if st is None:
             return
         plane = ctx["plane"](st.current_t, _chan_index())
-        # Slider spans the full data min..max so the high end can be pushed all
-        # the way up to bright fluorescence (e.g. mCherry nuclei ~5000) — the
-        # earlier percentile cap made that impossible.
-        mn, mx = float(plane.min()), float(plane.max())
-        if mx <= mn:
-            mx = mn + 1.0
-        # Default window near min..max (only the 0.1% tails trimmed, so a lone
-        # hot/dead pixel doesn't wreck it) — plenty of range visible by default.
-        lo, hi = (float(v) for v in np.percentile(plane, [0.1, 99.9]))
-        if hi <= lo:
-            hi = lo + 1.0
-        # ~500 steps across the range so the two handles are smooth to drag
-        # even when the range is large.
-        contrast.step = max(1.0, (mx - mn) / 500.0)
+        mn, mx, lo, hi, step = common.contrast_bounds(plane)
+        contrast.step = step
         contrast.start, contrast.end = mn, mx
         contrast.value = (lo, hi)
         mapper.low, mapper.high = lo, hi
 
     # ---- load ----------------------------------------------------------
     def do_load(event=None) -> None:
-        import nd2
-
         name = file_select.value
         if not name:
             status.text = "No ND2 file selected."
@@ -440,21 +312,10 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
                 prev.close()
             except Exception:
                 pass
-        f = nd2.ND2File(str(path))
-        ctx["nd2_file"] = f  # keep the handle alive for lazy dask reads
-        sizes = dict(f.sizes)
-        axes = list(sizes.keys())
-        arr = f.to_dask()
-        try:
-            channels = [str(cc.channel.name) for cc in (f.metadata.channels or [])]
-        except Exception:
-            channels = []
-        n_t = sizes.get("T", 1)
-        n_c = sizes.get("C", 1)
-        if not channels:
-            channels = [f"C{i}" for i in range(n_c)]
-        H = sizes.get("Y", arr.shape[-2])
-        W = sizes.get("X", arr.shape[-1])
+        nd = common.open_nd2(path)
+        ctx["nd2_file"] = nd["file"]  # keep the handle alive for lazy dask reads
+        arr, axes, channels = nd["arr"], nd["axes"], nd["channels"]
+        n_t, H, W = nd["n_t"], nd["H"], nd["W"]
 
         json_path = path.with_suffix(".annotations.json")
         if json_path.exists():
@@ -469,7 +330,7 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
             )
 
         ctx["state"] = DashboardState(af, n_t=n_t)
-        ctx["plane"] = _plane_extractor(arr, axes)
+        ctx["plane"] = nd["plane"]
         ctx["channels"] = channels
         ctx["json_path"] = json_path
         ctx["json_mtime"] = json_path.stat().st_mtime if json_path.exists() else None
@@ -489,7 +350,7 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
         t_slider.end = max(1, n_t - 1)
         t_slider.value = 0
         chan_select.options = channels
-        bf_idx = next((i for i, c in enumerate(channels) if "bf" in c.lower()), 0)
+        bf_idx = nd["bf_index"]
         chan_select.value = channels[bf_idx]
         ctx["bf_index"] = bf_idx
         # label_select options/value are managed by _render_legend (command

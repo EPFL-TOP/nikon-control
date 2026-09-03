@@ -7,6 +7,106 @@ the annotation tool against ND2 files on a shared drive.
 > The napari `nikon-control-annotate` tool below is retired/legacy. Jump to
 > [Running the dashboard](#running-the-dashboard) if it's already installed.
 
+## Clean install from scratch (new server)
+
+Follow these top to bottom on a fresh Windows machine. It uses **Miniconda**
+(the same env used for the GPU torch build) and installs the current Bokeh
+dashboard. Do it once, as an admin; annotators then just open a browser.
+
+Throughout, the conda env is called `single-cells` and the code lives in
+`C:\Tools\nikon-control`. Change these if you like, but keep them consistent.
+
+### 1. Install the prerequisites
+
+Install these first (all "for all users" so every RDP account can use them):
+
+1. **Miniconda — for all users.** Download from
+   <https://www.anaconda.com/download/success> (Miniconda). During setup pick
+   **"Install for all users"** so it lands in `C:\ProgramData\miniconda3\`,
+   **not** `C:\Users\<you>\AppData\Local\` — a per-user install under
+   `AppData\Local` is unreadable by other Windows accounts and breaks
+   multi-user use.
+2. **Git for Windows** — <https://git-scm.com/download/win>.
+3. **Microsoft Visual C++ Redistributable x64** —
+   <https://aka.ms/vs/17/release/vc_redist.x64.exe>, then reboot. Required by
+   torch (`c10.dll`) and the ND2 reader; installing it now avoids the
+   `WinError 1114` DLL failure later.
+4. **NVIDIA driver** (only if the box has an NVIDIA GPU) — a recent
+   Studio/Game-Ready driver from <https://www.nvidia.com/download/index.aspx>.
+   Verify with `nvidia-smi` in a terminal. No CUDA *toolkit* is needed — the
+   torch wheel bundles its own CUDA runtime.
+
+Open a fresh **Anaconda Prompt** (Start menu) for the rest so `conda` is on
+PATH.
+
+### 2. Get the code
+
+```bat
+cd C:\Tools
+git clone <your-fork-or-mirror-url> nikon-control
+cd nikon-control
+```
+
+### 3. Create the environment and install the tool
+
+```bat
+conda create -y -n single-cells python=3.11
+conda activate single-cells
+python -m pip install --upgrade pip
+pip install -e ".[dashboard]"
+```
+
+Python **3.11** is recommended (3.12 is fine; avoid 3.13 on Windows).
+
+### 4. Enable the GPU (recommended — skip if CPU-only)
+
+`pip install` pulls the **CPU-only** torch on Windows, so detection would run
+slowly. Replace it with a CUDA wheel matching your driver:
+
+```bat
+conda activate single-cells
+pip uninstall -y torch torchvision
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+```
+
+That last line must print `True <your GPU>`. Use `cu124` for very new drivers
+or `cu118` for older ones. (More detail + troubleshooting in
+[GPU acceleration](#gpu-acceleration-make-detection-fast).)
+
+### 5. Put the detection model in place
+
+Copy `cell_detection_model.pth` to a readable location, e.g.
+`C:\Tools\nikon-control\cell_detection_model.pth` or a shared drive. You'll
+point `--weights` at it (or drop it in the data folder for auto-discovery).
+
+### 6. First run and smoke test
+
+```bat
+conda activate single-cells
+nikon-control-dashboard --data-dir "G:\PROJECTS-02\Samuel" ^
+    --weights "C:\Tools\nikon-control\cell_detection_model.pth" --show
+```
+
+A browser opens at <http://localhost:5006>. Pick an ND2 from the dropdown,
+scrub frames, then click **Detect cells** — the status line should say
+"Detected N tracks on **CUDA**". If it says CPU, revisit step 4; if detection
+errors, see the troubleshooting below.
+
+If the `nikon-control-dashboard` command isn't found, the module form always
+works: `python -m nikon_control.dashboard.launch --show`.
+
+### 7. Make it available to everyone, always-on
+
+For multiple annotators and survival across logoffs/reboots, run it as a
+Windows service and (for off-server users) bind it to the network — see
+[Multiple users on the Windows Server](#multiple-users-on-the-windows-server).
+That section's NSSM command is the recommended way to keep it running.
+
+You're done. Day-to-day, annotators just open the URL — no terminal needed.
+
+---
+
 ## Running the dashboard
 
 In a conda env (or the venv), with the package installed
@@ -23,8 +123,20 @@ nikon-control-dashboard --data-dir "Z:\experiments\2026-07" ^
 - `--weights` — path to `cell_detection_model.pth` (enables the in-app
   *Detect cells* button; also auto-discovered if a `.pth` sits in the data
   folder).
-- `--show` — opens a browser tab automatically. It serves at
-  <http://localhost:5006>.
+- `--show` — opens a browser tab automatically.
+
+**Two dashboards are served by the one process**, sharing the same viewer
+and file browser:
+
+| URL | Dashboard | Use it for |
+|---|---|---|
+| <http://localhost:5006/annotate> | **Full** — tracked annotations: keyframes, birth/end/deaths, class changes over time | following individual cells through a movie |
+| <http://localhost:5006/simple> | **Simple** — independent per-frame boxes, first N frames, 3 classes (single/doublet/debris) | building detector **training data** |
+
+<http://localhost:5006/> lists both. The simple one is the one to point
+annotators at for training data — it has no tracking or lifecycle controls,
+and writes a separate `<file>.simple.json` sidecar that cannot be confused
+with the full dashboard's `<file>.annotations.json`.
 
 `--data-dir` and `--weights` only set the *starting* folder/model —
 annotators without terminal access can navigate to any folder, ND2, and
