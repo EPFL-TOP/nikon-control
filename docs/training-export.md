@@ -34,6 +34,11 @@ sees:
 - `label` is one of `single` / `doublet` / `debris`, or `unlabeled` for a
   detection nobody has classified yet. **`unlabeled` boxes are never
   training data.**
+- `group` links the boxes of one physical cell across frames. It exists so
+  the annotator classifies a cell **once** rather than once per frame
+  (detections are grouped automatically by IoU). Training ignores it — the
+  labels are per-frame — but the exporter passes it through as `cell` so
+  correlated boxes remain identifiable.
 - `auto` is `true` while a box is exactly as the detector produced it, and
   becomes `false` the moment a human classifies, moves, or resizes it. Two
   uses: re-running detection only replaces `auto` boxes (so it can't destroy
@@ -64,6 +69,40 @@ Keep the export a **build artifact**: the ND2s + JSONs stay the source of
 truth, and the exporter is re-runnable to produce `v2`, `v3`, … as
 annotation grows.
 
+## Running it
+
+```bat
+:: 1. export a frozen dataset from the annotations
+nikon-control-export --data-dir "G:\PROJECTS-02\Samuel" --out dataset-v1
+::    useful flags: --frame-step 5   (cut near-duplicate frames)
+::                  --verified-only  (drop auto-labelled boxes nobody touched)
+::                  --dry-run        (report what would be exported)
+
+:: 2. train, warm-starting from the existing 1-class cell model
+nikon-control-train --dataset dataset-v1 --out cell_classes_model.pth ^
+    --init-from "E:\PROJECTS-01\Clement\cell_detection_model.pth" ^
+    --epochs 20 --batch-size 4
+```
+
+The exporter prints a summary and warns when the data is thin (a single
+source file, so validation is meaningless; or few distinct cells). Training
+reports `train_loss` plus **AP@0.5 per class** and `mAP@0.5` each epoch, and
+keeps the best checkpoint by val mAP.
+
+The checkpoint is written as `{"model_state_dict", "classes", ...}` — the
+same shape the package already reads, and `CellDetector` infers the class
+count from the box predictor, so the trained 3-class model loads back
+without changes.
+
+## One rule for annotators
+
+**Label *every* cell and every piece of debris on a frame you annotate.**
+Only frames with at least one label are exported, and everything unboxed in
+an exported frame is treated as background — so a cell you skipped actively
+teaches the model to ignore cells. If a frame is too crowded or ambiguous to
+finish, leave it entirely unlabelled (it is then skipped) rather than
+half-labelled.
+
 ## Export format
 
 Full-frame 16-bit TIFF + a COCO JSON:
@@ -84,7 +123,9 @@ dataset-v1/
 - **COCO** because the model is a torchvision `fasterrcnn_resnet50_fpn`;
   COCO boxes are `[x, y, w, h]`, so `[y0,x0,y1,x1]` -> `[x0, y0, x1-x0,
   y1-y0]`. Categories: `single`=1, `doublet`=2, `debris`=3 (0 is background).
-- Skip `unlabeled`; offer `--verified-only` to additionally drop `auto` boxes.
+- Skips `unlabeled`; `--verified-only` additionally drops `auto` boxes.
+- Each annotation keeps `cell` (the group id) and `auto`, so correlated boxes
+  can be grouped in later analysis or a stricter split.
 - The `manifest.json` records source files, per-class counts, the split, the
   schema version, and the git commit — so a trained model can be traced back.
 

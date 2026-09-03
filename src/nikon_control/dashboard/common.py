@@ -17,6 +17,10 @@ from pathlib import Path
 
 import numpy as np
 
+# ND2 reading lives in ``io.py``; re-exported here so both dashboards
+# (and the training exporter) share one implementation.
+from ..io import bf_channel_index, open_nd2, plane_extractor  # noqa: F401
+
 # distinct line colours per class (cycled)
 PALETTE = ["#ff3b30", "#ffcc00", "#34c759", "#00c7be", "#ff9500", "#af52de"]
 
@@ -56,25 +60,6 @@ def list_drives() -> list[str]:
 
 def class_color(classes: list[str]) -> dict[str, str]:
     return {c: PALETTE[i % len(PALETTE)] for i, c in enumerate(classes)}
-
-
-def plane_extractor(arr, axes: list[str]):
-    """Build ``plane(t, c) -> 2D ndarray`` for an ND2's dask array."""
-
-    def plane(t: int, c: int) -> np.ndarray:
-        idx: list = []
-        for ax in axes:
-            if ax == "T":
-                idx.append(int(t))
-            elif ax == "C":
-                idx.append(int(c))
-            elif ax in ("Y", "X"):
-                idx.append(slice(None))
-            else:
-                idx.append(0)
-        return np.asarray(arr[tuple(idx)])
-
-    return plane
 
 
 def resolve_data_dir(data_dir: str | Path) -> Path:
@@ -133,46 +118,6 @@ def contrast_bounds(plane: np.ndarray) -> tuple[float, float, float, float, floa
         hi = lo + 1.0
     step = max(1.0, (mx - mn) / 500.0)
     return mn, mx, lo, hi, step
-
-
-def open_nd2(path: str | Path) -> dict:
-    """Open an ND2 and return everything the dashboards need from it.
-
-    The caller owns ``file`` and must close it (both apps close it on session
-    teardown / when switching files).
-    """
-    import nd2
-
-    f = nd2.ND2File(str(path))
-    sizes = dict(f.sizes)
-    axes = list(sizes.keys())
-    arr = f.to_dask()
-    try:
-        channels = [str(cc.channel.name) for cc in (f.metadata.channels or [])]
-    except Exception:
-        channels = []
-    n_t = sizes.get("T", 1)
-    n_c = sizes.get("C", 1)
-    if not channels:
-        channels = [f"C{i}" for i in range(n_c)]
-    return {
-        "file": f,
-        "arr": arr,
-        "axes": axes,
-        "sizes": sizes,
-        "channels": channels,
-        "n_t": n_t,
-        "n_c": n_c,
-        "H": sizes.get("Y", arr.shape[-2]),
-        "W": sizes.get("X", arr.shape[-1]),
-        "bf_index": bf_channel_index(channels),
-        "plane": plane_extractor(arr, axes),
-    }
-
-
-def bf_channel_index(channels: list[str]) -> int:
-    """Index of the brightfield channel (the one detection runs on)."""
-    return next((i for i, c in enumerate(channels) if "bf" in c.lower()), 0)
 
 
 def build_image_figure(width: int = 760, height: int = 760):

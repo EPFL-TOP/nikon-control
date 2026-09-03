@@ -33,13 +33,83 @@ def test_same_cell_two_frames_are_independent():
     assert st.boxes_at(1)[0]["label"] == "doublet"
 
 
-def test_num_is_per_frame():
+def test_num_is_per_cell_and_stable_across_frames():
+    """A cell keeps its number while scrubbing — the identity feedback that
+    makes 'classify once per cell' legible."""
     st = _st()
-    st.add_box(10, 10, 4, 4, "single", t=0)
-    st.add_box(20, 20, 4, 4, "single", t=0)
-    st.add_box(30, 30, 4, 4, "single", t=1)
+    st.add_box(10, 10, 4, 4, "single", t=0, group="g1")
+    st.add_box(20, 20, 4, 4, "single", t=0)          # standalone -> own cell
+    st.add_box(11, 11, 4, 4, "single", t=1, group="g1")  # same cell, later frame
     assert [r["num"] for r in st.boxes_at(0)] == [1, 2]
-    assert [r["num"] for r in st.boxes_at(1)] == [1]
+    assert [r["num"] for r in st.boxes_at(1)] == [1]  # cell 1 again, not 3
+
+
+def test_classify_once_applies_to_the_whole_cell():
+    """The whole point of the light tracking: one click labels every frame."""
+    st = _st()
+    ids = [st.add_box(10, 10, 4, 4, PROVISIONAL_LABEL, t=t, group="g1",
+                      auto=True) for t in range(5)]
+    solo = st.add_box(99, 99, 4, 4, PROVISIONAL_LABEL, t=0, auto=True)
+    n = st.set_label(ids[2], "doublet")            # click any frame
+    assert n == 5
+    assert all(st.box(i).label == "doublet" for i in ids)
+    assert st.box(solo).label == PROVISIONAL_LABEL  # other cells untouched
+    assert st.unlabeled_count() == 1
+
+
+def test_scope_frame_and_forward():
+    st = _st()
+    ids = [st.add_box(10, 10, 4, 4, "single", t=t, group="g1")
+           for t in range(6)]
+    # a one-off correction on a single frame
+    assert st.set_label(ids[0], "debris", scope="frame") == 1
+    assert [st.box(i).label for i in ids] == (
+        ["debris"] + ["single"] * 5)
+    # a cell that divides mid-window: doublet from frame 3 on
+    assert st.set_label(ids[3], "doublet", scope="forward") == 3
+    assert [st.box(i).label for i in ids] == (
+        ["debris", "single", "single", "doublet", "doublet", "doublet"])
+
+
+def test_geometry_stays_per_frame_within_a_cell():
+    """Moving a box must not move its siblings — cells drift."""
+    st = _st()
+    a = st.add_box(10, 10, 4, 4, "single", t=0, group="g1")
+    b = st.add_box(10, 10, 4, 4, "single", t=1, group="g1")
+    st.update_box(b, 80, 80, 4, 4)
+    assert st.boxes_at(0)[0]["cx"] == 10
+    assert st.boxes_at(1)[0]["cx"] == 80
+    assert st.group_of(a) == st.group_of(b)
+
+
+def test_delete_scope_frame_vs_cell():
+    st = _st()
+    ids = [st.add_box(10, 10, 4, 4, "single", t=t, group="g1")
+           for t in range(4)]
+    assert st.delete(ids[1]) == 1                    # just that frame
+    assert len(st.boxes()) == 3
+    assert st.delete(ids[0], scope="cell") == 3      # the whole cell
+    assert st.boxes() == []
+
+
+def test_propagate_forward_shares_one_cell():
+    st = _st(n_frames=5)
+    i = st.add_box(10, 10, 4, 4, "single", t=0)
+    assert st.propagate_forward(i) == 4              # frames 1..4
+    assert [b.t for b in st.boxes()] == [0, 1, 2, 3, 4]
+    gids = {b.group for b in st.boxes()}
+    assert len(gids) == 1 and None not in gids
+    # and a later re-classification still hits all of them
+    assert st.set_label(i, "doublet") == 5
+    assert {b.label for b in st.boxes()} == {"doublet"}
+
+
+def test_propagate_forward_skips_frames_already_occupied():
+    st = _st(n_frames=4)
+    i = st.add_box(10, 10, 4, 4, "single", t=0, group="g1")
+    st.add_box(50, 50, 4, 4, "single", t=2, group="g1")   # already there
+    assert st.propagate_forward(i) == 2                   # only t=1 and t=3
+    assert st.boxes_at(2)[0]["cx"] == 50                  # not overwritten
 
 
 def test_frame_limit_clamps_navigation():

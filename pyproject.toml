@@ -40,6 +40,8 @@ nikon-control = "nikon_control.cli:main"
 nikon-control-annotate = "nikon_control.annotate:main"
 nikon-control-preannotate = "nikon_control.preannotate:main"
 nikon-control-dashboard = "nikon_control.dashboard.launch:main"
+nikon-control-export = "nikon_control.export_training:main"
+nikon-control-train = "nikon_control.train_detector:main"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]

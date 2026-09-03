@@ -8,8 +8,13 @@ just *(frame, box, class)*.
 
 Key differences from the tracked schema:
 
-- **No tracking.** A box belongs to exactly ONE frame. The same cell at
-  t=0 and t=5 is two independent boxes, by design.
+- **Per-frame boxes.** A box belongs to exactly ONE frame, and each carries
+  its own bbox and class — that is what gets exported for training.
+- **A light identity link** (``SimpleBox.group``) may join the boxes of one
+  physical cell across frames. It exists purely so the annotator classifies
+  a cell ONCE instead of on every frame; geometry stays per-frame (so a
+  drifting cell is still correct), and nothing about the exported labels
+  depends on it. Boxes with ``group=None`` are standalone.
 - **No lifecycle.** No t_start / t_end / t_deaths / class_changes /
   keyframes / interpolation.
 - **Three training classes** (``TRAINING_CLASSES``): single, doublet,
@@ -28,6 +33,7 @@ convertible to COCO. See ``docs/training-export.md``.
 from __future__ import annotations
 
 import json
+import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -71,6 +77,11 @@ class SimpleBox:
     # as a human classifies, moves, or resizes it. Re-running detection
     # replaces only ``auto`` boxes, so it can never destroy human work.
     auto: bool = False
+    # Optional identity shared by the boxes of ONE physical cell across
+    # frames, so a class can be set once for the whole cell. Purely an
+    # annotation convenience — training uses ``t``/``bbox``/``label`` only.
+    # ``None`` = a standalone box.
+    group: str | None = None
 
     @property
     def is_training_label(self) -> bool:
@@ -181,13 +192,18 @@ def class_counts(af: SimpleAnnotationFile) -> dict[str, int]:
 
 
 def boxes_from_annotations(anns, n_frames: int, label: str | None = None,
-                           score: float | None = None) -> list[SimpleBox]:
+                           score: float | None = None,
+                           group: bool = True) -> list[SimpleBox]:
     """Flatten tracked annotations into independent per-frame boxes.
 
     Used to reuse the *tracked* detectors (e.g. debris detection, which needs
     a temporal background) inside the simplified per-frame workflow: each
     track is expanded into one box per frame it is visible on, and the track
     identity is then discarded.
+
+    With ``group=True`` (default) each track's boxes share a ``group`` id, so
+    the annotator can re-classify or delete the whole object in one action
+    while its geometry stays per-frame.
 
     ``anns`` is duck-typed on the tracked ``schema.Annotation`` interface
     (``t_start``, ``t_end``, ``label``, ``bbox_at(t)``) so this module stays
@@ -198,7 +214,22 @@ def boxes_from_annotations(anns, n_frames: int, label: str | None = None,
     for a in anns:
         lo = max(0, int(a.t_start))
         hi = last if a.t_end is None else min(last, int(a.t_end))
+        gid = uuid.uuid4().hex if group else None
         for t in range(lo, hi + 1):
             out.append(SimpleBox(t=t, bbox=[float(v) for v in a.bbox_at(t)],
-                                 label=label or a.label, score=score))
+                                 label=label or a.label, score=score,
+                                 group=gid))
     return out
+
+
+def group_counts(af: SimpleAnnotationFile) -> dict[str, int]:
+    """How many distinct CELLS (groups) per class, vs boxes.
+
+    A cell tracked across 20 frames is 20 boxes but one cell; this is the
+    number that reflects how much genuinely independent data there is.
+    Standalone boxes each count as their own cell.
+    """
+    seen: dict[str, set] = {}
+    for i, b in enumerate(af.boxes):
+        seen.setdefault(b.label, set()).add(b.group or f"_solo{i}")
+    return {label: len(g) for label, g in seen.items()}

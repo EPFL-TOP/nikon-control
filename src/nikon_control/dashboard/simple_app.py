@@ -9,8 +9,10 @@ The task it supports:
 
 - annotate only the first N frames (default 20, settable) — the detector must
   recognise singles/doublets *early*;
-- every ROI is independent: a cell on frame 0 and the same cell on frame 5
-  are two separate labels, and nothing is tracked;
+- boxes are stored per frame (that is what training consumes), but the boxes
+  of one cell share a light ``group`` identity so the annotator picks a class
+  **once per cell** instead of once per frame — detections are grouped
+  automatically by IoU;
 - three classes only: **single**, **doublet**, **debris** (fresh detections
   arrive as *unlabeled* and the annotator assigns one);
 - saved to ``<file>.simple.json`` — a different format and filename from the
@@ -52,6 +54,7 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
     from bokeh.models import (
         Button,
         Div,
+        RadioButtonGroup,
         Range1d,
         RangeSlider,
         Select,
@@ -102,7 +105,15 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
 
     # ---- annotation (the whole simplified panel) -----------------------
     add_roi_btn = Button(label="➕ Add ROI", button_type="primary", width=150)
-    del_roi_btn = Button(label="🗑 Delete ROI", button_type="danger", width=150)
+    del_frame_btn = Button(label="🗑 This frame", button_type="danger",
+                           width=145)
+    del_cell_btn = Button(label="🗑 Whole cell", button_type="danger",
+                          width=145)
+    propagate_btn = Button(label="⤳ Copy to later frames", width=300)
+    _SCOPES = ["cell", "frame", "forward"]
+    scope_radio = RadioButtonGroup(
+        labels=["whole cell", "this frame", "from here on"], active=0,
+        width=300)
     cls_btns = {c: Button(label=c, width=140) for c in TRAINING_CLASSES}
     width_spin = Spinner(title="ROI width (px)", low=4, high=4000, step=2,
                          value=110, width=145)
@@ -197,8 +208,10 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
                 "h": [r["h"] for r in rows],
                 "marker": [r["marker"] for r in rows],
                 "color": [colors.get(r["label"], "#ffffff") for r in rows],
+                # cell number + short class tag, so the annotator can see
+                # the same cell keep its identity while scrubbing
                 "text": [
-                    _SHORT.get(r["label"], r["label"])
+                    f"{r['num']} " + _SHORT.get(r["label"], r["label"])
                     + (f" {r['marker']}" if r["marker"] else "")
                     for r in rows
                 ],
@@ -215,20 +228,24 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
         st = ctx["state"]
         if st is None:
             return
-        counts = st.counts()
+        cells = st.cell_counts()
+        boxes = st.counts()
         here = st.counts_at()
-        todo = st.unlabeled_count()
+        todo_cells = st.unlabeled_cells()
+        # cells is the honest measure of independent data; boxes is what the
+        # exporter emits, so show both
         parts = " · ".join(
-            f"<b>{c}</b> {counts.get(c, 0)}" for c in TRAINING_CLASSES
+            f"<b>{c}</b> {cells.get(c, 0)} cell(s)/{boxes.get(c, 0)} box"
+            for c in TRAINING_CLASSES
         )
         far = st.out_of_range_count()
         far_txt = (f" <span style='color:#c60'>· {far} box(es) beyond frame "
                    f"{st.max_t}</span>") if far else ""
         progress_summary.text = (
             f"Frames 0–{st.max_t} · this frame: {sum(here.values())} box(es)"
-            f"<br>Total labelled: {parts}"
-            f"<br><span style='color:{'#c60' if todo else '#0a7'}'>"
-            f"{todo} still <i>unlabeled</i></span>{far_txt}"
+            f"<br>Labelled: {parts}"
+            f"<br><span style='color:{'#c60' if todo_cells else '#0a7'}'>"
+            f"{todo_cells} cell(s) still <i>unlabeled</i></span>{far_txt}"
         )
 
     def _render_legend() -> None:
@@ -380,11 +397,25 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
             fn(st, i)
         _render_boxes()
 
+    def _scope() -> str:
+        return _SCOPES[scope_radio.active]
+
     def _set_class(label: str) -> None:
-        _apply_to_selected(lambda st, i: st.set_label(i, label))
-        n = len(_selected_ids())
-        if n:
-            status.text = f"Set {n} box(es) → {label}."
+        st = ctx["state"]
+        if st is None:
+            return
+        ids = _selected_ids()
+        if not ids:
+            status.text = "Select a box first (tap it), then pick a class."
+            return
+        scope = _scope()
+        touched = sum(st.set_label(i, label, scope=scope, t=st.current_t)
+                      for i in ids)
+        _render_boxes()
+        where = {"cell": "on every frame of the cell",
+                 "frame": "on this frame only",
+                 "forward": f"from frame {st.current_t} on"}[scope]
+        status.text = f"Set → <b>{label}</b> {where} ({touched} box(es))."
 
     for cls, btn in cls_btns.items():
         btn.on_click(lambda cls=cls: _set_class(cls))
@@ -403,7 +434,7 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
         status.text = ("Added an ROI on this frame — now pick single / "
                        "doublet / debris.")
 
-    def _delete_roi() -> None:
+    def _delete_roi(scope: str) -> None:
         st = ctx["state"]
         if st is None:
             return
@@ -411,14 +442,33 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
         if not ids:
             status.text = "Select a box first (tap it), then Delete."
             return
-        for i in ids:
-            st.delete(i)
+        n = sum(st.delete(i, scope=scope) for i in ids if st.has(i))
         ctx["selected_ids"] = []
         _render_boxes()
-        status.text = f"Deleted {len(ids)} ROI(s)."
+        status.text = (f"Deleted {n} box(es)"
+                       + (" — the whole cell." if scope == "cell"
+                          else " on this frame."))
+
+    def _propagate() -> None:
+        st = ctx["state"]
+        if st is None:
+            return
+        ids = _selected_ids()
+        if not ids:
+            status.text = "Select a box first (tap it), then copy it forward."
+            return
+        n = sum(st.propagate_forward(i) for i in ids)
+        _render_boxes()
+        status.text = (
+            f"Copied to {n} later frame(s) as the same cell — one class "
+            "change now updates all of them. Nudge individual frames if the "
+            "cell drifts."
+        )
 
     add_roi_btn.on_click(_add_roi)
-    del_roi_btn.on_click(_delete_roi)
+    del_frame_btn.on_click(lambda: _delete_roi("frame"))
+    del_cell_btn.on_click(lambda: _delete_roi("cell"))
+    propagate_btn.on_click(_propagate)
 
     def _on_size_change(attr, old, new) -> None:
         if ctx["syncing_size"]:
@@ -526,16 +576,31 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
                 return d
 
             def _run(det):
-                out: list[SimpleBox] = []
+                """Detect per frame, then link frame-to-frame by IoU purely to
+                GROUP the boxes of one cell — so the annotator classifies each
+                cell once instead of once per frame. Geometry stays exactly as
+                detected on each frame (nothing is interpolated), which is what
+                training consumes."""
+                import uuid as _uuid
+
+                from ..tracking import IoUTracker
+
+                per_frame = []
                 for t in range(n_frames):
                     if t % 5 == 0 or t == n_frames - 1:
                         _tick(f"Detecting on {det.device.upper()}… "
                               f"frame {t + 1}/{n_frames}")
-                    for d in det.detect_frame(ctx["plane"](t, bf)):
+                    per_frame.append(det.detect_frame(ctx["plane"](t, bf)))
+                _tick("Linking detections into cells…")
+                out: list[SimpleBox] = []
+                for tr in IoUTracker(iou_threshold=0.3, max_age=2).track(
+                        per_frame):
+                    gid = _uuid.uuid4().hex
+                    for t, bb, sc in zip(tr.frames, tr.bboxes, tr.scores):
                         out.append(SimpleBox(
-                            t=t, bbox=[float(v) for v in d.bbox],
-                            label=PROVISIONAL_LABEL, score=d.score,
-                            auto=True,
+                            t=t, bbox=[float(v) for v in bb],
+                            label=PROVISIONAL_LABEL, score=float(sc),
+                            auto=True, group=gid,
                         ))
                 return out
 
@@ -562,11 +627,13 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
                     _render_boxes()
                     detect_btn.disabled = False
                     progress_div.text = ""
+                    ncells = len({b.group for b in boxes})
                     status.text = (
-                        f"Detected {n} box(es) across frames 0–{n_frames - 1} "
-                        f"on {dev} — all <i>unlabeled</i>. Tap each and set "
-                        "single / doublet / debris. Already-classified boxes "
-                        "were kept."
+                        f"Detected {n} box(es) = <b>{ncells} cell(s)</b> "
+                        f"across frames 0–{n_frames - 1} on {dev}, all "
+                        "<i>unlabeled</i>. Tap a box and pick a class — with "
+                        "scope <b>whole cell</b> that labels every frame of "
+                        "it at once. Already-classified cells were kept."
                     )
                 doc.add_next_tick_callback(finish)
             except Exception as exc:
@@ -701,18 +768,27 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
         Div(text="<h3 style='margin:2px 0'>Simple annotation "
                  "<span style='font-size:12px;color:#888'>(per frame, no "
                  "tracking)</span></h3>", width=420),
-        Div(text="Label cells and debris on each of the first N frames. "
-                 "Every box is <b>independent</b> — the same cell on two "
-                 "frames is two labels, and nothing is tracked. Saved to "
+        Div(text="Label cells and debris over the first N frames. Boxes are "
+                 "stored <b>per frame</b> (that's what training needs), but "
+                 "the boxes of one cell are linked, so you pick a class "
+                 "<b>once per cell</b> — not once per frame. Saved to "
                  "<code>&lt;file&gt;.simple.json</code>.", **_help),
         legend,
         progress_summary,
         Div(text="<b>1 · Add or pick a box</b> — <b>tap</b> a box to select "
-                 "it (turns white). <b>➕ Add ROI</b> puts a new one at the "
-                 "centre of this frame. Move it with the <i>Box Edit</i> tool "
-                 "in the toolbar (Esc cancels a half-drawn box).", **_help),
-        row(add_roi_btn, del_roi_btn),
+                 "it (turns white). The number on each box is its <b>cell "
+                 "number</b>, kept as you scrub. <b>➕ Add ROI</b> puts a new "
+                 "one on this frame. Move it with the <i>Box Edit</i> tool in "
+                 "the toolbar (Esc cancels a half-drawn box).", **_help),
+        row(add_roi_btn, del_frame_btn, del_cell_btn),
+        propagate_btn,
         Div(text="<b>2 · Set its class</b>", width=420),
+        Div(text="Applies to — <b>whole cell</b>: every frame of this cell "
+                 "(the normal choice: classify once). <b>this frame</b>: a "
+                 "one-off fix. <b>from here on</b>: for a cell that changes "
+                 "part-way, e.g. a single that divides into a doublet.",
+            **_help),
+        scope_radio,
         row(*(cls_btns[c] for c in TRAINING_CLASSES)),
         Div(text="<i>Resize the selected box:</i>", **_help),
         row(width_spin, height_spin),
