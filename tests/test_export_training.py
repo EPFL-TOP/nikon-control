@@ -114,3 +114,25 @@ def test_build_coco_drops_degenerate_boxes_at_train_time():
     """A zero-area box would crash torchvision; the dataset filters them."""
     from nikon_control.train_detector import CocoDetectionDataset
     assert CocoDetectionDataset is not None  # import-only check here
+
+
+def test_build_coco_records_channel_provenance():
+    """The review dashboard needs to know which plane the TIFF holds, and
+    what the other channels are called, to offer a channel selector."""
+    rec = {"file_name": "p_t0000.tif", "height": 8, "width": 8,
+           "source": "/d/p.nd2", "t": 3, "channel": 1,
+           "channels": ["BF", "mCherry"],
+           "boxes": [SimpleBox(t=3, bbox=[0, 0, 4, 4], label="single")]}
+    (img,) = build_coco([rec])["images"]
+    assert img["channel"] == 1
+    assert img["channels"] == ["BF", "mCherry"]
+    assert img["frame"] == 3 and img["source"] == "/d/p.nd2"
+
+
+def test_build_coco_channel_fields_default_when_absent():
+    """Datasets exported before channel provenance existed still load."""
+    rec = {"file_name": "p_t0000.tif", "height": 8, "width": 8,
+           "source": "p.nd2", "t": 0,
+           "boxes": [SimpleBox(t=0, bbox=[0, 0, 4, 4], label="single")]}
+    (img,) = build_coco([rec])["images"]
+    assert img["channel"] == 0 and img["channels"] == []

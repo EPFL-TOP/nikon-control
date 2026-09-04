@@ -25,6 +25,7 @@ from ..overlap import PREFER_AREA, PREFER_SCORE
 from . import common
 from .review_state import (
     FILTER_ALL,
+    FILTER_DISAGREE,
     FILTER_EMPTY,
     FILTER_OVERLAP,
     FILTER_REVIEWED,
@@ -36,13 +37,23 @@ from .review_state import (
 
 _SHORT = {"single": "S", "doublet": "D", "debris": "deb"}
 
+# The exported TIFF holds only the channel the model trains on. Other
+# channels are read live from the source ND2 (its path is recorded per image
+# at export time), so this option always shows the exact training pixels.
+_EXPORTED_CHANNEL = "exported (as trained)"
 
-def modify_doc(doc, dataset_dir: str | Path = ".") -> None:
+
+def modify_doc(doc, dataset_dir: str | Path = ".",
+               weights_path: str = "") -> None:
+    import threading
+
     from bokeh.events import Tap
     from bokeh.layouts import column, row
     from bokeh.models import (
         Button,
+        ColumnDataSource,
         Div,
+        LabelSet,
         Range1d,
         RangeSlider,
         Select,
@@ -54,6 +65,19 @@ def modify_doc(doc, dataset_dir: str | Path = ".") -> None:
 
     fig, img_src, img_r, box_src, rect_r, mapper = common.build_image_figure(
         box_edit=False)
+
+    # Model predictions as a SECOND overlay: dashed, and deliberately NOT in
+    # the tap tool's renderer list, so they can be compared side by side with
+    # the annotations but never selected or edited — they aren't annotations.
+    pred_src = ColumnDataSource({"cx": [], "cy": [], "w": [], "h": [],
+                                 "text": [], "color": []})
+    fig.rect(x="cx", y="cy", width="w", height="h", source=pred_src,
+             fill_alpha=0.0, line_color="color", line_width=2,
+             line_dash="dashed")
+    fig.add_layout(LabelSet(
+        x="cx", y="cy", text="text", source=pred_src, text_color="#7fdbff",
+        text_font_size="9pt", background_fill_color="#000033",
+        background_fill_alpha=0.6, y_offset=-14))
 
     # ---- widgets --------------------------------------------------------
     drive_select = Select(title="Drive / volume", value="",
@@ -69,6 +93,8 @@ def modify_doc(doc, dataset_dir: str | Path = ".") -> None:
                            options=[FILTER_ALL], width=340)
     img_slider = Slider(start=0, end=1, value=0, step=1, title="Image",
                         width=230)
+    chan_select = Select(title="Channel", value=_EXPORTED_CHANNEL,
+                         options=[_EXPORTED_CHANNEL], width=340)
     prev_btn = Button(label="◀ Prev", width=80)
     next_btn = Button(label="Next ▶", width=80)
     contrast = RangeSlider(start=0, end=65535, value=(0, 65535), step=1,
@@ -91,6 +117,20 @@ def modify_doc(doc, dataset_dir: str | Path = ".") -> None:
     grow_btn = Button(label="＋ 10%", width=95)
     cls_row: dict[str, Button] = {}
     cls_holder = column(width=420)
+    weights_input = TextInput(title="Model (.pth) to compare against",
+                              value=weights_path, width=340)
+    score_slider = Slider(start=0.1, end=0.95, value=0.5, step=0.05,
+                          title="Prediction score threshold", width=340)
+    predict_btn = Button(label="🤖 Run model on all images",
+                         button_type="warning", width=300)
+    show_pred_toggle = Toggle(label="👁 Show model predictions", active=True,
+                              width=300)
+    use_model_btn = Button(label="⇦ Use the model's class for this box",
+                           width=300)
+    agree_div = Div(text="", styles={"font-size": "12px"}, width=420)
+    progress_div = Div(text="", styles={
+        "font-size": "18px", "font-weight": "bold", "color": "#0a7",
+        "padding": "6px 4px"})
     overlap_spin = Spinner(title="Max overlap (%)", low=10, high=100, step=5,
                            value=70, width=145)
     prefer_select = Select(title="On overlap keep the", value="bigger",
@@ -108,7 +148,8 @@ def modify_doc(doc, dataset_dir: str | Path = ".") -> None:
 
     ctx: dict = {"state": None, "syncing": False, "selected_ids": [],
                  "place_target": None, "syncing_size": False,
-                 "dataset_dir": Path(dataset_dir)}
+                 "dataset_dir": Path(dataset_dir),
+                 "nd2": None, "nd2_source": None}
 
     # ---- folder browsing -------------------------------------------------
     def _rescan(*_) -> None:
@@ -181,7 +222,73 @@ def modify_doc(doc, dataset_dir: str | Path = ".") -> None:
                                         if r["id"] in sel]
         finally:
             ctx["syncing"] = False
+        _render_predictions()
+        _render_agreement()
         _render_info()
+
+    def _render_predictions() -> None:
+        st = ctx["state"]
+        if st is None:
+            return
+        if not show_pred_toggle.active or not st.has_predictions:
+            pred_src.data = {"cx": [], "cy": [], "w": [], "h": [],
+                             "text": [], "color": []}
+            return
+        preds = st.predicted()
+        ag = st.agreement()
+        extra = set(ag.extra) if ag else set()
+        mismatch = {pi for _, pi, _, _ in (ag.class_mismatch if ag else [])}
+        cx, cy, w, h, text, color = [], [], [], [], [], []
+        for i, pd in enumerate(preds):
+            y0, x0, y1, x1 = (float(v) for v in pd["bbox"])
+            cx.append((x0 + x1) / 2)
+            cy.append((y0 + y1) / 2)
+            w.append(x1 - x0)
+            h.append(y1 - y0)
+            sc = pd.get("score")
+            tag = _SHORT.get(str(pd["label"]), str(pd["label"]))
+            text.append(f"model {tag}"
+                        + (f" {float(sc):.2f}" if sc is not None else ""))
+            # red = the model found something nobody annotated; yellow = same
+            # object, different class; blue = agreement
+            color.append("#ff3b30" if i in extra
+                         else "#ffcc00" if i in mismatch else "#7fdbff")
+        pred_src.data = {"cx": cx, "cy": cy, "w": w, "h": h,
+                         "text": text, "color": color}
+
+    def _render_agreement() -> None:
+        st = ctx["state"]
+        if st is None:
+            return
+        if not st.has_predictions:
+            agree_div.text = ("<i>No model predictions yet — set a model and "
+                              "click <b>Run model on all images</b> to find "
+                              "where it disagrees with the annotations.</i>")
+            return
+        ag = st.agreement()
+        t = st.agreement_totals()
+        head = (f"<b>Model vs annotation</b> — dataset: "
+                f"{t['images_disagreeing']}/{t['images']} image(s) disagree "
+                f"({t['class_mismatch']} class, {t['missed']} missed, "
+                f"{t['extra']} extra)")
+        if ag is None:
+            agree_div.text = head
+            return
+        if ag.agrees:
+            body = ("<br><span style='color:#0a7'>This image: model agrees "
+                    f"({ag.n_agree} box(es) matched).</span>")
+        else:
+            reasons = "".join(f"<li>{r}</li>" for r in ag.reasons())
+            body = (f"<br><span style='color:#c60'>This image: model found "
+                    f"{ag.n_pred} box(es) vs {ag.n_gt} annotated</span>"
+                    f"<ul style='margin:2px 0 0 16px'>{reasons}</ul>")
+        conf = st.agreement_confusion()
+        if conf:
+            worst = sorted(conf.items(), key=lambda kv: -kv[1])[:3]
+            body += ("<br><span style='color:#888'>most common confusions: "
+                     + ", ".join(f"{a}→{b} ×{n}" for (a, b), n in worst)
+                     + "</span>")
+        agree_div.text = head + body
 
     def _render_info() -> None:
         st = ctx["state"]
@@ -227,6 +334,76 @@ def modify_doc(doc, dataset_dir: str | Path = ".") -> None:
             for c in st.classes
         )
 
+    def _nd2_for(source: str):
+        """Open (and cache) the source ND2 of the current image.
+
+        Only one handle is kept: switching image closes the previous one, so
+        a long review session doesn't accumulate open files. Returns None
+        when the ND2 isn't reachable from this machine (e.g. reviewing a
+        dataset copied off the microscope server) — the caller then falls
+        back to the exported plane.
+        """
+        if ctx.get("nd2_source") == source and ctx.get("nd2") is not None:
+            return ctx["nd2"]
+        prev = ctx.get("nd2")
+        if prev is not None:
+            try:
+                prev["file"].close()
+            except Exception:
+                pass
+        ctx["nd2"], ctx["nd2_source"] = None, None
+        if not source or not Path(source).exists():
+            return None
+        try:
+            ctx["nd2"] = common.open_nd2(source)
+            ctx["nd2_source"] = source
+        except Exception:
+            return None
+        return ctx["nd2"]
+
+    def _channel_names(img: dict) -> list[str]:
+        """Channel names for this image: from the COCO entry when the export
+        recorded them, else from the ND2, else none."""
+        names = [str(c) for c in (img.get("channels") or [])]
+        if names:
+            return names
+        nd = _nd2_for(str(img.get("source", "")))
+        return list(nd["channels"]) if nd else []
+
+    def _populate_channels() -> None:
+        st = ctx["state"]
+        if st is None:
+            return
+        img = st.image()
+        names = _channel_names(img)
+        exported_idx = int(img.get("channel", 0) or 0)
+        opts = [_EXPORTED_CHANNEL]
+        for i, name in enumerate(names):
+            # mark which one the exported TIFF actually is
+            opts.append(f"{name} (exported)" if i == exported_idx else name)
+        keep = chan_select.value if chan_select.value in opts else _EXPORTED_CHANNEL
+        ctx["syncing"] = True
+        try:
+            chan_select.options = opts
+            chan_select.value = keep
+        finally:
+            ctx["syncing"] = False
+
+    def _channel_index(img: dict) -> int | None:
+        """Index of the selected channel, or None to use the exported TIFF."""
+        choice = chan_select.value
+        if not choice or choice == _EXPORTED_CHANNEL:
+            return None
+        names = _channel_names(img)
+        bare = choice[:-len(" (exported)")] if choice.endswith(" (exported)") \
+            else choice
+        if bare in names:
+            idx = names.index(bare)
+            # the exported channel is already on disk as a TIFF — cheaper and
+            # guaranteed available, so use that rather than re-reading the ND2
+            return None if idx == int(img.get("channel", 0) or 0) else idx
+        return None
+
     def _render_image() -> None:
         st = ctx["state"]
         if st is None:
@@ -235,18 +412,39 @@ def modify_doc(doc, dataset_dir: str | Path = ".") -> None:
 
         img = st.image()
         path = ctx["dataset_dir"] / "images" / str(img["file_name"])
-        try:
-            plane = np.asarray(tifffile.imread(path))
-        except Exception as exc:
-            status.text = f"⚠ cannot read {path.name}: {exc}"
-            return
+        cidx = _channel_index(img)
+        plane = None
+        if cidx is not None:
+            nd = _nd2_for(str(img.get("source", "")))
+            if nd is None:
+                status.text = (
+                    f"⚠ source ND2 not reachable ({img.get('source')}) — only "
+                    "the exported channel can be shown. Review on a machine "
+                    "that can see the ND2 to use the other channels."
+                )
+                chan_select.value = _EXPORTED_CHANNEL
+            else:
+                try:
+                    plane = np.asarray(nd["plane"](int(img.get("frame", 0)),
+                                                   cidx))
+                except Exception as exc:
+                    status.text = f"⚠ cannot read channel from ND2: {exc}"
+                    plane = None
+        if plane is None:
+            try:
+                plane = np.asarray(tifffile.imread(path))
+            except Exception as exc:
+                status.text = f"⚠ cannot read {path.name}: {exc}"
+                return
         H, W = plane.shape[-2], plane.shape[-1]
         fig.x_range = Range1d(0, W)
         fig.y_range = Range1d(H, 0)
         img_r.glyph.dw = W
         img_r.glyph.dh = H
         img_src.data = {"image": [plane]}
-        fig.title.text = f"{img['file_name']}  [{st.split_of()}]"
+        chan_txt = ("" if _channel_index(img) is None
+                    else f"  —  {chan_select.value}")
+        fig.title.text = f"{img['file_name']}  [{st.split_of()}]{chan_txt}"
         mn, mx, lo, hi, step = common.contrast_bounds(plane)
         contrast.step = step
         contrast.start, contrast.end = mn, mx
@@ -267,8 +465,16 @@ def modify_doc(doc, dataset_dir: str | Path = ".") -> None:
             img_slider.value = st.current
         finally:
             ctx["syncing"] = False
+        _populate_channels()
         _render_image()
         _render_boxes()
+
+    def on_channel(attr, old, new) -> None:
+        if ctx["syncing"] or ctx["state"] is None:
+            return
+        _render_image()   # re-autoscales contrast for the new channel
+
+    chan_select.on_change("value", on_channel)
 
     # ---- load --------------------------------------------------------------
     def do_load(event=None) -> None:
@@ -288,12 +494,16 @@ def modify_doc(doc, dataset_dir: str | Path = ".") -> None:
             b.on_click(lambda c=c: _set_class(c))
         cls_holder.children = [row(*cls_row.values())]
         filter_select.options = [
-            FILTER_ALL, FILTER_UNVERIFIED, FILTER_OVERLAP, FILTER_UNREVIEWED,
-            FILTER_REVIEWED, FILTER_EMPTY, *st.classes,
+            FILTER_ALL, FILTER_DISAGREE, FILTER_UNVERIFIED, FILTER_OVERLAP,
+            FILTER_UNREVIEWED, FILTER_REVIEWED, FILTER_EMPTY, *st.classes,
         ]
         filter_select.value = FILTER_ALL
         img_slider.start = 0
         img_slider.end = max(1, len(st.images) - 1)
+        if st.load_predictions():
+            meta = st.prediction_meta or {}
+            status.text = ("Loaded cached predictions from "
+                           f"{meta.get('model', '?')}.")
         _render_legend()
         _show(0)
         counts = st.split_counts()
@@ -459,6 +669,139 @@ def modify_doc(doc, dataset_dir: str | Path = ".") -> None:
     grow_btn.on_click(lambda: _apply(lambda st, i: st.scale(i, 1.1)))
 
     # ---- review + save -------------------------------------------------------
+    def do_predict(event=None) -> None:
+        """Run a model over every image in the dataset, in a worker thread.
+
+        The exported TIFFs are exactly what training consumed, so this is an
+        apples-to-apples comparison.
+        """
+        st = ctx["state"]
+        if st is None:
+            status.text = "Load a dataset first."
+            return
+        wpath = weights_input.value.strip()
+        if not wpath or not Path(wpath).exists():
+            status.text = (f"⚠ Model not found: '{wpath}'. Point it at a "
+                           ".pth checkpoint.")
+            return
+        predict_btn.disabled = True
+        status.text = "Loading model…"
+        images = [(str(img["file_name"]),
+                   ctx["dataset_dir"] / "images" / str(img["file_name"]))
+                  for _, img in st.images]
+        thr = float(score_slider.value)
+
+        def work() -> None:
+            import tifffile
+
+            from ..detector import CellDetector
+
+            def _tick(msg):
+                doc.add_next_tick_callback(
+                    lambda: setattr(progress_div, "text", msg))
+
+            def _make(device=None):
+                return CellDetector(wpath, device=device, score_threshold=thr)
+
+            def _run(det):
+                out: dict[str, list[dict]] = {}
+                total = len(images)
+                for i, (fname, path) in enumerate(images, start=1):
+                    if i % 5 == 0 or i == total:
+                        _tick(f"Predicting on {det.device.upper()}… "
+                              f"{i}/{total}")
+                    try:
+                        plane = np.asarray(tifffile.imread(path))
+                    except Exception:
+                        out[fname] = []
+                        continue
+                    out[fname] = [
+                        {"bbox": [float(v) for v in d.bbox],
+                         "label": d.label or "single",
+                         "score": float(d.score)}
+                        for d in det.detect_frame(plane)
+                    ]
+                return out
+
+            try:
+                det = _make()
+                try:
+                    per_image = _run(det)
+                except Exception as exc:
+                    if "cuda" in str(exc).lower() and det.device != "cpu":
+                        _tick("⚠ GPU error — retrying on CPU…")
+                        det = _make(device="cpu")
+                        per_image = _run(det)
+                    else:
+                        raise
+                multiclass = det.is_multiclass
+                dev = det.device.upper()
+                classes = list(det.classes)
+
+                def finish():
+                    st.set_predictions(per_image, {
+                        "model": wpath, "score_threshold": thr,
+                        "device": dev, "multiclass": multiclass,
+                        "classes": classes,
+                    })
+                    st.save_predictions()
+                    predict_btn.disabled = False
+                    progress_div.text = ""
+                    bad = st.disagreeing_indices()
+                    _render_boxes()
+                    note = ("" if multiclass else
+                            " ⚠ This model has a single foreground class, so "
+                            "only box COUNTS and positions are compared, not "
+                            "types.")
+                    status.text = (
+                        f"Ran the model on {len(images)} image(s) on {dev}. "
+                        f"<b>{len(bad)} image(s) disagree</b> — choose "
+                        "<i>where the model disagrees</i> in Show to walk "
+                        f"them worst-first.{note}"
+                    )
+                doc.add_next_tick_callback(finish)
+            except Exception as exc:
+                def fail(exc=exc):
+                    predict_btn.disabled = False
+                    progress_div.text = ""
+                    status.text = f"⚠ Prediction failed: {exc}"
+                doc.add_next_tick_callback(fail)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    predict_btn.on_click(do_predict)
+
+    def _toggle_pred(active: bool) -> None:
+        _render_predictions()
+        _render_agreement()
+
+    show_pred_toggle.on_click(_toggle_pred)
+
+    def _use_model_class() -> None:
+        """Adopt the model's class for the selected annotation."""
+        st = ctx["state"]
+        if st is None:
+            return
+        ids = _selected_ids()
+        if not ids:
+            status.text = "Tap a box first."
+            return
+        applied = 0
+        for i in ids:
+            m = st.matched_prediction_for(i)
+            if m is not None:
+                st.set_class(i, str(m["label"]))
+                applied += 1
+        _render_boxes()
+        status.text = (
+            f"Adopted the model's class for {applied} box(es). Remember to "
+            "Save." if applied else
+            "No model prediction matches the selected box — the model may "
+            "have missed it, so the annotation may well be right."
+        )
+
+    use_model_btn.on_click(_use_model_class)
+
     def _dedupe(all_images: bool) -> None:
         st = ctx["state"]
         if st is None:
@@ -518,7 +861,14 @@ def modify_doc(doc, dataset_dir: str | Path = ".") -> None:
         filter_select,
         row(prev_btn, next_btn),
         img_slider,
+        Div(text="<b>View</b>"),
+        chan_select,
         contrast,
+        Div(text="<b>Compare with a model</b>"),
+        weights_input,
+        score_slider,
+        predict_btn,
+        show_pred_toggle,
         width=360,
     )
     review_col = column(
@@ -528,8 +878,22 @@ def modify_doc(doc, dataset_dir: str | Path = ".") -> None:
                  "walks only images where a model guessed the class and "
                  "nobody has accepted it yet; a box marked <b>?</b> is one of "
                  "those.", **_help),
+        Div(text="Only the training channel is exported as a TIFF; the "
+                 "<b>Channel</b> dropdown reads the other channels of the "
+                 "same frame live from the source ND2 (so it needs the ND2 "
+                 "to be reachable). Boxes are unchanged — the coordinates are "
+                 "the same in every channel.", **_help),
         legend,
         info,
+        agree_div,
+        Div(text="Dashed boxes are the <b>model's</b> predictions: "
+                 "<span style='color:#0aa'>blue</span> matched an annotation, "
+                 "<span style='color:#c60'>yellow</span> matched but with a "
+                 "<b>different class</b>, <span style='color:#c00'>red</span> "
+                 "matched nothing annotated. They can't be selected or "
+                 "edited. A disagreement may be the model's fault or the "
+                 "annotation's — that's why it's worth a look.", **_help),
+        use_model_btn,
         Div(text="<b>Fix the class</b> — tap a box, then:", width=420),
         cls_holder,
         Div(text="<b>Fix the box</b> — no dragging: arm 🎯 and click where it "
@@ -557,8 +921,22 @@ def modify_doc(doc, dataset_dir: str | Path = ".") -> None:
         status,
         width=440,
     )
-    doc.add_root(row(column(fig), controls, review_col, spacing=25))
+    doc.add_root(row(column(fig, progress_div), controls, review_col,
+                     spacing=25))
     doc.title = "nikon-control — review annotations"
+
+    def _cleanup(session_context) -> None:
+        nd = ctx.get("nd2")
+        if nd is not None:
+            try:
+                nd["file"].close()
+            except Exception:
+                pass
+
+    try:
+        doc.on_session_destroyed(_cleanup)
+    except Exception:
+        pass  # bare Document (tests) has no session lifecycle
 
     _rescan()
     if (Path(dir_input.value) / "annotations").is_dir():

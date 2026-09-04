@@ -91,7 +91,9 @@ def build_coco(records: list[dict]) -> dict:
 
     Each record: ``{"file_name", "height", "width", "source", "t", "boxes"}``
     where each box has ``bbox`` ``[y0,x0,y1,x1]``, ``label``, ``group``,
-    ``score``, ``auto``.
+    ``score``, ``auto``. Optional ``channel``/``channels`` record which plane
+    of the source ND2 the TIFF holds, so a reviewer can pull up the other
+    channels of the same frame.
     """
     images, annotations = [], []
     ann_id = 1
@@ -101,9 +103,14 @@ def build_coco(records: list[dict]) -> dict:
             "file_name": rec["file_name"],
             "height": rec["height"],
             "width": rec["width"],
-            # provenance, so any label can be traced back to the microscope
+            # provenance, so any label can be traced back to the microscope —
+            # and so the review dashboard can open the source ND2 to show the
+            # OTHER channels of this exact frame (only the training channel is
+            # exported as a TIFF)
             "source": rec["source"],
             "frame": rec["t"],
+            "channel": rec.get("channel", 0),
+            "channels": list(rec.get("channels") or []),
         })
         for b in rec["boxes"]:
             y0, x0, y1, x1 = (float(v) for v in b.bbox)
@@ -206,6 +213,7 @@ def export(data_dir: Path, out_dir: Path, *, val_frac: float = 0.2,
                 per_source.setdefault(stem, []).append({
                     "file_name": fname, "height": H, "width": W,
                     "source": str(nd2_path), "t": t, "boxes": boxes,
+                    "channel": af.bf_channel, "channels": list(af.channels),
                 })
                 for b in boxes:
                     box_counts[b.label] += 1

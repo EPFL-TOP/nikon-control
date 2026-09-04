@@ -164,10 +164,48 @@ real input rather than something re-derived from it.
   those.
 - Tap a box, hit a class button to correct it (that also verifies it);
   add/delete boxes; reposition without dragging (🎯 click-to-place, arrows).
+- **Channel** — only the training channel is exported as a TIFF, so the
+  other channels of the same frame are read live from the **source ND2**
+  (its path and the channel names are recorded per image at export time).
+  `exported (as trained)` shows the exact pixels the model sees. If the ND2
+  isn't reachable from the review machine the dropdown says so and falls
+  back to the exported plane, so review still works off-server — just
+  without fluorescence.
 - **✓ Mark reviewed & next** tracks progress, stored on the COCO image
   entries so it survives reopening.
 - **💾 Save** rewrites `annotations/*.json`, keeping the originals as
   `*.json.bak`.
+
+### Comparing against the last model
+
+**🤖 Run model on all images** runs a checkpoint over every image in the
+dataset and shows where it disagrees with the annotations. Because the
+exported TIFFs are exactly the tensors training consumed, the comparison is
+apples-to-apples.
+
+- Predictions draw as **dashed** boxes alongside the annotations:
+  **blue** = matched an annotation, **yellow** = same object but a
+  *different class*, **red** = the model found something nobody annotated.
+  They can't be selected or edited — they aren't annotations.
+- The **“where the model disagrees”** filter walks those images
+  **worst-first** (most discrepancies first). Disagreements are counted as
+  class mismatches + annotations the model missed + predictions nobody
+  annotated.
+- The panel shows this image's breakdown, the dataset totals, and the most
+  common confusions (e.g. `single→doublet ×12`) — which tells you whether
+  the model has a systematic weakness or the annotations are inconsistent.
+- **⇦ Use the model's class for this box** adopts the model's answer in one
+  click when it is right.
+- Predictions are cached in `predictions.json` next to the dataset, so
+  reopening the dashboard doesn't re-run the model.
+
+Matching is greedy by **IoU ≥ 0.5** — the "are these the same object?"
+question, unlike duplicate suppression which asks about containment.
+
+A disagreement is **not** automatically an annotation error: it can equally
+be a model error. That's the point — those are the only images where looking
+can change anything. With a single-class model only box counts and positions
+are compared, not types; the status line says so.
 
 ⚠ **Re-running the export regenerates the dataset from the sidecars and
 discards review edits.** Review is the last QC step before training; fixes

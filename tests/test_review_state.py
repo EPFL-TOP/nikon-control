@@ -5,6 +5,7 @@ import pytest
 
 from nikon_control.dashboard.review_state import (
     FILTER_ALL,
+    FILTER_DISAGREE,
     FILTER_EMPTY,
     FILTER_REVIEWED,
     FILTER_UNREVIEWED,
@@ -240,3 +241,157 @@ def test_review_suppression_protects_human_boxes():
     st = ReviewState(sp)
     assert st.suppress_overlaps(0.7) == 1
     assert [r["label"] for r in st.boxes()] == ["single"]   # human box kept
+
+
+# ---- model predictions & disagreement -----------------------------------
+
+def _pred_splits():
+    train = _payload(
+        [{"id": 1, "file_name": "a_t0000.tif", "height": 200, "width": 200,
+          "source": "a.nd2", "frame": 0},
+         {"id": 2, "file_name": "a_t0001.tif", "height": 200, "width": 200,
+          "source": "a.nd2", "frame": 1}],
+        # image 1: one 'single' annotation;  image 2: one 'debris'
+        [{"id": 1, "image_id": 1, "category_id": 1,
+          "bbox": [10, 10, 20, 20], "area": 400, "iscrowd": 0,
+          "auto": False, "score": None, "cell": None},
+         {"id": 2, "image_id": 2, "category_id": 3,
+          "bbox": [10, 10, 20, 20], "area": 400, "iscrowd": 0,
+          "auto": False, "score": None, "cell": None}],
+    )
+    return {"train": train}
+
+
+def test_no_predictions_means_no_agreement():
+    st = ReviewState(_pred_splits())
+    assert not st.has_predictions
+    assert st.agreement(0) is None
+    assert st.disagreeing_indices() == []
+    assert st.agreement_totals() == {}
+
+
+def test_class_disagreement_is_detected():
+    st = ReviewState(_pred_splits())
+    # the model calls image 1's box a doublet, and agrees on image 2
+    st.set_predictions({
+        "a_t0000.tif": [{"bbox": [10, 10, 30, 30], "label": "doublet",
+                         "score": 0.9}],
+        "a_t0001.tif": [{"bbox": [10, 10, 30, 30], "label": "debris",
+                         "score": 0.8}],
+    })
+    ag0 = st.agreement(0)
+    assert not ag0.agrees
+    assert ag0.class_mismatch == [(0, 0, "single", "doublet")]
+    assert st.agreement(1).agrees
+    assert st.disagreeing_indices() == [0]
+
+
+def test_count_disagreement_is_detected():
+    st = ReviewState(_pred_splits())
+    st.set_predictions({
+        "a_t0000.tif": [{"bbox": [10, 10, 30, 30], "label": "single",
+                         "score": 0.9},
+                        {"bbox": [100, 100, 130, 130], "label": "single",
+                         "score": 0.7}],   # an extra the annotator missed
+        "a_t0001.tif": [],                  # model found nothing here
+    })
+    ag0, ag1 = st.agreement(0), st.agreement(1)
+    assert ag0.extra == [1] and ag0.count_delta == 1
+    assert ag1.missed == [0] and ag1.count_delta == -1
+    assert sorted(st.disagreeing_indices()) == [0, 1]
+
+
+def test_disagreeing_indices_are_worst_first():
+    st = ReviewState(_pred_splits())
+    st.set_predictions({
+        # image 1: one mismatch;  image 2: mismatch + extra = worse
+        "a_t0000.tif": [{"bbox": [10, 10, 30, 30], "label": "doublet",
+                         "score": 0.9}],
+        "a_t0001.tif": [{"bbox": [10, 10, 30, 30], "label": "single",
+                         "score": 0.9},
+                        {"bbox": [100, 100, 130, 130], "label": "single",
+                         "score": 0.6}],
+    })
+    assert st.disagreeing_indices() == [1, 0]
+
+
+def test_disagree_filter():
+    st = ReviewState(_pred_splits())
+    st.set_predictions({
+        "a_t0000.tif": [{"bbox": [10, 10, 30, 30], "label": "doublet",
+                         "score": 0.9}],
+        "a_t0001.tif": [{"bbox": [10, 10, 30, 30], "label": "debris",
+                         "score": 0.8}],
+    })
+    assert st.set_filter(FILTER_DISAGREE) == 1
+    assert st.visible() == [0]
+
+
+def test_matched_prediction_lets_the_view_offer_the_model_class():
+    st = ReviewState(_pred_splits())
+    st.set_predictions({"a_t0000.tif": [
+        {"bbox": [10, 10, 30, 30], "label": "doublet", "score": 0.9}]})
+    st.goto(0)
+    box_id = st.boxes()[0]["id"]
+    m = st.matched_prediction_for(box_id)
+    assert m is not None and m["label"] == "doublet"
+
+
+def test_fixing_a_class_clears_the_disagreement():
+    """Editing must invalidate the cached comparison, not show stale state."""
+    st = ReviewState(_pred_splits())
+    st.set_predictions({
+        "a_t0000.tif": [{"bbox": [10, 10, 30, 30], "label": "doublet",
+                         "score": 0.9}],
+        "a_t0001.tif": [{"bbox": [10, 10, 30, 30], "label": "debris",
+                         "score": 0.8}],
+    })
+    st.goto(0)
+    assert not st.agreement().agrees
+    st.set_class(st.boxes()[0]["id"], "doublet")     # accept the model
+    assert st.agreement().agrees                      # recomputed, not cached
+    assert st.disagreeing_indices() == []
+
+
+def test_deleting_a_box_updates_the_comparison():
+    st = ReviewState(_pred_splits())
+    st.set_predictions({"a_t0000.tif": [], "a_t0001.tif": []})
+    st.goto(0)
+    assert st.agreement().missed == [0]
+    st.delete(st.boxes()[0]["id"])
+    assert st.agreement().agrees
+
+
+def test_agreement_totals_and_confusion():
+    st = ReviewState(_pred_splits())
+    st.set_predictions({
+        "a_t0000.tif": [{"bbox": [10, 10, 30, 30], "label": "doublet",
+                         "score": 0.9}],
+        "a_t0001.tif": [{"bbox": [10, 10, 30, 30], "label": "debris",
+                         "score": 0.8}],
+    })
+    t = st.agreement_totals()
+    assert t["images"] == 2 and t["images_disagreeing"] == 1
+    assert t["class_mismatch"] == 1 and t["agree"] == 1
+    assert st.agreement_confusion() == {("single", "doublet"): 1}
+
+
+def test_predictions_roundtrip_to_disk(tmp_path):
+    ann = tmp_path / "annotations"
+    ann.mkdir()
+    sp = _pred_splits()
+    (ann / "train.json").write_text(json.dumps(sp["train"]))
+    st = ReviewState(load_splits(tmp_path), tmp_path)
+    assert st.load_predictions() is False          # nothing cached yet
+    st.set_predictions(
+        {"a_t0000.tif": [{"bbox": [10, 10, 30, 30], "label": "doublet",
+                          "score": 0.9}]},
+        {"model": "m.pth", "score_threshold": 0.5},
+    )
+    p = st.save_predictions()
+    assert p is not None and p.name == "predictions.json"
+    # a fresh session picks them up without re-running the model
+    again = ReviewState(load_splits(tmp_path), tmp_path)
+    assert again.load_predictions() is True
+    assert again.prediction_meta["model"] == "m.pth"
+    assert not again.agreement(0).agrees

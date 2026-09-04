@@ -24,6 +24,7 @@ import json
 import shutil
 from pathlib import Path
 
+from ..agreement import DEFAULT_MATCH_IOU, Box, compare, confusion, totals
 from ..overlap import (
     DEFAULT_MAX_OVERLAP,
     PREFER_AREA,
@@ -41,6 +42,11 @@ FILTER_UNREVIEWED = "not yet reviewed"
 FILTER_REVIEWED = "reviewed"
 FILTER_EMPTY = "with no boxes"
 FILTER_OVERLAP = "with overlapping boxes"
+FILTER_DISAGREE = "where the model disagrees"
+
+# model predictions are cached next to the dataset so a review session
+# doesn't have to re-run the model after every reload
+PREDICTIONS_FILE = "predictions.json"
 
 
 def load_splits(dataset_dir: str | Path) -> dict[str, dict]:
@@ -109,6 +115,11 @@ class ReviewState:
 
         self.current = 0
         self.filter = FILTER_ALL
+        # file_name -> list of {"bbox":[y0,x0,y1,x1], "label":str, "score":f}
+        self.predictions: dict[str, list[dict]] = {}
+        self.prediction_meta: dict = {}
+        self.match_iou = DEFAULT_MATCH_IOU
+        self._agree_cache: dict[str, object] = {}
 
     # ---- classes -------------------------------------------------------
     @property
@@ -133,6 +144,9 @@ class ReviewState:
             return not self._keys(idx)
         if f == FILTER_OVERLAP:
             return self.has_overlaps(idx)
+        if f == FILTER_DISAGREE:
+            ag = self.agreement(idx)
+            return ag is not None and not ag.agrees
         # otherwise: a class name
         return any(self.cat_name.get(int(self._anns[k]["category_id"])) == f
                    for k in self._keys(idx))
@@ -212,6 +226,7 @@ class ReviewState:
         a["category_id"] = self.cat_id[label]
         a["auto"] = False  # a human just decided this
         self.dirty = True
+        self._agree_cache.clear()  # the comparison is now stale
 
     def delete(self, box_id: str) -> None:
         a = self._anns.pop(box_id, None)
@@ -227,6 +242,7 @@ class ReviewState:
                 anns.pop(i)
                 break
         self.dirty = True
+        self._agree_cache.clear()
 
     def add_box(self, cx: float, cy: float, w: float, h: float, label: str,
                 idx: int | None = None) -> str:
@@ -250,6 +266,7 @@ class ReviewState:
         self._by_image.setdefault((split, int(img["id"])), []).append(key)
         self.splits[split]["annotations"].append(ann)
         self.dirty = True
+        self._agree_cache.clear()
         return key
 
     def _set_geom(self, box_id: str, cx: float, cy: float,
@@ -259,6 +276,7 @@ class ReviewState:
         a["area"] = a["bbox"][2] * a["bbox"][3]
         a["auto"] = False
         self.dirty = True
+        self._agree_cache.clear()
 
     def size_of(self, box_id: str) -> tuple[float, float]:
         _, _, w, h = bbox_to_cwh(self._anns[box_id]["bbox"])
@@ -326,6 +344,119 @@ class ReviewState:
     def has_overlaps(self, idx: int | None = None,
                      max_overlap: float = DEFAULT_MAX_OVERLAP) -> bool:
         return self.overlap_count(max_overlap, idx) > 0
+
+    # ---- model predictions & disagreement --------------------------------
+    def set_predictions(self, per_image: dict[str, list[dict]],
+                        meta: dict | None = None) -> None:
+        """Attach a model's predictions, keyed by image ``file_name``."""
+        self.predictions = per_image
+        self.prediction_meta = meta or {}
+        self._agree_cache.clear()
+
+    @property
+    def has_predictions(self) -> bool:
+        return bool(self.predictions)
+
+    def predicted(self, idx: int | None = None) -> list[dict]:
+        return list(self.predictions.get(str(self.image(idx)["file_name"]), []))
+
+    def agreement(self, idx: int | None = None):
+        """Compare annotations and predictions for one image (cached).
+
+        Returns None when no predictions have been run.
+        """
+        if not self.predictions:
+            return None
+        i = self.current if idx is None else idx
+        fname = str(self.image(i)["file_name"])
+        if fname in self._agree_cache:
+            return self._agree_cache[fname]
+        gt = [
+            Box(bbox=self._yxyx(self._anns[k]["bbox"]),
+                label=self.cat_name.get(int(self._anns[k]["category_id"]), "?"))
+            for k in self._keys(i)
+        ]
+        pred = [Box(bbox=list(p["bbox"]), label=str(p["label"]),
+                    score=p.get("score")) for p in self.predictions.get(fname, [])]
+        ag = compare(gt, pred, self.match_iou)
+        self._agree_cache[fname] = ag
+        return ag
+
+    @staticmethod
+    def _yxyx(coco_bbox) -> list[float]:
+        x, y, w, h = (float(v) for v in coco_bbox)
+        return [y, x, y + h, x + w]
+
+    def matched_prediction_for(self, box_id: str) -> dict | None:
+        """The prediction matched to one annotation, if any — so the view can
+        offer 'use the model's class' for a mismatch."""
+        ag = self.agreement()
+        if ag is None:
+            return None
+        keys = self._keys()
+        if box_id not in keys:
+            return None
+        gi = keys.index(box_id)
+        for g, pi in ag.matched:
+            if g == gi:
+                return self.predicted()[pi]
+        return None
+
+    def disagreeing_indices(self) -> list[int]:
+        """Image indices with any disagreement, worst first."""
+        if not self.predictions:
+            return []
+        scored = []
+        for i in range(len(self.images)):
+            ag = self.agreement(i)
+            if ag is not None and not ag.agrees:
+                scored.append((ag.score, i))
+        scored.sort(key=lambda t: (-t[0], t[1]))
+        return [i for _, i in scored]
+
+    def agreement_totals(self) -> dict[str, int]:
+        if not self.predictions:
+            return {}
+        ags = [(str(img["file_name"]), self.agreement(i))
+               for i, (_, img) in enumerate(self.images)]
+        return totals([(n, a) for n, a in ags if a is not None])
+
+    def agreement_confusion(self) -> dict[tuple[str, str], int]:
+        if not self.predictions:
+            return {}
+        ags = [(str(img["file_name"]), self.agreement(i))
+               for i, (_, img) in enumerate(self.images)]
+        return confusion([(n, a) for n, a in ags if a is not None])
+
+    def invalidate_agreement(self, idx: int | None = None) -> None:
+        """Drop the cached comparison for an image after an edit."""
+        i = self.current if idx is None else idx
+        self._agree_cache.pop(str(self.image(i)["file_name"]), None)
+
+    def save_predictions(self) -> Path | None:
+        if self.dataset_dir is None or not self.predictions:
+            return None
+        path = self.dataset_dir / PREDICTIONS_FILE
+        path.write_text(json.dumps({
+            "meta": self.prediction_meta,
+            "per_image": self.predictions,
+        }, indent=1))
+        return path
+
+    def load_predictions(self) -> bool:
+        """Load cached predictions if present. Returns whether any loaded."""
+        if self.dataset_dir is None:
+            return False
+        path = self.dataset_dir / PREDICTIONS_FILE
+        if not path.exists():
+            return False
+        try:
+            payload = json.loads(path.read_text())
+        except Exception:
+            return False
+        self.set_predictions(payload.get("per_image", {}),
+                             payload.get("meta", {}))
+        return self.has_predictions
 
     # ---- review progress -------------------------------------------------
     def is_reviewed(self, idx: int | None = None) -> bool:
