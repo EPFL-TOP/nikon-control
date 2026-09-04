@@ -131,9 +131,11 @@ and file browser:
 | URL | Dashboard | Use it for |
 |---|---|---|
 | <http://localhost:5006/annotate> | **Full** — tracked annotations: keyframes, birth/end/deaths, class changes over time | following individual cells through a movie |
-| <http://localhost:5006/simple> | **Simple** — independent per-frame boxes, first N frames, 3 classes (single/doublet/debris) | building detector **training data** |
+| <http://localhost:5006/simple> | **Simple** — per-frame boxes, first N frames, 3 classes (single/doublet/debris) | building detector **training data** |
+| <http://localhost:5006/review> | **Review** — steps through an exported dataset and fixes labels | QC before training |
 
-<http://localhost:5006/> lists both. The simple one is the one to point
+<http://localhost:5006/> lists all three. `--dataset <folder>` makes
+`/review` open an exported dataset at startup. The simple one is the one to point
 annotators at for training data — it has no tracking or lifecycle controls,
 and writes a separate `<file>.simple.json` sidecar that cannot be confused
 with the full dashboard's `<file>.annotations.json`.

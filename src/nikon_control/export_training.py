@@ -175,6 +175,7 @@ def export(data_dir: Path, out_dir: Path, *, val_frac: float = 0.2,
     skipped: list[str] = []
     box_counts: dict[str, int] = {c: 0 for c in TRAINING_CLASSES}
     cell_ids: dict[str, set] = {c: set() for c in TRAINING_CLASSES}
+    unverified = 0  # boxes still carrying an unaccepted model prediction
 
     for sc in sidecars:
         af = load_simple(sc)
@@ -207,6 +208,8 @@ def export(data_dir: Path, out_dir: Path, *, val_frac: float = 0.2,
                 for b in boxes:
                     box_counts[b.label] += 1
                     cell_ids[b.label].add((stem, b.group or f"solo{id(b)}"))
+                    if b.auto:
+                        unverified += 1
         finally:
             if nd is not None:
                 try:
@@ -236,6 +239,10 @@ def export(data_dir: Path, out_dir: Path, *, val_frac: float = 0.2,
         "images": {k: len(v) for k, v in splits.items()},
         "boxes_per_class": box_counts,
         "cells_per_class": {c: len(v) for c, v in cell_ids.items()},
+        # boxes whose class is an unaccepted model prediction: nobody
+        # confirmed them, so training on them risks entrenching the model's
+        # own errors. --verified-only excludes them.
+        "unverified_boxes": unverified,
         "skipped": skipped,
     }
 
@@ -284,6 +291,14 @@ def main() -> None:
         print(f"\n⚠ only {n_cells} distinct cells. Frames of the same cell are "
               "near-duplicates, so this is much less data than the box count "
               "suggests — prefer annotating MORE FILES over more frames.")
+    unver = m.get("unverified_boxes", 0)
+    total_boxes = sum(m["boxes_per_class"].values())
+    if unver and not args.verified_only:
+        pct = 100.0 * unver / max(1, total_boxes)
+        print(f"\n⚠ {unver}/{total_boxes} exported boxes ({pct:.0f}%) are "
+              "UNVERIFIED model predictions that nobody accepted in the "
+              "dashboard. Training on the model's own guesses entrenches its "
+              "errors — review them (or re-run with --verified-only).")
     if m["skipped"]:
         print("\nskipped:")
         for s in m["skipped"]:

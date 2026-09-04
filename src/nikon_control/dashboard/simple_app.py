@@ -51,6 +51,7 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
     import threading
 
     from bokeh.layouts import column, row
+    from bokeh.events import Tap
     from bokeh.models import (
         Button,
         Div,
@@ -61,6 +62,7 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
         Slider,
         Spinner,
         TextInput,
+        Toggle,
     )
 
     from ..preannotate import detect_debris
@@ -69,7 +71,11 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
     weights_path = common.resolve_weights(weights_path)
 
     # ---- shared viewer -------------------------------------------------
-    fig, img_src, img_r, box_src, rect_r, mapper = common.build_image_figure()
+    # box_edit=False: no drag-to-draw tool at all. Its gesture can get stuck
+    # following the cursor when a mouseup is lost over RDP; ROIs are placed
+    # with the buttons below instead, which cannot get stuck.
+    fig, img_src, img_r, box_src, rect_r, mapper = common.build_image_figure(
+        box_edit=False)
 
     # ---- file browser (same as the full dashboard) ---------------------
     drive_select = Select(title="Drive / volume", value="",
@@ -110,6 +116,17 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
     del_cell_btn = Button(label="🗑 Whole cell", button_type="danger",
                           width=145)
     propagate_btn = Button(label="⤳ Copy to later frames", width=300)
+    confirm_frame_btn = Button(label="✓ Accept predictions on this frame",
+                               width=300)
+    confirm_all_btn = Button(label="✓ Accept ALL predictions in this file",
+                             width=300)
+    place_toggle = Toggle(label="🎯 Click on image to place", width=300)
+    nudge_spin = Spinner(title="Nudge step (px)", low=1, high=500, step=1,
+                         value=10, width=145)
+    nudge_up = Button(label="↑", width=45)
+    nudge_down = Button(label="↓", width=45)
+    nudge_left = Button(label="←", width=45)
+    nudge_right = Button(label="→", width=45)
     _SCOPES = ["cell", "frame", "forward"]
     scope_radio = RadioButtonGroup(
         labels=["whole cell", "this frame", "from here on"], active=0,
@@ -241,11 +258,16 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
         far = st.out_of_range_count()
         far_txt = (f" <span style='color:#c60'>· {far} box(es) beyond frame "
                    f"{st.max_t}</span>") if far else ""
+        unconf = st.unconfirmed_count()
+        unconf_txt = (
+            f"<br><span style='color:#c60'>{unconf} box(es) unverified "
+            "(model predictions not yet accepted)</span>") if unconf else ""
         progress_summary.text = (
             f"Frames 0–{st.max_t} · this frame: {sum(here.values())} box(es)"
             f"<br>Labelled: {parts}"
             f"<br><span style='color:{'#c60' if todo_cells else '#0a7'}'>"
-            f"{todo_cells} cell(s) still <i>unlabeled</i></span>{far_txt}"
+            f"{todo_cells} cell(s) still <i>unlabeled</i></span>"
+            f"{unconf_txt}{far_txt}"
         )
 
     def _render_legend() -> None:
@@ -431,8 +453,9 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
                             float(height_spin.value), PROVISIONAL_LABEL)
         ctx["selected_ids"] = [new_id]
         _render_boxes()
-        status.text = ("Added an ROI on this frame — now pick single / "
-                       "doublet / debris.")
+        status.text = ("Added an ROI at the centre. Use <b>🎯 Click on image "
+                       "to place</b> or the arrows to position it, the "
+                       "spinners to size it, then pick a class.")
 
     def _delete_roi(scope: str) -> None:
         st = ctx["state"]
@@ -469,6 +492,68 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
     del_frame_btn.on_click(lambda: _delete_roi("frame"))
     del_cell_btn.on_click(lambda: _delete_roi("cell"))
     propagate_btn.on_click(_propagate)
+
+    def _arm_place(active: bool) -> None:
+        """Remember which box to move BEFORE the tap happens.
+
+        Tapping empty space clears the tap-selection, so the live selection
+        can't be used as the target — capture it when the button is armed.
+        """
+        st = ctx["state"]
+        if not active:
+            ctx["place_target"] = None
+            return
+        ids = _selected_ids()
+        if st is None or not ids:
+            place_toggle.active = False
+            status.text = "Select a box first (tap it), then arm placing."
+            return
+        ctx["place_target"] = ids[0]
+        status.text = ("Now click on the image where this ROI should go — "
+                       "its size is kept. No dragging needed.")
+
+    place_toggle.on_click(_arm_place)
+
+    def _on_tap(event) -> None:
+        """Move the armed box's centre to the clicked point (one-shot)."""
+        if not place_toggle.active:
+            return
+        st = ctx["state"]
+        target = ctx.get("place_target")
+        if st is None or target is None or not st.has(target):
+            place_toggle.active = False
+            return
+        st.move_to(target, float(event.x), float(event.y))
+        ctx["selected_ids"] = [target]
+        ctx["place_target"] = None
+        place_toggle.active = False  # one-shot: no surprise moves later
+        _render_boxes()
+        status.text = (f"Moved ROI to ({event.x:.0f}, {event.y:.0f}). "
+                       "Arm again to move another.")
+
+    fig.on_event(Tap, _on_tap)
+
+    def _nudge(dx: float, dy: float) -> None:
+        step = float(nudge_spin.value or 10)
+        _apply_to_selected(lambda st, i: st.nudge(i, dx * step, dy * step))
+
+    nudge_up.on_click(lambda: _nudge(0, -1))     # y grows downward (flipped)
+    nudge_down.on_click(lambda: _nudge(0, 1))
+    nudge_left.on_click(lambda: _nudge(-1, 0))
+    nudge_right.on_click(lambda: _nudge(1, 0))
+
+    def _confirm(all_frames: bool) -> None:
+        st = ctx["state"]
+        if st is None:
+            return
+        n = st.confirm_all() if all_frames else st.confirm_frame()
+        _render_boxes()
+        where = "the whole file" if all_frames else f"frame {st.current_t}"
+        status.text = (f"Accepted {n} prediction(s) on {where} — they now "
+                       "count as human-verified and survive a re-detect.")
+
+    confirm_frame_btn.on_click(lambda: _confirm(False))
+    confirm_all_btn.on_click(lambda: _confirm(True))
 
     def _on_size_change(attr, old, new) -> None:
         if ctx["syncing_size"]:
@@ -580,27 +665,56 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
                 GROUP the boxes of one cell — so the annotator classifies each
                 cell once instead of once per frame. Geometry stays exactly as
                 detected on each frame (nothing is interpolated), which is what
-                training consumes."""
+                training consumes.
+
+                With a MULTI-CLASS model the predicted class is used as the
+                pre-selected label (still fully changeable); with the original
+                single-class model every box arrives as ``unlabeled``.
+                """
                 import uuid as _uuid
 
                 from ..tracking import IoUTracker
 
                 per_frame = []
+                # predicted class per (frame, detection), keyed by rounded
+                # bbox so it can be recovered after tracking reorders things
+                pred: dict[tuple, str] = {}
                 for t in range(n_frames):
                     if t % 5 == 0 or t == n_frames - 1:
                         _tick(f"Detecting on {det.device.upper()}… "
                               f"frame {t + 1}/{n_frames}")
-                    per_frame.append(det.detect_frame(ctx["plane"](t, bf)))
+                    dets = det.detect_frame(ctx["plane"](t, bf))
+                    per_frame.append(dets)
+                    for d in dets:
+                        if d.label:
+                            pred[(t, *(round(v, 1) for v in d.bbox))] = d.label
                 _tick("Linking detections into cells…")
+
+                def _label_for(t, bb):
+                    """Predicted class if the model gives one AND it is a
+                    class we train on; otherwise leave it unlabeled for a
+                    human to set."""
+                    name = pred.get((t, *(round(float(v), 1) for v in bb)))
+                    return name if name in TRAINING_CLASSES else PROVISIONAL_LABEL
+
                 out: list[SimpleBox] = []
                 for tr in IoUTracker(iou_threshold=0.3, max_age=2).track(
                         per_frame):
                     gid = _uuid.uuid4().hex
+                    # one class per cell: majority vote over its frames, so a
+                    # single odd frame doesn't split the cell's identity
+                    votes: dict[str, int] = {}
+                    for t, bb in zip(tr.frames, tr.bboxes):
+                        lb = _label_for(t, bb)
+                        if lb != PROVISIONAL_LABEL:
+                            votes[lb] = votes.get(lb, 0) + 1
+                    cell_label = (max(votes, key=votes.get) if votes
+                                  else PROVISIONAL_LABEL)
                     for t, bb, sc in zip(tr.frames, tr.bboxes, tr.scores):
                         out.append(SimpleBox(
                             t=t, bbox=[float(v) for v in bb],
-                            label=PROVISIONAL_LABEL, score=float(sc),
-                            auto=True, group=gid,
+                            label=cell_label, score=float(sc),
+                            auto=True, group=gid, origin="cells",
                         ))
                 return out
 
@@ -622,19 +736,34 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
                 dev = det.device.upper()
 
                 def finish():
-                    n = st.set_detections(boxes, t_range=(0, n_frames))
+                    n = st.set_detections(boxes, t_range=(0, n_frames),
+                                           origin="cells")
                     ctx["selected_ids"] = []
                     _render_boxes()
                     detect_btn.disabled = False
                     progress_div.text = ""
                     ncells = len({b.group for b in boxes})
-                    status.text = (
-                        f"Detected {n} box(es) = <b>{ncells} cell(s)</b> "
-                        f"across frames 0–{n_frames - 1} on {dev}, all "
-                        "<i>unlabeled</i>. Tap a box and pick a class — with "
-                        "scope <b>whole cell</b> that labels every frame of "
-                        "it at once. Already-classified cells were kept."
-                    )
+                    pre = len({b.group for b in boxes
+                               if b.label != PROVISIONAL_LABEL})
+                    if pre:
+                        status.text = (
+                            f"Detected {n} box(es) = <b>{ncells} cell(s)</b> "
+                            f"across frames 0–{n_frames - 1} on {dev}. "
+                            f"<b>{pre} cell(s) were pre-classified by the "
+                            "model</b> — check them and fix any that are "
+                            "wrong (tap + a class button), then <b>✓ Accept "
+                            "predictions</b> to mark them reviewed. "
+                            "Unaccepted predictions count as unverified."
+                        )
+                    else:
+                        status.text = (
+                            f"Detected {n} box(es) = <b>{ncells} cell(s)</b> "
+                            f"across frames 0–{n_frames - 1} on {dev}, all "
+                            "<i>unlabeled</i> (this model detects but does "
+                            "not identify). Tap a box and pick a class — "
+                            "scope <b>whole cell</b> labels every frame at "
+                            "once. Already-classified cells were kept."
+                        )
                 doc.add_next_tick_callback(finish)
             except Exception as exc:
                 msg = str(exc)
@@ -684,10 +813,12 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
                 )
                 boxes = boxes_from_annotations(anns, n_frames, label="debris")
                 for b in boxes:
-                    b.auto = True  # refreshable; human edits pin them
+                    b.auto = True       # refreshable; human edits pin them
+                    b.origin = "debris"  # so the cell pass won't wipe these
 
                 def finish():
-                    n = st.set_detections(boxes, t_range=(0, n_frames))
+                    n = st.set_detections(boxes, t_range=(0, n_frames),
+                                           origin="debris")
                     ctx["selected_ids"] = []
                     _render_boxes()
                     detect_debris_btn.disabled = False
@@ -778,9 +909,15 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
         Div(text="<b>1 · Add or pick a box</b> — <b>tap</b> a box to select "
                  "it (turns white). The number on each box is its <b>cell "
                  "number</b>, kept as you scrub. <b>➕ Add ROI</b> puts a new "
-                 "one on this frame. Move it with the <i>Box Edit</i> tool in "
-                 "the toolbar (Esc cancels a half-drawn box).", **_help),
+                 "one on this frame.", **_help),
         row(add_roi_btn, del_frame_btn, del_cell_btn),
+        Div(text="<b>Position it — no dragging.</b> Arm <b>🎯 Click on image "
+                 "to place</b> then click where the ROI should go (one move "
+                 "per arming), or nudge it with the arrows. Size comes from "
+                 "the spinners below, so a box can never get stuck resizing "
+                 "under the cursor.", **_help),
+        place_toggle,
+        row(nudge_spin, nudge_left, nudge_right, nudge_up, nudge_down),
         propagate_btn,
         Div(text="<b>2 · Set its class</b>", width=420),
         Div(text="Applies to — <b>whole cell</b>: every frame of this cell "
@@ -790,6 +927,13 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
             **_help),
         scope_radio,
         row(*(cls_btns[c] for c in TRAINING_CLASSES)),
+        Div(text="If a trained multi-class model pre-selected the classes, "
+                 "fix any that are wrong then <b>accept</b> the rest. "
+                 "Unaccepted predictions are exported as <i>unverified</i> "
+                 "(and <code>--verified-only</code> drops them), so the model "
+                 "never silently becomes its own ground truth.", **_help),
+        confirm_frame_btn,
+        confirm_all_btn,
         Div(text="<i>Resize the selected box:</i>", **_help),
         row(width_spin, height_spin),
         row(shrink_btn, grow_btn),

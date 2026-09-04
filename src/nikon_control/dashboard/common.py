@@ -120,15 +120,21 @@ def contrast_bounds(plane: np.ndarray) -> tuple[float, float, float, float, floa
     return mn, mx, lo, hi, step
 
 
-def build_image_figure(width: int = 760, height: int = 760):
+def build_image_figure(width: int = 760, height: int = 760,
+                       box_edit: bool = True):
     """Build the shared image figure + box overlay.
 
     Returns ``(fig, img_src, img_r, box_src, rect_r, mapper)``.
 
     Tool setup is deliberate: **tap** selects a box and the default drag is
     **pan**, so a stray click can't start drawing a box that then sticks to
-    the cursor. The Box-Edit tool stays in the toolbar for deliberate
-    move/draw (Esc cancels a half-drawn box).
+    the cursor.
+
+    ``box_edit`` adds the Box-Edit tool for deliberate drag-to-move/draw. It
+    is off for the simplified dashboard: its draw gesture needs a clean
+    mousedown-drag-mouseup, and a mouseup dropped over RDP leaves the box
+    following the cursor with no way out. That dashboard positions ROIs with
+    click-to-place and nudge buttons instead, which cannot get stuck.
     """
     from bokeh.models import (
         BoxEditTool,
@@ -165,9 +171,10 @@ def build_image_figure(width: int = 760, height: int = 760):
             y_offset=12,
         )
     )
-    box_tool = BoxEditTool(renderers=[rect_r], empty_value="")
     tap_tool = TapTool(renderers=[rect_r])
-    fig.add_tools(box_tool, tap_tool)
+    if box_edit:
+        fig.add_tools(BoxEditTool(renderers=[rect_r], empty_value=""))
+    fig.add_tools(tap_tool)
     fig.toolbar.active_tap = tap_tool
     pan = fig.select_one(PanTool)
     if pan is not None:

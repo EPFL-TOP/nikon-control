@@ -8,8 +8,11 @@ served by the one process, sharing the viewer and file browser:
 - ``/simple`` — the simplified dashboard: independent per-frame boxes over
   the first N frames, three classes (single / doublet / debris), written to
   ``<file>.simple.json``. This is the one for building training data.
+- ``/review`` — review an exported training dataset (the output of
+  ``nikon-control-export``): step through the images the model will actually
+  be trained on and fix any wrong label.
 
-``/`` lists both. The data directory (folder of ND2 files + their sidecar
+``/`` lists all three. The data directory (folder of ND2 files + their sidecar
 JSONs) reaches the apps via the ``NIKON_CONTROL_DATA`` environment variable.
 
 Examples::
@@ -32,8 +35,13 @@ def main() -> None:
     p.add_argument("--data-dir", default=".",
                    help="folder containing .nd2 files (default: cwd)")
     p.add_argument("--weights", default="",
-                   help="path to cell_detection_model.pth (enables the "
-                        "in-dashboard Detect button)")
+                   help="path to a detection model .pth (enables the "
+                        "in-dashboard Detect button). A multi-class model "
+                        "from nikon-control-train also pre-selects the "
+                        "single/doublet/debris class of each detection.")
+    p.add_argument("--dataset", default="",
+                   help="exported dataset folder the /review dashboard opens "
+                        "at startup (see nikon-control-export)")
     p.add_argument("--port", type=int, default=5006)
     p.add_argument("--address", default=None,
                    help="bind address. Omit for localhost (fine when users "
@@ -47,11 +55,15 @@ def main() -> None:
     args = p.parse_args()
 
     apps_dir = Path(__file__).parent / "apps"
-    server_scripts = [str(apps_dir / "annotate.py"), str(apps_dir / "simple.py")]
+    server_scripts = [str(apps_dir / "annotate.py"),
+                      str(apps_dir / "simple.py"),
+                      str(apps_dir / "review.py")]
     env = dict(os.environ)
     env["NIKON_CONTROL_DATA"] = str(Path(args.data_dir).resolve())
     if args.weights:
         env["NIKON_CONTROL_WEIGHTS"] = str(Path(args.weights).resolve())
+    if args.dataset:
+        env["NIKON_CONTROL_DATASET"] = str(Path(args.dataset).resolve())
 
     cmd = [sys.executable, "-m", "bokeh", "serve", *server_scripts,
            "--port", str(args.port)]
@@ -66,6 +78,7 @@ def main() -> None:
     print("data dir:", env["NIKON_CONTROL_DATA"])
     print(f"  full dashboard  : http://{host}:{args.port}/annotate")
     print(f"  simple dashboard: http://{host}:{args.port}/simple")
+    print(f"  review dataset  : http://{host}:{args.port}/review")
     print("running:", " ".join(cmd))
     raise SystemExit(subprocess.call(cmd, env=env))
 

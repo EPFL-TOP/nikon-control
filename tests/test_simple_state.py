@@ -256,3 +256,74 @@ def test_sync_to_file_sorts_by_frame_and_persists_n_frames():
     af = st.sync_to_file()
     assert [b.t for b in af.boxes] == [2, 7]
     assert af.n_frames == 12
+
+
+# ---- the two reported bugs ------------------------------------------------
+
+def test_cell_and_debris_detection_do_not_overwrite_each_other():
+    """Reported bug: running one detector wiped the other's boxes.
+
+    Both passes produce 'auto' boxes, so keying the refresh off `auto` alone
+    made them clobber each other. The refresh must be scoped by `origin`.
+    """
+    st = _st()
+    # cell pass
+    cells = [SimpleBox(t=0, bbox=[0, 0, 5, 5], label=PROVISIONAL_LABEL,
+                       auto=True, origin="cells")]
+    assert st.set_detections(cells, t_range=(0, 20), origin="cells") == 1
+    # debris pass must NOT remove the cell boxes
+    debris = [SimpleBox(t=0, bbox=[50, 50, 60, 60], label="debris",
+                        auto=True, origin="debris")]
+    assert st.set_detections(debris, t_range=(0, 20), origin="debris") == 1
+    origins = sorted(b.origin for b in st.boxes())
+    assert origins == ["cells", "debris"], origins
+
+    # re-running the cell pass replaces only cell boxes, debris survives
+    assert st.set_detections(
+        [SimpleBox(t=1, bbox=[0, 0, 5, 5], label=PROVISIONAL_LABEL,
+                   auto=True, origin="cells")],
+        t_range=(0, 20), origin="cells") == 1
+    origins = sorted(b.origin for b in st.boxes())
+    assert origins == ["cells", "debris"], origins
+    assert [b.t for b in st.boxes() if b.origin == "cells"] == [1]
+
+    # and re-running debris leaves the cell box alone
+    st.set_detections([], t_range=(0, 20), origin="debris")
+    assert [b.origin for b in st.boxes()] == ["cells"]
+
+
+def test_hand_drawn_boxes_survive_every_detector_pass():
+    st = _st()
+    mine = st.add_box(10, 10, 4, 4, "debris", t=0)   # origin None, auto False
+    st.set_detections([], t_range=(0, 20), origin="cells")
+    st.set_detections([], t_range=(0, 20), origin="debris")
+    assert st.has(mine)
+
+
+def test_move_to_keeps_size_and_marks_human_edited():
+    """Drag-free positioning: click-to-place re-centres without resizing."""
+    st = _st()
+    i = st.add_box(100, 100, 40, 60, PROVISIONAL_LABEL, t=0, auto=True)
+    st.move_to(i, 300, 250)
+    r = st.boxes_at(0)[0]
+    assert (r["cx"], r["cy"]) == (300, 250)
+    assert (r["w"], r["h"]) == (40, 60)      # size frozen
+    assert st.box(i).auto is False           # human positioned it
+
+
+def test_nudge_offsets_by_pixels():
+    st = _st()
+    i = st.add_box(100, 100, 20, 20, "single", t=0)
+    st.nudge(i, 15, -5)
+    assert st.center_of(i) == (115, 95)
+    st.nudge(i, -15, 5)
+    assert st.center_of(i) == (100, 100)
+
+
+def test_moving_one_frame_does_not_move_the_cell_elsewhere():
+    st = _st()
+    a = st.add_box(10, 10, 4, 4, "single", t=0, group="g1")
+    b = st.add_box(10, 10, 4, 4, "single", t=1, group="g1")
+    st.move_to(b, 90, 90)
+    assert st.center_of(a) == (10, 10)
+    assert st.center_of(b) == (90, 90)

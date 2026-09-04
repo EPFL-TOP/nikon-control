@@ -184,7 +184,7 @@ class SimpleState:
     def add_box(self, cx: float, cy: float, w: float, h: float,
                 label: str, t: int | None = None,
                 score: float | None = None, auto: bool = False,
-                group: str | None = None) -> str:
+                group: str | None = None, origin: str | None = None) -> str:
         """Create a box on frame ``t`` (defaults to the current frame).
 
         ``auto=True`` marks it as raw detector output — see ``set_detections``.
@@ -192,7 +192,7 @@ class SimpleState:
         t = self._t(t)
         return self._register(
             SimpleBox(t=t, bbox=cwh_to_bbox(cx, cy, w, h), label=label,
-                      score=score, auto=auto, group=group)
+                      score=score, auto=auto, group=group, origin=origin)
         )
 
     def update_box(self, box_id: str, cx: float, cy: float,
@@ -259,6 +259,22 @@ class SimpleState:
         _, _, w, h = bbox_to_cwh(self._by_id[box_id].bbox)
         return w, h
 
+    def center_of(self, box_id: str) -> tuple[float, float]:
+        cx, cy, _, _ = bbox_to_cwh(self._by_id[box_id].bbox)
+        return cx, cy
+
+    def move_to(self, box_id: str, cx: float, cy: float) -> None:
+        """Re-centre a box, keeping its size — the drag-free way to position
+        an ROI (click-to-place / nudge), which is far more reliable than a
+        drag gesture over RDP."""
+        w, h = self.size_of(box_id)
+        self.update_box(box_id, cx, cy, w, h)
+
+    def nudge(self, box_id: str, dx: float, dy: float) -> None:
+        """Shift a box by a pixel offset, keeping its size."""
+        cx, cy = self.center_of(box_id)
+        self.move_to(box_id, cx + dx, cy + dy)
+
     # ---- write: classification -----------------------------------------
     def set_label(self, box_id: str, label: str, scope: str = "cell",
                   t: int | None = None) -> int:
@@ -316,18 +332,26 @@ class SimpleState:
 
     # ---- detection -----------------------------------------------------
     def set_detections(self, boxes: list[SimpleBox],
-                       t_range: tuple[int, int] | None = None) -> int:
-        """Insert fresh detections, keeping everything a human touched.
+                       t_range: tuple[int, int] | None = None,
+                       origin: str | None = None) -> int:
+        """Insert fresh detections, replacing only THIS detector's own output.
 
-        Only ``auto`` boxes (raw detector output nobody has classified,
-        moved, or resized) — and, when ``t_range`` is given, only those
-        inside it — are cleared out. So re-running detection refreshes
-        untriaged boxes and can never destroy curation work, whatever class
-        those boxes carry. Returns how many boxes were added.
+        A box is cleared only if all of these hold:
+
+        - it is ``auto`` — raw detector output nobody classified, moved or
+          resized (so curation work is never destroyed);
+        - its ``origin`` matches ``origin`` — so re-running the cell pass
+          leaves debris boxes alone and vice versa (they used to wipe each
+          other, since both are merely "auto");
+        - it lies inside ``t_range``, when given.
+
+        Returns how many boxes were added.
         """
         def is_stale(b: SimpleBox) -> bool:
             if not b.auto:
                 return False  # human-touched: keep
+            if b.origin != origin:
+                return False  # another detector's output: not ours to replace
             if t_range is None:
                 return True
             return t_range[0] <= b.t < t_range[1]
@@ -341,6 +365,44 @@ class SimpleState:
                 self._register(b)
                 added += 1
         return added
+
+    # ---- confirming model predictions ----------------------------------
+    def confirm(self, box_id: str, scope: str = "cell",
+                t: int | None = None) -> int:
+        """Accept a model's predicted class as human-approved.
+
+        Clearing ``auto`` is what marks a box reviewed: it then survives a
+        re-detect and counts as verified on export. Returns how many changed.
+        """
+        n = 0
+        for i in self.scope_ids(box_id, scope, t):
+            if self._by_id[i].auto:
+                self._by_id[i].auto = False
+                n += 1
+        return n
+
+    def confirm_frame(self, t: int | None = None) -> int:
+        """Accept every prediction on one frame."""
+        t = self._t(t)
+        n = 0
+        for b in self._by_id.values():
+            if b.auto and b.t == t:
+                b.auto = False
+                n += 1
+        return n
+
+    def confirm_all(self) -> int:
+        """Accept every prediction in the whole file."""
+        n = 0
+        for b in self._by_id.values():
+            if b.auto:
+                b.auto = False
+                n += 1
+        return n
+
+    def unconfirmed_count(self) -> int:
+        """Boxes still carrying an unreviewed model prediction."""
+        return sum(1 for b in self._by_id.values() if b.auto)
 
     # ---- summaries / persistence ---------------------------------------
     def counts(self) -> dict[str, int]:

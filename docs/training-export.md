@@ -39,6 +39,9 @@ sees:
   (detections are grouped automatically by IoU). Training ignores it — the
   labels are per-frame — but the exporter passes it through as `cell` so
   correlated boxes remain identifiable.
+- `origin` records which detector produced a box (`"cells"` / `"debris"`),
+  or `null` for a hand-drawn one. Re-running one detector replaces only its
+  own output, so the cell and debris passes no longer wipe each other.
 - `auto` is `true` while a box is exactly as the detector produced it, and
   becomes `false` the moment a human classifies, moves, or resizes it. Two
   uses: re-running detection only replaces `auto` boxes (so it can't destroy
@@ -93,6 +96,54 @@ The checkpoint is written as `{"model_state_dict", "classes", ...}` — the
 same shape the package already reads, and `CellDetector` infers the class
 count from the box predictor, so the trained 3-class model loads back
 without changes.
+
+## Using a trained model to pre-classify (closing the loop)
+
+Once `nikon-control-train` has produced a multi-class checkpoint, point the
+dashboard at it (`--weights`, or pick it in the page) and **Detect cells**
+both detects *and* identifies: each cell arrives with `single` / `doublet` /
+`debris` already selected, so annotating becomes checking rather than
+labelling. `CellDetector` reads the class names from the checkpoint, so
+nothing else needs configuring; the original 1-class
+`cell_detection_model.pth` still works and simply leaves every box
+`unlabeled`.
+
+One class is assigned per **cell** (a majority vote over the frames the
+tracker linked), so a single odd frame cannot split a cell's identity.
+
+**Predictions are not ground truth until a human accepts them.** A
+pre-classified box keeps `auto: true`, which means *unverified*:
+
+- fix any wrong class by tapping the box and picking the right one (that
+  clears `auto` automatically), then press **✓ Accept predictions on this
+  frame** (or for the whole file) to confirm the rest;
+- the exporter counts unaccepted predictions in `manifest.json`
+  (`unverified_boxes`) and **warns** when they make it into a dataset;
+- `--verified-only` excludes them entirely.
+
+This matters: training on the model's own unreviewed guesses entrenches its
+mistakes instead of correcting them. The workflow is only a speed-up if
+somebody actually looks.
+
+## Reviewing a dataset before training
+
+`/review` opens an exported dataset (COCO + TIFFs) and steps through the
+images **the model will actually be trained on**, so what you check is the
+real input rather than something re-derived from it.
+
+- The **“with unverified predictions”** filter walks only the images holding
+  unaccepted model guesses — the highest-value pass. Boxes marked `?` are
+  those.
+- Tap a box, hit a class button to correct it (that also verifies it);
+  add/delete boxes; reposition without dragging (🎯 click-to-place, arrows).
+- **✓ Mark reviewed & next** tracks progress, stored on the COCO image
+  entries so it survives reopening.
+- **💾 Save** rewrites `annotations/*.json`, keeping the originals as
+  `*.json.bak`.
+
+⚠ **Re-running the export regenerates the dataset from the sidecars and
+discards review edits.** Review is the last QC step before training; fixes
+you want permanently belong in `/simple`.
 
 ## One rule for annotators
 

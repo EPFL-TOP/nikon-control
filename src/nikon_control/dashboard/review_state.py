@@ -1,0 +1,322 @@
+"""Controller for the annotation REVIEW dashboard.
+
+Operates directly on a ``nikon-control-export`` output (a COCO dataset), so
+what gets reviewed is exactly what training will consume — no re-derivation,
+no chance of reviewing something different from the real input.
+
+As with the other dashboards, all correctness logic lives here (pure, no
+GUI) and the view only wires widgets.
+
+Editing model: boxes are addressed by ``"<split>:<coco annotation id>"``, and
+edits mutate the loaded COCO payloads in place; ``save`` writes each split
+back, keeping a one-off ``.bak`` of the original. Per-image ``reviewed``
+flags are stored on the COCO image entries, so review progress survives
+reopening the dataset.
+
+Caveat the view surfaces prominently: re-running ``nikon-control-export``
+REGENERATES the dataset from the ``*.simple.json`` sidecars and therefore
+discards edits made here. Review is a final QC pass before training; lasting
+fixes belong in the annotation dashboard.
+"""
+from __future__ import annotations
+
+import json
+import shutil
+from pathlib import Path
+
+SPLITS = ("train", "val")
+
+# filters offered by the view
+FILTER_ALL = "all images"
+FILTER_UNVERIFIED = "with unverified predictions"
+FILTER_UNREVIEWED = "not yet reviewed"
+FILTER_REVIEWED = "reviewed"
+FILTER_EMPTY = "with no boxes"
+
+
+def load_splits(dataset_dir: str | Path) -> dict[str, dict]:
+    """Read ``annotations/<split>.json`` for whichever splits exist."""
+    d = Path(dataset_dir)
+    ann = d / "annotations"
+    out: dict[str, dict] = {}
+    for name in SPLITS:
+        p = ann / f"{name}.json"
+        if p.exists():
+            out[name] = json.loads(p.read_text())
+    if not out:
+        raise FileNotFoundError(
+            f"no annotations/train.json or val.json under {d} — is this a "
+            "nikon-control-export dataset?"
+        )
+    return out
+
+
+def bbox_to_cwh(bbox: list[float]) -> tuple[float, float, float, float]:
+    """COCO [x, y, w, h] -> (cx, cy, w, h) for a Bokeh Rect glyph."""
+    x, y, w, h = (float(v) for v in bbox)
+    return x + w / 2.0, y + h / 2.0, w, h
+
+
+def cwh_to_bbox(cx: float, cy: float, w: float, h: float) -> list[float]:
+    """(cx, cy, w, h) -> COCO [x, y, w, h]."""
+    w, h = max(1.0, float(w)), max(1.0, float(h))
+    return [float(cx) - w / 2.0, float(cy) - h / 2.0, w, h]
+
+
+class ReviewState:
+    def __init__(self, splits: dict[str, dict],
+                 dataset_dir: str | Path | None = None):
+        self.splits = splits
+        self.dataset_dir = Path(dataset_dir) if dataset_dir else None
+        self.dirty = False
+
+        # categories (assumed consistent across splits — the exporter writes
+        # the same list into both)
+        cats: dict[int, str] = {}
+        for payload in splits.values():
+            for c in payload.get("categories", []):
+                cats[int(c["id"])] = str(c["name"])
+        self.cat_name = cats
+        self.cat_id = {v: k for k, v in cats.items()}
+
+        # flat, stable image order: split, then the file's own order
+        self.images: list[tuple[str, dict]] = []
+        self._anns: dict[str, dict] = {}
+        self._by_image: dict[tuple[str, int], list[str]] = {}
+        self._next_id = 1
+        for split in SPLITS:
+            payload = splits.get(split)
+            if payload is None:
+                continue
+            for img in payload.get("images", []):
+                self.images.append((split, img))
+                self._by_image.setdefault((split, int(img["id"])), [])
+            for a in payload.get("annotations", []):
+                key = f"{split}:{a['id']}"
+                self._anns[key] = a
+                self._by_image.setdefault(
+                    (split, int(a["image_id"])), []).append(key)
+                self._next_id = max(self._next_id, int(a["id"]) + 1)
+
+        self.current = 0
+        self.filter = FILTER_ALL
+
+    # ---- classes -------------------------------------------------------
+    @property
+    def classes(self) -> list[str]:
+        return [self.cat_name[i] for i in sorted(self.cat_name)]
+
+    # ---- navigation / filtering ----------------------------------------
+    def _has_unverified(self, idx: int) -> bool:
+        return any(self._anns[k].get("auto") for k in self._keys(idx))
+
+    def _matches(self, idx: int) -> bool:
+        f = self.filter
+        if f == FILTER_ALL:
+            return True
+        if f == FILTER_UNVERIFIED:
+            return self._has_unverified(idx)
+        if f == FILTER_UNREVIEWED:
+            return not self.is_reviewed(idx)
+        if f == FILTER_REVIEWED:
+            return self.is_reviewed(idx)
+        if f == FILTER_EMPTY:
+            return not self._keys(idx)
+        # otherwise: a class name
+        return any(self.cat_name.get(int(self._anns[k]["category_id"])) == f
+                   for k in self._keys(idx))
+
+    def visible(self) -> list[int]:
+        """Indices matching the active filter (always non-empty in practice:
+        an empty result leaves navigation where it is)."""
+        return [i for i in range(len(self.images)) if self._matches(i)]
+
+    def set_filter(self, name: str) -> int:
+        """Apply a filter and jump to its first match. Returns the match
+        count; the current image is kept if it still matches."""
+        self.filter = name
+        vis = self.visible()
+        if vis and self.current not in vis:
+            self.current = vis[0]
+        return len(vis)
+
+    def goto(self, idx: int) -> None:
+        self.current = max(0, min(int(idx), len(self.images) - 1))
+
+    def step(self, delta: int) -> None:
+        """Move to the next/previous image that matches the filter."""
+        vis = self.visible()
+        if not vis:
+            return
+        if self.current in vis:
+            pos = vis.index(self.current)
+            self.current = vis[max(0, min(pos + delta, len(vis) - 1))]
+        else:
+            self.current = vis[0]
+
+    # ---- image / box access --------------------------------------------
+    def image(self, idx: int | None = None) -> dict:
+        _, img = self.images[self.current if idx is None else idx]
+        return img
+
+    def split_of(self, idx: int | None = None) -> str:
+        split, _ = self.images[self.current if idx is None else idx]
+        return split
+
+    def _keys(self, idx: int | None = None) -> list[str]:
+        i = self.current if idx is None else idx
+        split, img = self.images[i]
+        return list(self._by_image.get((split, int(img["id"])), []))
+
+    def boxes(self, idx: int | None = None) -> list[dict]:
+        """CDS rows for one image — same contract as the other dashboards."""
+        rows = []
+        for n, key in enumerate(self._keys(idx), start=1):
+            a = self._anns[key]
+            cx, cy, w, h = bbox_to_cwh(a["bbox"])
+            score = a.get("score")
+            marks = []
+            if score is not None:
+                marks.append(f"{float(score):.2f}")
+            if a.get("auto"):
+                marks.append("?")  # unverified model prediction
+            rows.append({
+                "id": key,
+                "num": n,
+                "label": self.cat_name.get(int(a["category_id"]), "?"),
+                "cx": cx, "cy": cy, "w": w, "h": h,
+                "marker": " ".join(marks),
+            })
+        return rows
+
+    def has(self, box_id: str) -> bool:
+        return box_id in self._anns
+
+    # ---- edits ----------------------------------------------------------
+    def set_class(self, box_id: str, label: str) -> None:
+        """Re-classify a box. Reviewing a prediction also verifies it."""
+        if label not in self.cat_id:
+            raise ValueError(f"unknown class {label!r}; have {self.classes}")
+        a = self._anns[box_id]
+        a["category_id"] = self.cat_id[label]
+        a["auto"] = False  # a human just decided this
+        self.dirty = True
+
+    def delete(self, box_id: str) -> None:
+        a = self._anns.pop(box_id, None)
+        if a is None:
+            return
+        split = box_id.split(":", 1)[0]
+        key = (split, int(a["image_id"]))
+        if box_id in self._by_image.get(key, []):
+            self._by_image[key].remove(box_id)
+        anns = self.splits[split]["annotations"]
+        for i, other in enumerate(anns):
+            if other is a:
+                anns.pop(i)
+                break
+        self.dirty = True
+
+    def add_box(self, cx: float, cy: float, w: float, h: float, label: str,
+                idx: int | None = None) -> str:
+        """Add a box a human drew (so ``auto`` is False, ``score`` None)."""
+        i = self.current if idx is None else idx
+        split, img = self.images[i]
+        ann = {
+            "id": self._next_id,
+            "image_id": int(img["id"]),
+            "category_id": self.cat_id[label],
+            "bbox": cwh_to_bbox(cx, cy, w, h),
+            "area": max(1.0, float(w)) * max(1.0, float(h)),
+            "iscrowd": 0,
+            "cell": None,
+            "auto": False,
+            "score": None,
+        }
+        self._next_id += 1
+        key = f"{split}:{ann['id']}"
+        self._anns[key] = ann
+        self._by_image.setdefault((split, int(img["id"])), []).append(key)
+        self.splits[split]["annotations"].append(ann)
+        self.dirty = True
+        return key
+
+    def _set_geom(self, box_id: str, cx: float, cy: float,
+                  w: float, h: float) -> None:
+        a = self._anns[box_id]
+        a["bbox"] = cwh_to_bbox(cx, cy, w, h)
+        a["area"] = a["bbox"][2] * a["bbox"][3]
+        a["auto"] = False
+        self.dirty = True
+
+    def size_of(self, box_id: str) -> tuple[float, float]:
+        _, _, w, h = bbox_to_cwh(self._anns[box_id]["bbox"])
+        return w, h
+
+    def center_of(self, box_id: str) -> tuple[float, float]:
+        cx, cy, _, _ = bbox_to_cwh(self._anns[box_id]["bbox"])
+        return cx, cy
+
+    def move_to(self, box_id: str, cx: float, cy: float) -> None:
+        w, h = self.size_of(box_id)
+        self._set_geom(box_id, cx, cy, w, h)
+
+    def nudge(self, box_id: str, dx: float, dy: float) -> None:
+        cx, cy = self.center_of(box_id)
+        self.move_to(box_id, cx + dx, cy + dy)
+
+    def resize(self, box_id: str, w: float, h: float) -> None:
+        cx, cy = self.center_of(box_id)
+        self._set_geom(box_id, cx, cy, w, h)
+
+    def scale(self, box_id: str, factor: float) -> None:
+        cx, cy, w, h = bbox_to_cwh(self._anns[box_id]["bbox"])
+        self._set_geom(box_id, cx, cy, w * factor, h * factor)
+
+    # ---- review progress -------------------------------------------------
+    def is_reviewed(self, idx: int | None = None) -> bool:
+        return bool(self.image(idx).get("reviewed"))
+
+    def mark_reviewed(self, reviewed: bool = True,
+                      idx: int | None = None) -> None:
+        self.image(idx)["reviewed"] = bool(reviewed)
+        self.dirty = True
+
+    def review_progress(self) -> tuple[int, int]:
+        done = sum(1 for i in range(len(self.images)) if self.is_reviewed(i))
+        return done, len(self.images)
+
+    # ---- summaries -------------------------------------------------------
+    def counts(self) -> dict[str, int]:
+        c = {name: 0 for name in self.classes}
+        for a in self._anns.values():
+            name = self.cat_name.get(int(a["category_id"]))
+            if name:
+                c[name] = c.get(name, 0) + 1
+        return c
+
+    def unverified_count(self) -> int:
+        return sum(1 for a in self._anns.values() if a.get("auto"))
+
+    def split_counts(self) -> dict[str, int]:
+        out: dict[str, int] = {}
+        for split, _ in self.images:
+            out[split] = out.get(split, 0) + 1
+        return out
+
+    # ---- persistence -----------------------------------------------------
+    def save(self, backup: bool = True) -> list[Path]:
+        """Write each split back. Returns the files written."""
+        if self.dataset_dir is None:
+            raise RuntimeError("this ReviewState has no dataset_dir to save to")
+        written = []
+        for split, payload in self.splits.items():
+            path = self.dataset_dir / "annotations" / f"{split}.json"
+            if backup:
+                bak = path.with_suffix(".json.bak")
+                if path.exists() and not bak.exists():
+                    shutil.copy2(path, bak)  # one-off snapshot of the original
+            path.write_text(json.dumps(payload, indent=1))
+            written.append(path)
+        self.dirty = False
+        return written

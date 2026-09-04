@@ -82,6 +82,10 @@ class SimpleBox:
     # annotation convenience — training uses ``t``/``bbox``/``label`` only.
     # ``None`` = a standalone box.
     group: str | None = None
+    # Which detector produced this box ("cells" / "debris"), or None for a
+    # hand-drawn one. Re-running ONE detector must only replace ITS OWN
+    # output — without this, the cell and debris passes wipe each other.
+    origin: str | None = None
 
     @property
     def is_training_label(self) -> bool:

@@ -23,6 +23,11 @@ import numpy as np
 class Detection:
     bbox: list[float]  # [y0, x0, y1, x1] in pixels
     score: float
+    # Predicted class, for a multi-class model (e.g. single/doublet/debris).
+    # ``None`` for a single-foreground-class model, which only says "object
+    # here" — callers then supply their own provisional label.
+    label: str | None = None
+    label_id: int | None = None
 
 
 def bbox_center(bbox: list[float]) -> tuple[float, float]:
@@ -50,6 +55,22 @@ def infer_num_classes(state_dict: dict) -> int:
     """Read the number of classes (incl. background) from the box predictor."""
     w = state_dict["roi_heads.box_predictor.cls_score.weight"]
     return int(w.shape[0])
+
+
+def checkpoint_classes(obj, num_classes: int) -> list[str]:
+    """Class names for a checkpoint, index 0 being background.
+
+    ``nikon-control-train`` writes a ``classes`` list into the checkpoint. Old
+    single-class checkpoints (``cell_detection_model.pth``) have none, so a
+    sensible name is synthesised — ``["__background__", "cell"]`` for the
+    2-class case.
+    """
+    names = obj.get("classes") if isinstance(obj, dict) else None
+    if isinstance(names, (list, tuple)) and len(names) == num_classes:
+        return [str(n) for n in names]
+    if num_classes == 2:
+        return ["__background__", "cell"]
+    return ["__background__"] + [f"class{i}" for i in range(1, num_classes)]
 
 
 def _resolve_device(torch, requested: str | None) -> str:
@@ -207,6 +228,8 @@ class CellDetector:
         if num_classes is None:
             num_classes = infer_num_classes(state)
         self.num_classes = num_classes
+        # class names (index 0 = background) so detections can be labelled
+        self.classes = checkpoint_classes(ckpt, num_classes)
 
         model = fasterrcnn_resnet50_fpn(
             weights=None, weights_backbone=None, num_classes=num_classes
@@ -232,8 +255,28 @@ class CellDetector:
                 f"model on '{param_dev}' but device is '{self.device}'"
             )
 
+    @property
+    def is_multiclass(self) -> bool:
+        """True when the model predicts real classes (more than one
+        foreground class), i.e. it identifies as well as detects."""
+        return self.num_classes > 2
+
+    def class_name(self, label_id: int) -> str | None:
+        """Name for a predicted label id, or None if it isn't meaningful
+        (single-foreground-class models just mean 'object here')."""
+        if not self.is_multiclass:
+            return None
+        if 0 <= label_id < len(self.classes):
+            return self.classes[label_id]
+        return None
+
     def detect_frame(self, bf_plane: np.ndarray) -> list[Detection]:
-        """Detect cells in a single 2D brightfield plane."""
+        """Detect cells in a single 2D brightfield plane.
+
+        For a multi-class model each detection also carries the predicted
+        class (``Detection.label``); for a single-class model ``label`` stays
+        ``None`` and the caller supplies its own provisional label.
+        """
         torch = self._torch
         img = normalize_plane(bf_plane, self.percentiles)
         tensor = torch.from_numpy(img)[None].repeat(3, 1, 1).to(self.device)
@@ -241,13 +284,16 @@ class CellDetector:
             out = self._model([tensor])[0]
         boxes = out["boxes"].cpu().numpy()
         scores = out["scores"].cpu().numpy()
+        labels = out["labels"].cpu().numpy() if "labels" in out else None
         dets: list[Detection] = []
-        for (x0, y0, x1, y1), s in zip(boxes, scores):
+        for i, ((x0, y0, x1, y1), s) in enumerate(zip(boxes, scores)):
             if s < self.score_threshold:
                 continue
+            lid = int(labels[i]) if labels is not None else None
             dets.append(
                 Detection(bbox=[float(y0), float(x0), float(y1), float(x1)],
-                          score=float(s))
+                          score=float(s), label_id=lid,
+                          label=self.class_name(lid) if lid is not None else None)
             )
         return dets
 
