@@ -327,3 +327,100 @@ def test_moving_one_frame_does_not_move_the_cell_elsewhere():
     st.move_to(b, 90, 90)
     assert st.center_of(a) == (10, 10)
     assert st.center_of(b) == (90, 90)
+
+
+# ---- overlap suppression -------------------------------------------------
+
+def test_multiclass_duplicate_single_inside_doublet_is_suppressed():
+    """The real case: per-class NMS returns one object as BOTH classes.
+
+    The 'single' box sits inside the 'doublet' box, so IoU is low but the
+    smaller box is fully contained — the bigger box must win.
+    """
+    st = _st()
+    st.set_detections([
+        SimpleBox(t=0, bbox=[0, 0, 100, 100], label="doublet",
+                  score=0.6, auto=True, origin="cells"),
+        SimpleBox(t=0, bbox=[10, 10, 40, 40], label="single",
+                  score=0.95, auto=True, origin="cells"),
+    ], t_range=(0, 20), origin="cells")
+    assert st.overlap_count(0.7) == 2
+    assert st.suppress_overlaps(0.7) == 1
+    rows = st.boxes_at(0)
+    assert [r["label"] for r in rows] == ["doublet"]
+    assert st.overlap_count(0.7) == 0
+
+
+def test_prefer_higher_scoring_keeps_the_confident_one():
+    st = _st()
+    st.set_detections([
+        SimpleBox(t=0, bbox=[0, 0, 100, 100], label="doublet",
+                  score=0.6, auto=True),
+        SimpleBox(t=0, bbox=[10, 10, 40, 40], label="single",
+                  score=0.95, auto=True),
+    ])
+    st.suppress_overlaps(0.7, prefer="score")
+    assert [r["label"] for r in st.boxes_at(0)] == ["single"]
+
+
+def test_suppression_is_per_frame():
+    """A duplicate on frame 0 must not remove a box on frame 1."""
+    st = _st()
+    st.set_detections([
+        SimpleBox(t=0, bbox=[0, 0, 100, 100], label="doublet", score=0.6,
+                  auto=True),
+        SimpleBox(t=0, bbox=[10, 10, 40, 40], label="single", score=0.9,
+                  auto=True),
+        SimpleBox(t=1, bbox=[10, 10, 40, 40], label="single", score=0.9,
+                  auto=True),
+    ])
+    assert st.suppress_overlaps(0.7) == 1
+    assert len(st.boxes_at(0)) == 1
+    assert len(st.boxes_at(1)) == 1     # untouched
+
+
+def test_suppression_never_deletes_human_work_for_a_detection():
+    st = _st()
+    mine = st.add_box(25, 25, 30, 30, "single", t=0)      # human, small
+    st.set_detections([SimpleBox(t=0, bbox=[0, 0, 100, 100], label="doublet",
+                                 score=0.99, auto=True)], t_range=(0, 20))
+    assert st.suppress_overlaps(0.7) == 1
+    assert st.has(mine)                                   # human box survived
+    assert [r["label"] for r in st.boxes_at(0)] == ["single"]
+
+
+def test_two_overlapping_human_boxes_are_left_alone():
+    st = _st()
+    a = st.add_box(50, 50, 100, 100, "doublet", t=0)
+    b = st.add_box(30, 30, 20, 20, "single", t=0)
+    assert st.suppress_overlaps(0.7) == 0
+    assert st.has(a) and st.has(b)
+
+
+def test_cells_and_debris_passes_no_longer_double_up():
+    """Both detectors firing on one object leaves a single box."""
+    st = _st()
+    st.set_detections([SimpleBox(t=0, bbox=[0, 0, 60, 60],
+                                 label=PROVISIONAL_LABEL, score=0.8,
+                                 auto=True, origin="cells")],
+                      t_range=(0, 20), origin="cells")
+    st.set_detections([SimpleBox(t=0, bbox=[5, 5, 55, 55], label="debris",
+                                 score=0.5, auto=True, origin="debris")],
+                      t_range=(0, 20), origin="debris")
+    assert len(st.boxes_at(0)) == 2          # both passes fired
+    assert st.suppress_overlaps(0.7) == 1    # resolved
+    assert len(st.boxes_at(0)) == 1
+
+
+def test_suppress_single_frame_only():
+    st = _st()
+    for t in (0, 1):
+        st.set_detections([
+            SimpleBox(t=t, bbox=[0, 0, 100, 100], label="doublet", score=0.6,
+                      auto=True),
+            SimpleBox(t=t, bbox=[10, 10, 40, 40], label="single", score=0.9,
+                      auto=True),
+        ], t_range=(t, t + 1))
+    assert st.suppress_overlaps(0.7, t=0) == 1
+    assert len(st.boxes_at(0)) == 1
+    assert len(st.boxes_at(1)) == 2     # frame 1 not cleaned

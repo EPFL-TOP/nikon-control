@@ -24,6 +24,14 @@ import json
 import shutil
 from pathlib import Path
 
+from ..overlap import (
+    DEFAULT_MAX_OVERLAP,
+    PREFER_AREA,
+    OverlapCandidate,
+    count_overlaps,
+    select_survivors,
+)
+
 SPLITS = ("train", "val")
 
 # filters offered by the view
@@ -32,6 +40,7 @@ FILTER_UNVERIFIED = "with unverified predictions"
 FILTER_UNREVIEWED = "not yet reviewed"
 FILTER_REVIEWED = "reviewed"
 FILTER_EMPTY = "with no boxes"
+FILTER_OVERLAP = "with overlapping boxes"
 
 
 def load_splits(dataset_dir: str | Path) -> dict[str, dict]:
@@ -122,6 +131,8 @@ class ReviewState:
             return self.is_reviewed(idx)
         if f == FILTER_EMPTY:
             return not self._keys(idx)
+        if f == FILTER_OVERLAP:
+            return self.has_overlaps(idx)
         # otherwise: a class name
         return any(self.cat_name.get(int(self._anns[k]["category_id"])) == f
                    for k in self._keys(idx))
@@ -272,6 +283,49 @@ class ReviewState:
     def scale(self, box_id: str, factor: float) -> None:
         cx, cy, w, h = bbox_to_cwh(self._anns[box_id]["bbox"])
         self._set_geom(box_id, cx, cy, w * factor, h * factor)
+
+    # ---- overlap suppression ---------------------------------------------
+    def _candidates(self, idx: int | None = None) -> list[OverlapCandidate]:
+        out = []
+        for key in self._keys(idx):
+            a = self._anns[key]
+            x, y, w, h = (float(v) for v in a["bbox"])
+            out.append(OverlapCandidate(
+                ref=key,
+                bbox=[y, x, y + h, x + w],   # overlap helpers use y0,x0,y1,x1
+                score=a.get("score"),
+                protected=not a.get("auto"),
+            ))
+        return out
+
+    def suppress_overlaps(self, max_overlap: float = DEFAULT_MAX_OVERLAP,
+                          prefer: str = PREFER_AREA,
+                          all_images: bool = False) -> int:
+        """Drop duplicate overlapping boxes on this image (or every image).
+
+        Human-made boxes are protected, exactly as in the annotation
+        dashboard. Returns how many were removed.
+        """
+        targets = (range(len(self.images)) if all_images
+                   else [self.current])
+        removed = 0
+        for i in targets:
+            cands = self._candidates(i)
+            if len(cands) < 2:
+                continue
+            _, dropped = select_survivors(cands, max_overlap, prefer)
+            for key in dropped:
+                self.delete(key)
+                removed += 1
+        return removed
+
+    def overlap_count(self, max_overlap: float = DEFAULT_MAX_OVERLAP,
+                      idx: int | None = None) -> int:
+        return count_overlaps(self._candidates(idx), max_overlap)
+
+    def has_overlaps(self, idx: int | None = None,
+                     max_overlap: float = DEFAULT_MAX_OVERLAP) -> bool:
+        return self.overlap_count(max_overlap, idx) > 0
 
     # ---- review progress -------------------------------------------------
     def is_reviewed(self, idx: int | None = None) -> bool:

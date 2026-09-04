@@ -196,3 +196,47 @@ def test_save_writes_both_splits_and_backs_up_once(tmp_path):
 def test_load_splits_rejects_a_non_dataset(tmp_path):
     with pytest.raises(FileNotFoundError, match="nikon-control-export"):
         load_splits(tmp_path)
+
+
+# ---- overlap suppression -------------------------------------------------
+
+def _overlap_splits():
+    """One image with a small 'single' fully inside a big 'doublet'."""
+    train = _payload(
+        [{"id": 1, "file_name": "a_t0000.tif", "height": 200, "width": 200,
+          "source": "a.nd2", "frame": 0}],
+        [{"id": 1, "image_id": 1, "category_id": 2,          # doublet, big
+          "bbox": [0, 0, 100, 100], "area": 10000, "iscrowd": 0,
+          "auto": True, "score": 0.6, "cell": "c1"},
+         {"id": 2, "image_id": 1, "category_id": 1,          # single, inside
+          "bbox": [10, 10, 30, 30], "area": 900, "iscrowd": 0,
+          "auto": True, "score": 0.95, "cell": "c2"}],
+    )
+    return {"train": train}
+
+
+def test_review_detects_and_suppresses_overlap():
+    st = ReviewState(_overlap_splits())
+    assert st.overlap_count(0.7) == 2
+    assert st.has_overlaps()
+    assert st.suppress_overlaps(0.7) == 1
+    assert [r["label"] for r in st.boxes()] == ["doublet"]   # bigger kept
+    assert st.overlap_count(0.7) == 0
+    # and it really left the payload
+    assert [a["id"] for a in st.splits["train"]["annotations"]] == [1]
+
+
+def test_review_overlap_filter():
+    from nikon_control.dashboard.review_state import FILTER_OVERLAP
+    st = ReviewState(_overlap_splits())
+    assert st.set_filter(FILTER_OVERLAP) == 1
+    st.suppress_overlaps(0.7)
+    assert st.set_filter(FILTER_OVERLAP) == 0
+
+
+def test_review_suppression_protects_human_boxes():
+    sp = _overlap_splits()
+    sp["train"]["annotations"][1]["auto"] = False     # a human drew the single
+    st = ReviewState(sp)
+    assert st.suppress_overlaps(0.7) == 1
+    assert [r["label"] for r in st.boxes()] == ["single"]   # human box kept

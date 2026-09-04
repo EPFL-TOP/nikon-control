@@ -21,10 +21,12 @@ from pathlib import Path
 
 import numpy as np
 
+from ..overlap import PREFER_AREA, PREFER_SCORE
 from . import common
 from .review_state import (
     FILTER_ALL,
     FILTER_EMPTY,
+    FILTER_OVERLAP,
     FILTER_REVIEWED,
     FILTER_UNREVIEWED,
     FILTER_UNVERIFIED,
@@ -89,6 +91,13 @@ def modify_doc(doc, dataset_dir: str | Path = ".") -> None:
     grow_btn = Button(label="＋ 10%", width=95)
     cls_row: dict[str, Button] = {}
     cls_holder = column(width=420)
+    overlap_spin = Spinner(title="Max overlap (%)", low=10, high=100, step=5,
+                           value=70, width=145)
+    prefer_select = Select(title="On overlap keep the", value="bigger",
+                           options=["bigger", "higher-scoring"], width=165)
+    dedupe_btn = Button(label="⧈ Remove overlaps (this image)", width=300)
+    dedupe_all_btn = Button(label="⧈ Remove overlaps (whole dataset)",
+                            width=300)
     reviewed_btn = Button(label="✓ Mark reviewed & next", button_type="success",
                           width=300)
     save_btn = Button(label="💾 Save dataset", button_type="success", width=300)
@@ -191,6 +200,10 @@ def modify_doc(doc, dataset_dir: str | Path = ".") -> None:
         unver_tag = ("<br><span style='color:#c60'>"
                      f"{unver} unverified model prediction(s) left</span>"
                      if unver else "")
+        n_ov = st.overlap_count(float(overlap_spin.value or 70) / 100.0)
+        ov_tag = ("<br><span style='color:#c60'>"
+                  f"{n_ov} box(es) here overlap another</span>"
+                  if n_ov else "")
         src_name = Path(str(img.get("source", "?"))).name
         info.text = (
             f"<b>{img['file_name']}</b> "
@@ -199,7 +212,7 @@ def modify_doc(doc, dataset_dir: str | Path = ".") -> None:
             f"{len(st.boxes())} box(es){reviewed_tag}"
             f"<br>image {st.current + 1}/{len(st.images)} "
             f"({vis} match the filter) · reviewed {done}/{total}"
-            f"<br>Dataset totals: {parts}{unver_tag}"
+            f"<br>Dataset totals: {parts}{unver_tag}{ov_tag}"
         )
 
     def _render_legend() -> None:
@@ -275,8 +288,8 @@ def modify_doc(doc, dataset_dir: str | Path = ".") -> None:
             b.on_click(lambda c=c: _set_class(c))
         cls_holder.children = [row(*cls_row.values())]
         filter_select.options = [
-            FILTER_ALL, FILTER_UNVERIFIED, FILTER_UNREVIEWED, FILTER_REVIEWED,
-            FILTER_EMPTY, *st.classes,
+            FILTER_ALL, FILTER_UNVERIFIED, FILTER_OVERLAP, FILTER_UNREVIEWED,
+            FILTER_REVIEWED, FILTER_EMPTY, *st.classes,
         ]
         filter_select.value = FILTER_ALL
         img_slider.start = 0
@@ -446,6 +459,28 @@ def modify_doc(doc, dataset_dir: str | Path = ".") -> None:
     grow_btn.on_click(lambda: _apply(lambda st, i: st.scale(i, 1.1)))
 
     # ---- review + save -------------------------------------------------------
+    def _dedupe(all_images: bool) -> None:
+        st = ctx["state"]
+        if st is None:
+            return
+        thresh = float(overlap_spin.value or 70) / 100.0
+        prefer = (PREFER_AREA if prefer_select.value == "bigger"
+                  else PREFER_SCORE)
+        n = st.suppress_overlaps(thresh, prefer, all_images=all_images)
+        ctx["selected_ids"] = [i for i in ctx["selected_ids"] if st.has(i)]
+        _render_boxes()
+        where = "the whole dataset" if all_images else "this image"
+        pct = int(thresh * 100)
+        status.text = (
+            f"Removed {n} box(es) from {where} overlapping another by more "
+            f"than {pct}% (kept the {prefer_select.value} one; boxes a human "
+            "made are never removed for a detection). Remember to Save."
+            if n else f"Nothing on {where} overlaps by more than {pct}%."
+        )
+
+    dedupe_btn.on_click(lambda: _dedupe(False))
+    dedupe_all_btn.on_click(lambda: _dedupe(True))
+
     def _mark_reviewed() -> None:
         st = ctx["state"]
         if st is None:
@@ -504,6 +539,13 @@ def modify_doc(doc, dataset_dir: str | Path = ".") -> None:
         row(nudge_spin, nudge_left, nudge_right, nudge_up, nudge_down),
         row(width_spin, height_spin),
         row(shrink_btn, grow_btn),
+        Div(text="<b>Duplicates</b> — a multi-class model can return the same "
+                 "object as two classes. Overlap is measured against the "
+                 "<i>smaller</i> box, so a single inside a doublet counts as "
+                 "100%.", **_help),
+        row(overlap_spin, prefer_select),
+        dedupe_btn,
+        dedupe_all_btn,
         reviewed_btn,
         save_btn,
         Div(text="⚠ Re-running <code>nikon-control-export</code> rebuilds the "

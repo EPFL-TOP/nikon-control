@@ -32,6 +32,7 @@ import json
 import subprocess
 from pathlib import Path
 
+from .overlap import DEFAULT_MAX_OVERLAP, OverlapCandidate, count_overlaps
 from .schema_simple import (
     SIMPLE_SUFFIX,
     TRAINING_CLASSES,
@@ -176,6 +177,7 @@ def export(data_dir: Path, out_dir: Path, *, val_frac: float = 0.2,
     box_counts: dict[str, int] = {c: 0 for c in TRAINING_CLASSES}
     cell_ids: dict[str, set] = {c: set() for c in TRAINING_CLASSES}
     unverified = 0  # boxes still carrying an unaccepted model prediction
+    overlapping = 0  # duplicate boxes (same object returned twice)
 
     for sc in sidecars:
         af = load_simple(sc)
@@ -210,6 +212,13 @@ def export(data_dir: Path, out_dir: Path, *, val_frac: float = 0.2,
                     cell_ids[b.label].add((stem, b.group or f"solo{id(b)}"))
                     if b.auto:
                         unverified += 1
+                # duplicates within this frame (measured against the smaller
+                # box, so a single inside a doublet counts)
+                overlapping += count_overlaps(
+                    [OverlapCandidate(ref=k, bbox=b.bbox)
+                     for k, b in enumerate(boxes)],
+                    DEFAULT_MAX_OVERLAP,
+                )
         finally:
             if nd is not None:
                 try:
@@ -243,6 +252,9 @@ def export(data_dir: Path, out_dir: Path, *, val_frac: float = 0.2,
         # confirmed them, so training on them risks entrenching the model's
         # own errors. --verified-only excludes them.
         "unverified_boxes": unverified,
+        # boxes overlapping another by >70% of the smaller box — usually the
+        # same object returned under two classes by a multi-class model
+        "overlapping_boxes": overlapping,
         "skipped": skipped,
     }
 
@@ -299,6 +311,13 @@ def main() -> None:
               "UNVERIFIED model predictions that nobody accepted in the "
               "dashboard. Training on the model's own guesses entrenches its "
               "errors — review them (or re-run with --verified-only).")
+    ov = m.get("overlapping_boxes", 0)
+    if ov:
+        print(f"\n⚠ {ov} exported boxes overlap another by >70% of the "
+              "smaller box — usually one object returned under two classes. "
+              "Clean them with 'Remove overlapping ROIs' in the annotation "
+              "dashboard, or the /review dashboard's overlap filter, then "
+              "re-export.")
     if m["skipped"]:
         print("\nskipped:")
         for s in m["skipped"]:

@@ -125,6 +125,34 @@ This matters: training on the model's own unreviewed guesses entrenches its
 mistakes instead of correcting them. The workflow is only a speed-up if
 somebody actually looks.
 
+## Overlapping boxes (duplicates)
+
+A multi-class detector runs non-maximum suppression **per class**, so one
+object can come back as `single` *and* as `doublet`; the cell and debris
+passes can also both fire on the same object. Both dashboards resolve this.
+
+Overlap is measured as **intersection ÷ area of the smaller box**, not IoU.
+"Overlaps by more than 70%" is a statement about the smaller box, and only
+this measure catches containment — a small `single` inside a big `doublet`
+has ~100% overlap by this rule but an IoU well under 0.3, which an IoU rule
+would miss entirely.
+
+When two boxes overlap beyond the limit, one survives:
+
+- **Boxes a human made, classified, moved or resized always win** over
+  detector output, and are never deleted for one. Two overlapping *human*
+  boxes are both kept — removing deliberate work is never automatic.
+- Otherwise, by **On overlap keep the**: `bigger` (default, score breaks
+  ties) or `higher-scoring` (area breaks ties). Bigger is the default
+  because a doublet legitimately contains singles, so preferring area keeps
+  the doublet rather than a confident `single` inside it.
+
+It runs **automatically after each detection pass**, per frame, and
+**⧈ Remove overlapping ROIs** re-runs it by hand (e.g. after adding boxes).
+`/review` has the same controls plus a **"with overlapping boxes"** filter
+and a whole-dataset sweep. The exporter counts what is left in
+`manifest.json` (`overlapping_boxes`) and warns.
+
 ## Reviewing a dataset before training
 
 `/review` opens an exported dataset (COCO + TIFFs) and steps through the

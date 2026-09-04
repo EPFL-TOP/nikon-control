@@ -22,6 +22,12 @@ from __future__ import annotations
 
 import uuid
 
+from ..overlap import (
+    DEFAULT_MAX_OVERLAP,
+    PREFER_AREA,
+    OverlapCandidate,
+    select_survivors,
+)
 from ..schema_simple import (
     PROVISIONAL_LABEL,
     SimpleAnnotationFile,
@@ -365,6 +371,54 @@ class SimpleState:
                 self._register(b)
                 added += 1
         return added
+
+    # ---- overlap suppression --------------------------------------------
+    def suppress_overlaps(self, max_overlap: float = DEFAULT_MAX_OVERLAP,
+                          prefer: str = PREFER_AREA,
+                          t: int | None = None) -> int:
+        """Drop duplicate boxes that overlap beyond ``max_overlap``.
+
+        Needed because a multi-class model runs NMS per class (so one object
+        can return as both ``single`` and ``doublet``) and because the cell
+        and debris passes can both fire on the same object.
+
+        Resolved **per frame** — boxes are frame-local, so a duplicate on one
+        frame says nothing about another. Boxes a human drew or classified
+        are protected: they outrank detections and are never dropped for one.
+        Pass ``t`` to clean a single frame, or leave it ``None`` for all
+        frames in range. Returns how many boxes were removed.
+        """
+        frames = ([int(t)] if t is not None
+                  else sorted({b.t for b in self._by_id.values()}))
+        removed = 0
+        for frame in frames:
+            cands = [
+                OverlapCandidate(ref=i, bbox=self._by_id[i].bbox,
+                                 score=self._by_id[i].score,
+                                 protected=not self._by_id[i].auto)
+                for i in self._order if self._by_id[i].t == frame
+            ]
+            if len(cands) < 2:
+                continue
+            _, dropped = select_survivors(cands, max_overlap, prefer)
+            for box_id in dropped:
+                self.delete(box_id)
+                removed += 1
+        return removed
+
+    def overlap_count(self, max_overlap: float = DEFAULT_MAX_OVERLAP,
+                      t: int | None = None) -> int:
+        """How many boxes overlap another beyond the limit (no changes)."""
+        from ..overlap import count_overlaps
+
+        frames = ([int(t)] if t is not None
+                  else sorted({b.t for b in self._by_id.values()}))
+        total = 0
+        for frame in frames:
+            cands = [OverlapCandidate(ref=i, bbox=self._by_id[i].bbox)
+                     for i in self._order if self._by_id[i].t == frame]
+            total += count_overlaps(cands, max_overlap)
+        return total
 
     # ---- confirming model predictions ----------------------------------
     def confirm(self, box_id: str, scope: str = "cell",

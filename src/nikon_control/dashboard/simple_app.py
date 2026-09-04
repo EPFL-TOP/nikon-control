@@ -39,6 +39,7 @@ from ..schema_simple import (
     save_simple,
     simple_path_for,
 )
+from ..overlap import PREFER_AREA, PREFER_SCORE
 from . import common
 from .simple_state import SimpleState
 
@@ -108,6 +109,11 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
     detect_btn = Button(label="Detect cells (first N)", button_type="warning")
     detect_debris_btn = Button(label="Detect debris (first N)",
                                button_type="warning")
+    overlap_spin = Spinner(title="Max overlap (%)", low=10, high=100, step=5,
+                           value=70, width=145)
+    prefer_select = Select(title="On overlap keep the", value="bigger",
+                           options=["bigger", "higher-scoring"], width=165)
+    dedupe_btn = Button(label="⧈ Remove overlapping ROIs", width=300)
 
     # ---- annotation (the whole simplified panel) -----------------------
     add_roi_btn = Button(label="➕ Add ROI", button_type="primary", width=150)
@@ -542,6 +548,36 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
     nudge_left.on_click(lambda: _nudge(-1, 0))
     nudge_right.on_click(lambda: _nudge(1, 0))
 
+    def _overlap_args() -> tuple[float, str]:
+        thresh = float(overlap_spin.value or 70) / 100.0
+        prefer = (PREFER_AREA if prefer_select.value == "bigger"
+                  else PREFER_SCORE)
+        return thresh, prefer
+
+    def _dedupe(quiet: bool = False) -> int:
+        """Drop duplicate overlapping boxes across every frame in range."""
+        st = ctx["state"]
+        if st is None:
+            return 0
+        thresh, prefer = _overlap_args()
+        n = st.suppress_overlaps(thresh, prefer)
+        if n:
+            ctx["selected_ids"] = [i for i in ctx["selected_ids"]
+                                   if st.has(i)]
+            _render_boxes()
+        if not quiet:
+            pct = int(thresh * 100)
+            status.text = (
+                f"Removed {n} box(es) overlapping another by more than "
+                f"{pct}% (kept the {prefer_select.value} one; boxes you "
+                "made or classified are never removed for a detection)."
+                if n else
+                f"No box overlaps another by more than {pct}%."
+            )
+        return n
+
+    dedupe_btn.on_click(lambda: _dedupe())
+
     def _confirm(all_frames: bool) -> None:
         st = ctx["state"]
         if st is None:
@@ -738,6 +774,10 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
                 def finish():
                     n = st.set_detections(boxes, t_range=(0, n_frames),
                                            origin="cells")
+                    # a multi-class model runs NMS per class, so the same
+                    # object can arrive as both single and doublet — and the
+                    # debris pass may already cover some of these
+                    dropped = _dedupe(quiet=True)
                     ctx["selected_ids"] = []
                     _render_boxes()
                     detect_btn.disabled = False
@@ -745,10 +785,12 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
                     ncells = len({b.group for b in boxes})
                     pre = len({b.group for b in boxes
                                if b.label != PROVISIONAL_LABEL})
+                    dup = (f" {dropped} overlapping duplicate(s) removed."
+                           if dropped else "")
                     if pre:
                         status.text = (
                             f"Detected {n} box(es) = <b>{ncells} cell(s)</b> "
-                            f"across frames 0–{n_frames - 1} on {dev}. "
+                            f"across frames 0–{n_frames - 1} on {dev}.{dup} "
                             f"<b>{pre} cell(s) were pre-classified by the "
                             "model</b> — check them and fix any that are "
                             "wrong (tap + a class button), then <b>✓ Accept "
@@ -758,8 +800,8 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
                     else:
                         status.text = (
                             f"Detected {n} box(es) = <b>{ncells} cell(s)</b> "
-                            f"across frames 0–{n_frames - 1} on {dev}, all "
-                            "<i>unlabeled</i> (this model detects but does "
+                            f"across frames 0–{n_frames - 1} on {dev}.{dup} "
+                            "All <i>unlabeled</i> (this model detects but does "
                             "not identify). Tap a box and pick a class — "
                             "scope <b>whole cell</b> labels every frame at "
                             "once. Already-classified cells were kept."
@@ -819,13 +861,16 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
                 def finish():
                     n = st.set_detections(boxes, t_range=(0, n_frames),
                                            origin="debris")
+                    dropped = _dedupe(quiet=True)
                     ctx["selected_ids"] = []
                     _render_boxes()
                     detect_debris_btn.disabled = False
                     progress_div.text = ""
+                    dup = (f" {dropped} overlapping duplicate(s) removed."
+                           if dropped else "")
                     status.text = (
                         f"Found {n} debris box(es) across frames "
-                        f"0–{n_frames - 1}. Review and delete false "
+                        f"0–{n_frames - 1}.{dup} Review and delete false "
                         "positives; they are already labelled 'debris'."
                     )
                 doc.add_next_tick_callback(finish)
@@ -889,6 +934,8 @@ def modify_doc(doc, data_dir: str | Path = ".", weights_path: str = "") -> None:
         weights_input, score_slider,
         detect_btn,
         detect_debris_btn,
+        row(overlap_spin, prefer_select),
+        dedupe_btn,
         Div(text="<b>View</b>"),
         chan_select, contrast,
         row(prev_btn, next_btn),
