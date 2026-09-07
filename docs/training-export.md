@@ -211,6 +211,51 @@ are compared, not types; the status line says so.
 discards review edits.** Review is the last QC step before training; fixes
 you want permanently belong in `/simple`.
 
+## Reading a training run
+
+A real log from 343 train / 100 val images, warm-started from the 1-class
+model, showed the pattern to expect:
+
+```
+epoch  1  train_loss 0.276   mAP@0.5 0.870      <- already converged
+epoch  5  train_loss 0.129   mAP@0.5 0.880      <- best
+epoch 20  train_loss 0.042   mAP@0.5 0.823      <- overfitting
+```
+
+Three things to read off it:
+
+1. **The warm start does nearly all the work.** mAP 0.87 after one epoch
+   means there is little left to learn from a few hundred images. More
+   epochs cannot fix that; **more annotated FILES** can.
+2. **Falling train loss with flat-or-falling val mAP is overfitting**, not
+   progress. `--patience` (default 5) now stops the run there.
+3. **Unstable mAP is usually one thin class.** In that run `single` sat at
+   0.92-0.97 while `debris` swung 0.39-0.78 — and mAP, being a 3-class macro
+   average, tracked debris. The trainer now prints per-class instance counts
+   and warns when a class has under 50 val instances, because its AP will
+   move several points between epochs no matter what the model does.
+
+### What the defaults now do
+
+- **Dihedral augmentation** (all 8 flips/rotations). A microscopy frame has
+  no canonical orientation, so this is free label-preserving data — the
+  cheapest lever against overfitting when the dataset is fixed.
+- **`--trainable-layers 3`** (was effectively 5). Constructing with
+  `weights=None`, as the warm-start path does, makes torchvision train the
+  *whole* backbone; 3 stages is its own fine-tuning default — faster per
+  step and much less prone to overfitting on small data.
+- **Warmup + cosine LR**, peak `--lr 2e-3` (was 5e-3, no warmup). The
+  freshly-initialised 4-class head produces large early gradients that
+  damage a warm-started backbone; that is what caused the epoch-2 collapse
+  (debris 0.78 → 0.39).
+- **Mixed precision** on CUDA (`--no-amp` to disable) and **`--workers 4`**,
+  which overlaps TIFF reading and percentile normalisation with GPU compute.
+- **`--patience 5`** early stopping and **`--val-every N`** to skip
+  evaluations once you know it converges early.
+
+For the run above, expect roughly: same best mAP, reached in a handful of
+epochs, in a fraction of the wall-clock time.
+
 ## One rule for annotators
 
 **Label *every* cell and every piece of debris on a frame you annotate.**

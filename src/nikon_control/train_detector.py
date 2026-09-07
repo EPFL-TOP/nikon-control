@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import time
 from pathlib import Path
 
 import numpy as np
@@ -35,6 +37,49 @@ from .export_training import CATEGORY_IDS
 CLASS_NAMES: list[str] = ["__background__"] + [
     name for name, _ in sorted(CATEGORY_IDS.items(), key=lambda kv: kv[1])
 ]
+
+
+def dihedral(img: np.ndarray, boxes: list[list[float]], transpose: bool,
+             hflip: bool, vflip: bool) -> tuple[np.ndarray, list[list[float]]]:
+    """One of the 8 dihedral transforms of a plane and its xyxy boxes.
+
+    Microscopy frames have no canonical orientation, so the full symmetry
+    group is valid label-preserving augmentation — it multiplies 343 images
+    into 8x as many distinct views for free, which is the cheapest lever
+    against overfitting when the dataset is fixed.
+
+    Box coordinates are continuous edges in ``[0, W]``, so a flip is
+    ``x -> W - x`` (not ``W - 1 - x``) and the ``x0/x1`` pair swaps.
+    """
+    out = np.asarray(img)
+    bx = [list(map(float, b)) for b in boxes]
+    if transpose:                      # (y, x) -> (x, y)
+        out = out.T
+        bx = [[y0, x0, y1, x1] for x0, y0, x1, y1 in bx]
+    H, W = out.shape[-2], out.shape[-1]
+    if hflip:
+        out = out[:, ::-1]
+        bx = [[W - x1, y0, W - x0, y1] for x0, y0, x1, y1 in bx]
+    if vflip:
+        out = out[::-1, :]
+        bx = [[x0, H - y1, x1, H - y0] for x0, y0, x1, y1 in bx]
+    return np.ascontiguousarray(out), bx
+
+
+def lr_at(it: int, total_iters: int, base_lr: float,
+          warmup_iters: int) -> float:
+    """Learning rate for one iteration: linear warmup, then cosine decay.
+
+    Warmup matters specifically for the ``--init-from`` path: the 4-class box
+    predictor is freshly initialised, so its early gradients are large and,
+    at full LR, they damage the warm-started backbone. That is what produced
+    the epoch-2 collapse (debris AP 0.78 -> 0.39) in the first runs.
+    """
+    if warmup_iters > 0 and it < warmup_iters:
+        return base_lr * (0.1 + 0.9 * (it + 1) / warmup_iters)
+    span = max(1, total_iters - warmup_iters)
+    p = min(1.0, max(0.0, (it - warmup_iters) / span))
+    return base_lr * 0.5 * (1.0 + math.cos(math.pi * p))
 
 
 class CocoDetectionDataset:
@@ -51,6 +96,15 @@ class CocoDetectionDataset:
 
     def __len__(self) -> int:
         return len(self.images)
+
+    def instance_counts(self) -> dict[int, int]:
+        """Annotations per category id — exposes class imbalance/support."""
+        out: dict[int, int] = {}
+        for anns in self.by_image.values():
+            for a in anns:
+                cid = int(a["category_id"])
+                out[cid] = out.get(cid, 0) + 1
+        return out
 
     def __getitem__(self, idx: int):
         import tifffile
@@ -69,10 +123,12 @@ class CocoDetectionDataset:
             boxes.append([x, y, x + w, y + h])  # torchvision wants xyxy
             labels.append(a["category_id"])
 
-        if self.augment and boxes and np.random.rand() < 0.5:
-            img = np.ascontiguousarray(img[:, ::-1])  # horizontal flip
-            W = img.shape[-1]
-            boxes = [[W - x1, y0, W - x0, y1] for x0, y0, x1, y1 in boxes]
+        if self.augment and boxes:
+            # full dihedral group (8 orientations) — valid because a
+            # microscopy frame has no canonical up
+            r = np.random.rand(3)
+            img, boxes = dihedral(img, boxes, r[0] < 0.5, r[1] < 0.5,
+                                  r[2] < 0.5)
 
         tensor = torch.from_numpy(img)[None].repeat(3, 1, 1)
         target = {
@@ -88,8 +144,16 @@ def collate(batch):
 
 
 def build_model(num_classes: int, init_from: str | None = None,
-                pretrained_backbone: bool = True):
-    """Faster R-CNN with ``num_classes`` (including background)."""
+                pretrained_backbone: bool = True,
+                trainable_layers: int = 3):
+    """Faster R-CNN with ``num_classes`` (including background).
+
+    ``trainable_layers`` is how many ResNet stages get gradients (0-5).
+    torchvision defaults to **5** when constructed with ``weights=None`` —
+    which the warm-start path does — so all 41M parameters were being
+    fine-tuned on a few hundred images. 3 is torchvision's own default for
+    fine-tuning: faster per step and markedly less prone to overfitting.
+    """
     import torch
     from torchvision.models.detection import fasterrcnn_resnet50_fpn
     from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
@@ -98,7 +162,8 @@ def build_model(num_classes: int, init_from: str | None = None,
         # warm start from the existing cell model: same architecture, but its
         # predictor is 1-class so it must be rebuilt
         from .detector import load_checkpoint_state_dict
-        model = fasterrcnn_resnet50_fpn(weights=None, weights_backbone=None)
+        model = fasterrcnn_resnet50_fpn(weights=None, weights_backbone=None,
+                                        trainable_backbone_layers=trainable_layers)
         state = load_checkpoint_state_dict(torch.load(init_from,
                                                       map_location="cpu"))
         state = {k: v for k, v in state.items()
@@ -111,10 +176,15 @@ def build_model(num_classes: int, init_from: str | None = None,
             print(f"  ignored {len(unexpected)} unexpected tensors")
     else:
         weights = "DEFAULT" if pretrained_backbone else None
-        model = fasterrcnn_resnet50_fpn(weights=weights)
+        model = fasterrcnn_resnet50_fpn(
+            weights=weights, trainable_backbone_layers=trainable_layers)
 
     in_features = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
+    n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    n_all = sum(p.numel() for p in model.parameters())
+    print(f"model: {n_train/1e6:.1f}M of {n_all/1e6:.1f}M params trainable "
+          f"(backbone stages trainable: {trainable_layers}/5)")
     return model
 
 
@@ -202,16 +272,19 @@ def evaluate(model, loader, device) -> dict[str, float]:
     return average_precision(preds, gts)
 
 
-def train(dataset: Path, out: Path, *, epochs: int = 20, batch_size: int = 2,
-          lr: float = 5e-3, workers: int = 0, init_from: str | None = None,
-          device: str | None = None) -> None:
+def train(dataset: Path, out: Path, *, epochs: int = 20, batch_size: int = 4,
+          lr: float = 2e-3, workers: int = 4, init_from: str | None = None,
+          device: str | None = None, trainable_layers: int = 3,
+          patience: int = 5, val_every: int = 1, amp: bool = True,
+          warmup_frac: float = 0.5) -> None:
     import torch
     from torch.utils.data import DataLoader
 
     from .detector import _resolve_device
 
     dev = _resolve_device(torch, device)
-    print(f"device: {dev}")
+    use_amp = bool(amp) and str(dev).startswith("cuda")
+    print(f"device: {dev}" + ("  (mixed precision)" if use_amp else ""))
 
     ann = dataset / "annotations"
     imgs = dataset / "images"
@@ -220,41 +293,83 @@ def train(dataset: Path, out: Path, *, epochs: int = 20, batch_size: int = 2,
     val_ds = CocoDetectionDataset(imgs, val_json) if val_json.exists() else None
     print(f"train images: {len(train_ds)}"
           + (f" | val images: {len(val_ds)}" if val_ds else " | NO val set"))
+
+    # Per-class support, because a macro mAP over 3 classes is dominated by
+    # whichever class has fewest instances — that is usually why the metric
+    # looks unstable from epoch to epoch.
+    def _support(ds, name):
+        if ds is None:
+            return
+        counts = ds.instance_counts()
+        pretty = ", ".join(f"{CLASS_NAMES[c]} {counts.get(c, 0)}"
+                           for c in sorted(CATEGORY_IDS.values()))
+        print(f"{name} instances: {pretty}")
+        thin = [CLASS_NAMES[c] for c in sorted(CATEGORY_IDS.values())
+                if counts.get(c, 0) < 50]
+        if thin and name == "val":
+            print(f"  \u26a0 few val instances for {', '.join(thin)} — its AP "
+                  "will swing by several points between epochs regardless of "
+                  "what the model does. Annotate more of that class before "
+                  "reading much into the number.")
+
+    _support(train_ds, "train")
+    _support(val_ds, "val")
     if val_ds is not None and len(val_ds) == 0:
-        print("⚠ val set is empty — annotate more ND2 FILES (the split is by "
-              "file, deliberately). Validation numbers will be meaningless.")
+        print("\u26a0 val set is empty — annotate more ND2 FILES (the split is "
+              "by file, deliberately).")
 
     train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                          num_workers=workers, collate_fn=collate)
+                          num_workers=workers, collate_fn=collate,
+                          persistent_workers=workers > 0,
+                          pin_memory=str(dev).startswith("cuda"))
     val_dl = (DataLoader(val_ds, batch_size=1, shuffle=False,
                          num_workers=workers, collate_fn=collate)
               if val_ds and len(val_ds) else None)
 
     num_classes = len(CLASS_NAMES)  # background + 3
-    model = build_model(num_classes, init_from=init_from).to(dev)
+    model = build_model(num_classes, init_from=init_from,
+                        trainable_layers=trainable_layers).to(dev)
     params = [p for p in model.parameters() if p.requires_grad]
     opt = torch.optim.SGD(params, lr=lr, momentum=0.9, weight_decay=5e-4)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
-    best = -1.0
+    iters_per_epoch = max(1, len(train_dl))
+    total_iters = epochs * iters_per_epoch
+    warmup_iters = int(warmup_frac * iters_per_epoch)
+    print(f"schedule: {total_iters} iters, {warmup_iters} warmup, "
+          f"peak lr {lr:g}, cosine decay")
+
+    best, best_epoch, since_best = -1.0, 0, 0
     out.parent.mkdir(parents=True, exist_ok=True)
+    it = 0
     for epoch in range(1, epochs + 1):
         model.train()
+        t0 = time.time()
         total = 0.0
         for imgs_b, targets in train_dl:
-            imgs_b = [i.to(dev) for i in imgs_b]
-            targets = [{k: v.to(dev) for k, v in t.items()} for t in targets]
-            losses = model(imgs_b, targets)
-            loss = sum(losses.values())
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-            total += float(loss)
-        sched.step()
-        msg = f"epoch {epoch}/{epochs}  train_loss {total / max(1, len(train_dl)):.4f}"
+            cur_lr = lr_at(it, total_iters, lr, warmup_iters)
+            for g in opt.param_groups:
+                g["lr"] = cur_lr
+            imgs_b = [i.to(dev, non_blocking=True) for i in imgs_b]
+            targets = [{k: v.to(dev, non_blocking=True) for k, v in t.items()}
+                       for t in targets]
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                losses = model(imgs_b, targets)
+                loss = sum(losses.values())
+            opt.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
+            total += float(loss.detach())
+            it += 1
+        dt = time.time() - t0
+        msg = (f"epoch {epoch}/{epochs}  train_loss "
+               f"{total / iters_per_epoch:.4f}  lr {cur_lr:.2e}  "
+               f"{dt:.0f}s ({len(train_ds) / max(dt, 1e-9):.1f} img/s)")
 
         score = None
-        if val_dl is not None:
+        due = val_dl is not None and (epoch % val_every == 0 or epoch == epochs)
+        if due:
             metrics = evaluate(model, val_dl, dev)
             score = metrics["mAP@0.5"]
             msg += "  " + "  ".join(
@@ -263,20 +378,45 @@ def train(dataset: Path, out: Path, *, epochs: int = 20, batch_size: int = 2,
             )
         print(msg, flush=True)
 
-        # checkpoint: best by val mAP, or last epoch when there is no val set
-        is_best = score is not None and score > best
-        if is_best:
-            best = score
-        if is_best or (val_dl is None and epoch == epochs):
+        if score is not None:
+            if score > best:
+                best, best_epoch, since_best = score, epoch, 0
+                torch.save({
+                    "model_state_dict": model.state_dict(),
+                    "classes": CLASS_NAMES,
+                    "epoch": epoch,
+                    "val_mAP@0.5": score,
+                    "init_from": init_from,
+                    "trainable_layers": trainable_layers,
+                }, out)
+                print(f"  saved {out} (mAP {score:.3f})")
+            else:
+                since_best += val_every
+                if patience and since_best >= patience:
+                    print(f"  early stop: no val improvement for "
+                          f"{since_best} epoch(s); best was epoch "
+                          f"{best_epoch} (mAP {best:.3f}). Training longer "
+                          "only overfits — the loss keeps falling while val "
+                          "does not.")
+                    break
+        elif val_dl is None and epoch == epochs:
             torch.save({
                 "model_state_dict": model.state_dict(),
-                "classes": CLASS_NAMES,
-                "epoch": epoch,
-                "val_mAP@0.5": score,
-                "init_from": init_from,
+                "classes": CLASS_NAMES, "epoch": epoch,
+                "val_mAP@0.5": None, "init_from": init_from,
+                "trainable_layers": trainable_layers,
             }, out)
-            print(f"  saved {out}" + (f" (mAP {score:.3f})" if score else ""))
-    print(f"done. best val mAP@0.5: {best:.3f}" if best >= 0 else "done.")
+            print(f"  saved {out} (no val set)")
+
+    if best >= 0:
+        print(f"done. best val mAP@0.5: {best:.3f} at epoch {best_epoch}")
+        if best_epoch <= 2:
+            print("  note: the best epoch was the first or second — the warm "
+                  "start is doing the work and there is little left to learn "
+                  "from this much data. More ANNOTATED FILES will move this "
+                  "number; more epochs will not.")
+    else:
+        print("done.")
 
 
 def main() -> None:
@@ -289,18 +429,37 @@ def main() -> None:
     p.add_argument("--out", default="cell_classes_model.pth",
                    help="checkpoint path to write")
     p.add_argument("--epochs", type=int, default=20)
-    p.add_argument("--batch-size", type=int, default=2)
-    p.add_argument("--lr", type=float, default=5e-3)
-    p.add_argument("--workers", type=int, default=0,
-                   help="DataLoader workers (0 is safest on Windows)")
+    p.add_argument("--batch-size", type=int, default=4)
+    p.add_argument("--lr", type=float, default=2e-3,
+                   help="peak learning rate after warmup (default 2e-3; the "
+                        "old 5e-3 with no warmup destabilised a warm start)")
+    p.add_argument("--workers", type=int, default=4,
+                   help="DataLoader workers. >0 overlaps TIFF reading and "
+                        "percentile normalisation with GPU compute; use 0 if "
+                        "you hit a Windows multiprocessing problem.")
     p.add_argument("--init-from", default=None,
                    help="warm start from an existing .pth (e.g. the current "
                         "1-class cell_detection_model.pth)")
     p.add_argument("--device", default=None, help="cuda / cpu (default: auto)")
+    p.add_argument("--trainable-layers", type=int, default=3,
+                   choices=[0, 1, 2, 3, 4, 5],
+                   help="ResNet stages to fine-tune (default 3). Lower = "
+                        "faster and less overfitting on a small dataset; 5 "
+                        "trains the whole backbone.")
+    p.add_argument("--patience", type=int, default=5,
+                   help="stop after this many epochs without val improvement "
+                        "(0 disables)")
+    p.add_argument("--val-every", type=int, default=1,
+                   help="evaluate every N epochs (2 or 3 saves time once you "
+                        "know it converges early)")
+    p.add_argument("--no-amp", action="store_true",
+                   help="disable mixed precision (on by default on CUDA)")
     args = p.parse_args()
     train(Path(args.dataset), Path(args.out), epochs=args.epochs,
           batch_size=args.batch_size, lr=args.lr, workers=args.workers,
-          init_from=args.init_from, device=args.device)
+          init_from=args.init_from, device=args.device,
+          trainable_layers=args.trainable_layers, patience=args.patience,
+          val_every=args.val_every, amp=not args.no_amp)
 
 
 if __name__ == "__main__":
