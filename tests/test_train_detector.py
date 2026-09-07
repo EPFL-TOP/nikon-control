@@ -119,3 +119,66 @@ def test_no_warmup_is_pure_cosine():
 def test_class_names_line_up_with_the_head():
     assert CLASS_NAMES[0] == "__background__"
     assert CLASS_NAMES[1:] == ["single", "doublet", "debris"]
+
+
+# ---- backbone freezing (torchvision silently ignores the request) --------
+
+@pytest.mark.parametrize("n,expected", [
+    (0, []),
+    (1, ["layer4"]),
+    (2, ["layer3", "layer4"]),
+    (3, ["layer2", "layer3", "layer4"]),
+    (5, ["conv1", "layer1", "layer2", "layer3", "layer4"]),
+])
+def test_freeze_backbone_trains_exactly_the_outermost_stages(n, expected):
+    """torchvision only honours trainable_backbone_layers when built with
+    pretrained weights; the warm-start path must apply it itself."""
+    from nikon_control.train_detector import build_model, freeze_backbone
+
+    model = build_model(4, pretrained_backbone=False, trainable_layers=5)
+    freeze_backbone(model, n)
+    body = model.backbone.body
+    live = [k for k in ["conv1", "layer1", "layer2", "layer3", "layer4"]
+            if any(p.requires_grad for nm, p in body.named_parameters()
+                   if nm.startswith(k))]
+    assert live == expected
+
+
+def test_freezing_fewer_stages_reduces_trainable_params_monotonically():
+    from nikon_control.train_detector import build_model, freeze_backbone
+
+    model = build_model(4, pretrained_backbone=False, trainable_layers=5)
+    counts = []
+    for n in (0, 1, 2, 3, 5):
+        freeze_backbone(model, n)
+        counts.append(sum(p.numel() for p in model.parameters()
+                          if p.requires_grad))
+    assert counts == sorted(counts)
+    assert counts[0] < counts[-1]
+
+
+def test_freeze_batchnorm_converts_and_preserves_weights():
+    """Live BatchNorm at batch size 4 makes fine-tuning noisy; every
+    pretrained torchvision detector uses FrozenBatchNorm instead."""
+    import torch.nn as nn
+    from torchvision.ops.misc import FrozenBatchNorm2d
+
+    from nikon_control.train_detector import build_model, freeze_batchnorm
+
+    class Tiny(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.backbone = nn.Module()
+            self.backbone.body = nn.Sequential(nn.BatchNorm2d(4),
+                                               nn.Conv2d(4, 4, 1))
+
+    m = Tiny()
+    bn = m.backbone.body[0]
+    bn.weight.data.fill_(2.0)
+    bn.running_mean.data.fill_(3.0)
+    n = freeze_batchnorm(m)
+    assert n == 1
+    frozen = m.backbone.body[0]
+    assert isinstance(frozen, FrozenBatchNorm2d)
+    assert float(frozen.weight[0]) == 2.0        # weights carried over
+    assert float(frozen.running_mean[0]) == 3.0

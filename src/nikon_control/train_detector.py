@@ -143,6 +143,68 @@ def collate(batch):
     return tuple(zip(*batch))
 
 
+# ResNet stages, outermost first — torchvision's own ordering for deciding
+# which to fine-tune.
+_BACKBONE_STAGES = ["layer4", "layer3", "layer2", "layer1", "conv1"]
+
+
+def freeze_backbone(model, trainable_layers: int) -> tuple[int, list[str]]:
+    """Freeze all but the last ``trainable_layers`` ResNet stages.
+
+    torchvision only applies ``trainable_backbone_layers`` when the model is
+    built WITH pretrained weights; built with ``weights=None`` (which the
+    warm-start path must do) it warns and silently trains all 5 stages. So we
+    apply the same policy ourselves. Returns
+    ``(trainable_param_count, stage_names_left_trainable)``.
+    """
+    keep = _BACKBONE_STAGES[:max(0, min(5, trainable_layers))]
+    if trainable_layers >= 5:
+        keep = keep + ["bn1"]
+    body = model.backbone.body
+    for name, param in body.named_parameters():
+        param.requires_grad_(any(name.startswith(k) for k in keep))
+    live = sorted({k for k in keep
+                   for n, p in body.named_parameters()
+                   if n.startswith(k) and p.requires_grad})
+    n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return n_train, live
+
+
+def freeze_batchnorm(model) -> int:
+    """Replace the backbone's BatchNorm2d with FrozenBatchNorm2d.
+
+    Every pretrained torchvision detector uses FrozenBatchNorm; only the
+    ``weights=None`` path gets trainable BatchNorm. With a small batch size
+    (4 here) live BatchNorm normalises on noisy batch statistics and keeps
+    updating its running stats, which makes fine-tuning measurably less
+    stable — a likely contributor to val mAP bouncing between epochs.
+    Returns how many layers were converted.
+    """
+    import torch.nn as nn
+    from torchvision.ops.misc import FrozenBatchNorm2d
+
+    converted = 0
+
+    def convert(module):
+        nonlocal converted
+        for name, child in list(module.named_children()):
+            if isinstance(child, nn.BatchNorm2d):
+                frozen = FrozenBatchNorm2d(child.num_features)
+                with_no_grad = frozen.state_dict()
+                del with_no_grad
+                frozen.weight.data.copy_(child.weight.data)
+                frozen.bias.data.copy_(child.bias.data)
+                frozen.running_mean.data.copy_(child.running_mean.data)
+                frozen.running_var.data.copy_(child.running_var.data)
+                setattr(module, name, frozen)
+                converted += 1
+            else:
+                convert(child)
+
+    convert(model.backbone.body)
+    return converted
+
+
 def build_model(num_classes: int, init_from: str | None = None,
                 pretrained_backbone: bool = True,
                 trainable_layers: int = 3):
@@ -181,10 +243,16 @@ def build_model(num_classes: int, init_from: str | None = None,
 
     in_features = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
-    n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    # Apply the freezing policy OURSELVES: torchvision ignores
+    # trainable_backbone_layers when built without pretrained weights.
+    n_bn = freeze_batchnorm(model)
+    n_train, live = freeze_backbone(model, trainable_layers)
     n_all = sum(p.numel() for p in model.parameters())
     print(f"model: {n_train/1e6:.1f}M of {n_all/1e6:.1f}M params trainable "
-          f"(backbone stages trainable: {trainable_layers}/5)")
+          f"(backbone stages trainable: {len(live)}/5"
+          + (f" — {', '.join(live)}" if live else " — backbone fully frozen")
+          + f"; {n_bn} BatchNorm layers frozen)")
     return model
 
 
@@ -314,6 +382,23 @@ def train(dataset: Path, out: Path, *, epochs: int = 20, batch_size: int = 4,
 
     _support(train_ds, "train")
     _support(val_ds, "val")
+
+    # A by-file split can land most of a rare class in val, starving training
+    # of it. Worth flagging: it looks like a model weakness but is a split
+    # artefact, fixable by re-exporting with a different --seed.
+    if val_ds is not None and len(val_ds):
+        tr_c, va_c = train_ds.instance_counts(), val_ds.instance_counts()
+        for cid in sorted(CATEGORY_IDS.values()):
+            tr, va = tr_c.get(cid, 0), va_c.get(cid, 0)
+            if tr + va == 0:
+                continue
+            frac = va / (tr + va)
+            if frac > 0.35 and tr < 300:
+                print(f"  \u26a0 {CLASS_NAMES[cid]}: only {tr} train vs {va} "
+                      f"val instances ({frac:.0%} of them are in val). The "
+                      "by-file split put much of this class in the held-out "
+                      "files, so training barely sees it — re-export with a "
+                      "different --seed to rebalance.")
     if val_ds is not None and len(val_ds) == 0:
         print("\u26a0 val set is empty — annotate more ND2 FILES (the split is "
               "by file, deliberately).")
