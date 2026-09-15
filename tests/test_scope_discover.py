@@ -106,3 +106,69 @@ def test_nikon_readiness_reports_rather_than_raises():
     joined = " ".join(notes).lower()
     assert "nikon" in joined
     assert "camera" in joined
+
+
+def test_scan_adapter_distinguishes_missing_from_empty():
+    """'Not installed' and 'installed but silent' have different fixes."""
+    scan = discover.scan_adapter("NoSuchAdapter")
+    assert scan.installed is False
+    assert scan.devices == []
+    assert "not installed" in scan.error
+
+
+def test_probe_does_not_dump_the_adapter_list_on_a_typo():
+    """MMCore's own error pastes all ~265 adapter names; ours must not."""
+    res = discover.probe("NikonTi8", "TIXYDrive")
+    assert res.ok is False
+    assert "no adapter named 'NikonTi8'" in res.error
+    assert len(res.error) < 300
+    assert "DemoCamera" not in res.error or "Did you mean" in res.error
+
+
+def test_ti2_diagnosis_explains_an_empty_list_and_names_the_dll():
+    """The rig's actual failure: adapter present, SDK DLL missing."""
+    from nikon_control.scope.stand import TI2
+
+    st = discover.StandStatus(stand=TI2, installed=True, devices=[],
+                              driver_path=None, roles={})
+    text = " ".join(st.diagnosis("C:/mm"))
+    assert "offers no devices" in text
+    assert "SDK could not be reached" in text      # not "adapter missing"
+    assert "Ti2_Mic_Driver.dll" in text
+    assert r"C:\Program Files\Nikon\Ti2-SDK\bin" in text   # where to get it
+    assert st.usable is False
+
+
+def test_ti_diagnosis_warns_that_a_device_list_proves_nothing():
+    from nikon_control.scope.stand import TI
+
+    entries = [discover.DeviceEntry("NikonTI", n, type=t) for n, t in [
+        ("TIXYDrive", "XYStage"), ("TIZDrive", "Stage"),
+        ("TIPFSOffset", "Stage"), ("TIPFSStatus", "AutoFocus"),
+        ("TINosePiece", "State"), ("TILightPath", "State"),
+        ("TIEpiShutter", "Shutter"),
+    ]]
+    st = discover.StandStatus(
+        stand=TI, installed=True, devices=entries,
+        driver_path=None,
+        roles=discover.resolve_roles(entries),
+    )
+    text = " ".join(st.diagnosis("C:/mm"))
+    assert "7 device(s)" in text
+    assert "proves nothing about what is connected" in text
+    assert "NikonTi.dll" in text
+    # every role resolved, but the driver is missing, so it is not usable yet
+    assert st.usable is True        # roles are complete
+    assert "NOT found" in text      # and the driver problem is still reported
+
+
+def test_readiness_covers_both_stand_generations():
+    notes = " ".join(discover.nikon_readiness())
+    assert "NikonTi2" in notes and "NikonTI" in notes
+
+
+def test_the_pfs_trap_is_recorded_for_whichever_stand_is_attached():
+    """Moving Z kills PFS on both generations — control code must re-engage."""
+    text = " ".join(discover.SHARED_NOTES)
+    assert "DISABLES PFS" in text
+    assert "re-engage" in text

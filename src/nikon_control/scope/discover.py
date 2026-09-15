@@ -16,25 +16,27 @@ increasingly committal steps:
 Probing is deliberately one device at a time in a fresh core, so a device
 that hangs or crashes its adapter cannot take the rest of the inventory with
 it.
+
+Which Nikon stand is attached — Ti2 or the older Ti — lives in :mod:`.stand`;
+this module is the layer that puts a core behind it.
 """
 from __future__ import annotations
 
-import os
+import difflib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# Adapters that matter for a Nikon Ti2 rig, with what each is responsible for.
-NIKON_ADAPTERS = {
-    "NikonTi2": "Ti2-E stand: XY stage, Z drive, PFS, nosepiece, shutters",
-    "NikonTI": "older Ti/Ti-E stand (superseded by NikonTi2)",
-}
+from .stand import (SHARED_NOTES, STANDS, Stand, missing_roles,  # noqa: F401
+                    resolve_roles, stand_for_adapter)
+
+# Adapters that matter for a Nikon rig, with what each is responsible for.
+NIKON_ADAPTERS = {s.adapter: s.label for s in STANDS}
 CAMERA_ADAPTERS = {
     "HamamatsuHam": "Hamamatsu ORCA (DCAM)",
     "PVCAM": "Photometrics (PVCAM)",
     "AndorSDK3": "Andor sCMOS",
 }
-# The Nikon adapter is a thin wrapper over Nikon's closed SDK; this DLL has to
-# sit beside the adapter or loading fails with an unhelpful error.
+# Kept for callers that imported it before the stand registry existed.
 TI2_DRIVER_DLL = "Ti2_Mic_Driver.dll"
 
 
@@ -57,6 +59,16 @@ class LoadedDevice:
 
 
 @dataclass
+class AdapterScan:
+    """What one adapter offers — and why, when it offers nothing."""
+
+    library: str
+    installed: bool
+    devices: list[DeviceEntry] = field(default_factory=list)
+    error: str = ""
+
+
+@dataclass
 class ProbeResult:
     library: str
     name: str
@@ -67,6 +79,56 @@ class ProbeResult:
     def describe(self) -> str:
         head = f"{self.library}/{self.name}"
         return f"{head}: connected" if self.ok else f"{head}: FAILED — {self.error}"
+
+
+@dataclass
+class StandStatus:
+    """Everything known about one stand generation on this machine."""
+
+    stand: Stand
+    installed: bool
+    devices: list[DeviceEntry] = field(default_factory=list)
+    error: str = ""
+    driver_path: Path | None = None
+    roles: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def usable(self) -> bool:
+        """Devices enumerated and the roles the loop needs are all present."""
+        return bool(self.devices) and not missing_roles(self.roles)
+
+    def diagnosis(self, mm_dir: Path | None = None) -> list[str]:
+        """What is wrong, and what to do about it — in that order."""
+        s = self.stand
+        out: list[str] = []
+        if not self.installed:
+            out.append(f"{s.adapter} is not installed in this Micro-Manager.")
+            return out
+
+        if self.devices:
+            out.append(f"{s.adapter}: {len(self.devices)} device(s).")
+            if not s.dynamic:
+                out.append(s.empty_list_meaning)
+        else:
+            out.append(f"{s.adapter}: installed but offers no devices.")
+            out.append(s.empty_list_meaning)
+            if self.error:
+                out.append(f"Enumeration error: {self.error}")
+
+        if self.driver_path:
+            out.append(f"{s.driver.dll} found at {self.driver_path}.")
+        else:
+            where = (f" in {mm_dir}" if mm_dir and s.driver.beside_adapter
+                     else "")
+            out.append(f"{s.driver.dll} NOT found{where} — "
+                       f"{s.driver.fix(mm_dir or 'the Micro-Manager folder')}.")
+
+        missing = missing_roles(self.roles)
+        if self.devices and missing:
+            out.append("Roles not resolved: "
+                       + ", ".join(missing)
+                       + " (fine if the stand genuinely lacks them).")
+        return out
 
 
 def device_type_name(value) -> str:
@@ -103,13 +165,21 @@ def available_adapters(core=None) -> list[str]:
         return []
 
 
-def adapter_devices(library: str, core=None) -> list[DeviceEntry]:
-    """Devices a given adapter offers (without loading any of them)."""
+def scan_adapter(library: str, core=None) -> AdapterScan:
+    """Devices a given adapter offers, plus why it offered none.
+
+    The distinction matters: "adapter not installed" and "adapter installed
+    but its vendor SDK is unreachable" look identical in a bare device list,
+    and they have completely different fixes.
+    """
     core = core or new_core()
+    if library not in set(available_adapters(core)):
+        return AdapterScan(library, installed=False,
+                           error="adapter not installed")
     try:
         names = list(core.getAvailableDevices(library))
-    except Exception:
-        return []
+    except Exception as exc:
+        return AdapterScan(library, installed=True, error=str(exc))
     try:
         descs = list(core.getAvailableDeviceDescriptions(library))
     except Exception:
@@ -119,22 +189,41 @@ def adapter_devices(library: str, core=None) -> list[DeviceEntry]:
                  for t in core.getAvailableDeviceTypes(library)]
     except Exception:
         types = [""] * len(names)
-    return [
+    devices = [
         DeviceEntry(library=library, name=n,
                     description=descs[i] if i < len(descs) else "",
                     type=types[i] if i < len(types) else "")
         for i, n in enumerate(names)
     ]
+    return AdapterScan(library, installed=True, devices=devices)
 
 
-def probe(library: str, name: str, *, read_properties: bool = True) -> ProbeResult:
+def adapter_devices(library: str, core=None) -> list[DeviceEntry]:
+    """Devices a given adapter offers (without loading any of them)."""
+    return scan_adapter(library, core).devices
+
+
+def probe(library: str, name: str, *, read_properties: bool = True,
+          core_factory=None) -> ProbeResult:
     """Try to load and initialise one device — the real 'is it connected?' test.
 
     Runs in its own core so a failure cannot poison anything else. Returns a
     result rather than raising: a rig bring-up wants the whole picture, not
     the first exception.
     """
-    core = new_core()
+    core = (core_factory or new_core)()
+
+    # MMCore's "unknown adapter" error pastes all 265 installed adapter names
+    # into the message, which buries the one thing you need to read. Catch a
+    # misspelled adapter here instead.
+    adapters = set(available_adapters(core))
+    if adapters and library not in adapters:
+        near = difflib.get_close_matches(library, sorted(adapters), n=3,
+                                         cutoff=0.6)
+        hint = f" Did you mean: {', '.join(near)}?" if near else ""
+        return ProbeResult(library, name, False,
+                           f"no adapter named {library!r} is installed.{hint}")
+
     label = "__probe__"
     try:
         core.loadDevice(label, library, name)
@@ -160,6 +249,48 @@ def probe(library: str, name: str, *, read_properties: bool = True) -> ProbeResu
     except Exception:
         pass
     return ProbeResult(library, name, True, "", props)
+
+
+def find_driver(stand: Stand, mm_dir: Path | None = None) -> Path | None:
+    """Locate the vendor DLL this stand's adapter needs.
+
+    Ti2 wants its DLL copied beside the adapter; the older Ti finds its own
+    on the system path from the vendor's install directory. Both are checked
+    either way, because a working machine is a working machine.
+    """
+    mm_dir = mm_dir if mm_dir is not None else mm_install()
+    if mm_dir:
+        for hit in Path(mm_dir).rglob(stand.driver.dll):
+            return hit
+    sdk = Path(stand.driver.sdk_path) / stand.driver.dll
+    try:
+        if sdk.exists():
+            return sdk
+    except OSError:
+        pass
+    return None
+
+
+def stand_status(core=None, mm_dir: Path | None = None) -> list[StandStatus]:
+    """Scan every known Nikon stand generation on this machine."""
+    core = core or new_core()
+    mm_dir = mm_dir if mm_dir is not None else mm_install()
+    adapters = set(available_adapters(core))
+    out: list[StandStatus] = []
+    for s in STANDS:
+        if s.adapter not in adapters:
+            out.append(StandStatus(stand=s, installed=False))
+            continue
+        scan = scan_adapter(s.adapter, core)
+        out.append(StandStatus(
+            stand=s,
+            installed=True,
+            devices=scan.devices,
+            error=scan.error,
+            driver_path=find_driver(s, mm_dir),
+            roles=resolve_roles(scan.devices),
+        ))
+    return out
 
 
 def load_config(path: str | Path, core=None):
@@ -208,44 +339,33 @@ def core_roles(core) -> dict[str, str]:
     return roles
 
 
-def nikon_readiness(core=None) -> list[str]:
-    """Ti2-specific findings worth knowing before a bring-up.
+def nikon_readiness(core=None, mm_dir: Path | None = None) -> list[str]:
+    """Findings worth knowing before a bring-up, for whichever stand is here.
 
-    Encodes the two failure modes that cost the most time on this hardware:
-    the Nikon SDK DLL not sitting beside the adapter, and the fact that the
-    stand adapter never provides the camera.
+    Encodes the failure modes that cost the most time on this hardware: the
+    vendor SDK DLL not where the adapter can find it, the two stands' very
+    different meanings for an empty device list, and the fact that no stand
+    adapter ever provides the camera.
     """
     core = core or new_core()
+    mm_dir = mm_dir if mm_dir is not None else mm_install()
     notes: list[str] = []
+
+    statuses = stand_status(core, mm_dir)
+    present = [s for s in statuses if s.installed]
+    if not present:
+        notes.append(
+            "No Nikon stand adapter found (looked for "
+            + ", ".join(s.adapter for s in STANDS)
+            + "). This is not a Micro-Manager build that can drive the stand."
+        )
+    for st in present:
+        notes.extend(st.diagnosis(mm_dir))
+        notes.extend(st.stand.notes)
+    if present:
+        notes.extend(SHARED_NOTES)
+
     adapters = set(available_adapters(core))
-
-    ti2 = [a for a in NIKON_ADAPTERS if a in adapters]
-    if not ti2:
-        notes.append(
-            "No Nikon stand adapter found. On Windows the NikonTi2 adapter "
-            "ships with Micro-Manager; if it is missing, this is not a "
-            "Micro-Manager build that can drive the stand."
-        )
-    else:
-        notes.append(f"Nikon stand adapter(s) present: {', '.join(ti2)}.")
-
-    install = mm_install()
-    if install and os.name == "nt":
-        if not any(install.rglob(TI2_DRIVER_DLL)):
-            notes.append(
-                f"{TI2_DRIVER_DLL} was NOT found in {install}. The NikonTi2 "
-                "adapter wraps Nikon's closed SDK and will fail to load "
-                "without it — copy it from the Ti2 Control installation into "
-                "the Micro-Manager folder."
-            )
-        else:
-            notes.append(f"{TI2_DRIVER_DLL} found beside the adapter.")
-        notes.append(
-            "Check the installed Ti2 Control version: 2.10 and 2.20 are "
-            "documented to crash Micro-Manager when the nosepiece device is "
-            "added (mmCoreAndDevices #44); 2.00 is reported working."
-        )
-
     cams = [a for a in CAMERA_ADAPTERS if a in adapters]
     notes.append(
         f"Camera adapter(s) present: {', '.join(cams)}." if cams else
