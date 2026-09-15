@@ -224,8 +224,12 @@ def build_model(num_classes: int, init_from: str | None = None,
         # warm start from the existing cell model: same architecture, but its
         # predictor is 1-class so it must be rebuilt
         from .detector import load_checkpoint_state_dict
-        model = fasterrcnn_resnet50_fpn(weights=None, weights_backbone=None,
-                                        trainable_backbone_layers=trainable_layers)
+        # NOTE: trainable_backbone_layers is deliberately NOT passed here.
+        # torchvision ignores it when built without pretrained weights and
+        # emits a warning saying it fell back to 5 — which would be
+        # misleading, because freeze_backbone() below applies the real
+        # policy a few lines later.
+        model = fasterrcnn_resnet50_fpn(weights=None, weights_backbone=None)
         state = load_checkpoint_state_dict(torch.load(init_from,
                                                       map_location="cpu"))
         state = {k: v for k, v in state.items()
