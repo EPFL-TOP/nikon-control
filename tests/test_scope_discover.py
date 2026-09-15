@@ -5,6 +5,8 @@ pymmcore-plus's `mmcore install` on every platform, so they are the one thing
 we can exercise without the microscope; anything needing real hardware is out
 of scope here and belongs on the rig.
 """
+from pathlib import Path
+
 import pytest
 
 pytest.importorskip("pymmcore_plus")
@@ -130,7 +132,8 @@ def test_ti2_diagnosis_explains_an_empty_list_and_names_the_dll():
     from nikon_control.scope.stand import TI2
 
     st = discover.StandStatus(stand=TI2, installed=True, devices=[],
-                              driver_path=None, roles={})
+                              driver=discover.DriverLocation("Ti2_Mic_Driver.dll"),
+                              roles={})
     text = " ".join(st.diagnosis("C:/mm"))
     assert "offers no devices" in text
     assert "SDK could not be reached" in text      # not "adapter missing"
@@ -150,7 +153,7 @@ def test_ti_diagnosis_warns_that_a_device_list_proves_nothing():
     ]]
     st = discover.StandStatus(
         stand=TI, installed=True, devices=entries,
-        driver_path=None,
+        driver=discover.DriverLocation("NikonTi.dll"),
         roles=discover.resolve_roles(entries),
     )
     text = " ".join(st.diagnosis("C:/mm"))
@@ -172,3 +175,29 @@ def test_the_pfs_trap_is_recorded_for_whichever_stand_is_attached():
     text = " ".join(discover.SHARED_NOTES)
     assert "DISABLES PFS" in text
     assert "re-engage" in text
+
+
+def test_dll_in_the_sdk_folder_is_not_enough_for_the_ti2():
+    """The rig's real state: DLL present on the machine, wrong folder.
+
+    A plain "found it" would have sent us looking elsewhere for the failure.
+    """
+    from nikon_control.scope.stand import TI, TI2
+
+    sdk = Path(r"C:\Program Files\Nikon\Ti2-SDK\bin\Ti2_Mic_Driver.dll")
+    loc = discover.DriverLocation("Ti2_Mic_Driver.dll", sdk,
+                                  beside_adapter=False, satisfied=False)
+    text = " ".join(discover.StandStatus(TI2, True, [], "", loc, {})
+                    .diagnosis("C:/mm"))
+    assert "is on this machine at" in text
+    assert "COPY it to C:/mm" in text
+
+    # The older Ti loads its DLL from the system path, so the same location
+    # IS enough there — the two stands must not share one verdict.
+    ok = discover.DriverLocation("NikonTi.dll",
+                                 Path(r"C:\Program Files\Nikon\Shared\Bin\NikonTi.dll"),
+                                 beside_adapter=False, satisfied=True)
+    ti_text = " ".join(discover.StandStatus(TI, True, [], "", ok, {})
+                       .diagnosis("C:/mm"))
+    assert "found at" in ti_text
+    assert "COPY" not in ti_text

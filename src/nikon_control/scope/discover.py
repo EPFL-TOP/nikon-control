@@ -82,6 +82,22 @@ class ProbeResult:
 
 
 @dataclass
+class DriverLocation:
+    """Where a stand's vendor DLL was found — and whether that is good enough.
+
+    Finding the DLL is not the same as the adapter being able to load it. The
+    Ti2 adapter looks for its driver *beside itself*, so a copy sitting only
+    in the Nikon SDK directory satisfies a search and still fails the load —
+    which is exactly the state a fresh install is in.
+    """
+
+    dll: str
+    path: Path | None = None
+    beside_adapter: bool = False    # found in the Micro-Manager folder?
+    satisfied: bool = False         # good enough for THIS stand's adapter?
+
+
+@dataclass
 class StandStatus:
     """Everything known about one stand generation on this machine."""
 
@@ -89,7 +105,7 @@ class StandStatus:
     installed: bool
     devices: list[DeviceEntry] = field(default_factory=list)
     error: str = ""
-    driver_path: Path | None = None
+    driver: DriverLocation | None = None
     roles: dict[str, str] = field(default_factory=dict)
 
     @property
@@ -115,13 +131,21 @@ class StandStatus:
             if self.error:
                 out.append(f"Enumeration error: {self.error}")
 
-        if self.driver_path:
-            out.append(f"{s.driver.dll} found at {self.driver_path}.")
+        found = self.driver
+        target = mm_dir or "the Micro-Manager folder"
+        if found and found.satisfied:
+            out.append(f"{s.driver.dll} found at {found.path}.")
+        elif found and found.path:
+            # The trap: present on the machine, wrong place for the adapter.
+            out.append(
+                f"{s.driver.dll} is on this machine at {found.path}, but the "
+                f"{s.adapter} adapter loads it from its own folder — COPY it "
+                f"to {target} (do not move or rename it)."
+            )
         else:
-            where = (f" in {mm_dir}" if mm_dir and s.driver.beside_adapter
-                     else "")
+            where = f" in {mm_dir}" if mm_dir and s.driver.beside_adapter else ""
             out.append(f"{s.driver.dll} NOT found{where} — "
-                       f"{s.driver.fix(mm_dir or 'the Micro-Manager folder')}.")
+                       f"{s.driver.fix(target)}.")
 
         missing = missing_roles(self.roles)
         if self.devices and missing:
@@ -251,24 +275,27 @@ def probe(library: str, name: str, *, read_properties: bool = True,
     return ProbeResult(library, name, True, "", props)
 
 
-def find_driver(stand: Stand, mm_dir: Path | None = None) -> Path | None:
-    """Locate the vendor DLL this stand's adapter needs.
+def find_driver(stand: Stand, mm_dir: Path | None = None) -> DriverLocation:
+    """Locate the vendor DLL this stand's adapter needs, and judge the location.
 
-    Ti2 wants its DLL copied beside the adapter; the older Ti finds its own
-    on the system path from the vendor's install directory. Both are checked
-    either way, because a working machine is a working machine.
+    Ti2 wants its DLL copied beside the adapter; the older Ti finds its own on
+    the system path from the vendor's install directory. Both places are
+    searched either way, but only the right place counts as satisfied.
     """
+    dll = stand.driver.dll
     mm_dir = mm_dir if mm_dir is not None else mm_install()
     if mm_dir:
-        for hit in Path(mm_dir).rglob(stand.driver.dll):
-            return hit
-    sdk = Path(stand.driver.sdk_path) / stand.driver.dll
+        for hit in Path(mm_dir).rglob(dll):
+            return DriverLocation(dll, hit, beside_adapter=True, satisfied=True)
+    sdk = Path(stand.driver.sdk_path) / dll
     try:
         if sdk.exists():
-            return sdk
+            # Enough for the Ti (system path); not enough for the Ti2.
+            return DriverLocation(dll, sdk, beside_adapter=False,
+                                  satisfied=not stand.driver.beside_adapter)
     except OSError:
         pass
-    return None
+    return DriverLocation(dll)
 
 
 def stand_status(core=None, mm_dir: Path | None = None) -> list[StandStatus]:
@@ -287,7 +314,7 @@ def stand_status(core=None, mm_dir: Path | None = None) -> list[StandStatus]:
             installed=True,
             devices=scan.devices,
             error=scan.error,
-            driver_path=find_driver(s, mm_dir),
+            driver=find_driver(s, mm_dir),
             roles=resolve_roles(scan.devices),
         ))
     return out

@@ -17,10 +17,8 @@ from __future__ import annotations
 
 import argparse
 import difflib
-import json
-from pathlib import Path
 
-from . import discover, stand as stand_mod
+from . import discover, plate as plate_mod, stand as stand_mod
 from .plate import WellRef, calibrate, suggested_refs
 
 
@@ -68,9 +66,13 @@ def _cmd_devices(args) -> int:
         st = stand_mod.stand_for_adapter(args.adapter)
         if st:
             print(f"  {st.empty_list_meaning}")
-            if not discover.find_driver(st):
-                mm = discover.mm_install() or "the Micro-Manager folder"
-                print(f"  {st.driver.dll} is not present — {st.driver.fix(mm)}")
+            mm = discover.mm_install() or "the Micro-Manager folder"
+            found = discover.find_driver(st)
+            if not found.satisfied:
+                st_status = discover.StandStatus(stand=st, installed=True,
+                                                 driver=found)
+                for line in st_status.diagnosis(mm)[1:]:
+                    print(f"  {line}")
         if scan.error:
             print(f"  error: {scan.error}")
         return 1
@@ -188,8 +190,21 @@ def _cmd_plate(args) -> int:
               f"  nikon-control-scope plate --plate {args.plate} "
               f"--well {a} X Y --well {b} X Y --well {c} X Y")
         return 0
+    if args.show:
+        try:
+            cal = plate_mod.load(args.show)
+        except Exception as exc:
+            print(f"could not read {args.show}: {exc}")
+            return 1
+        print(cal.describe())
+        lay = plate_mod.layout(cal)
+        print(f"  {len(lay.names)} wells, {lay.rows}x{lay.columns}, "
+              f"{lay.well_width_um / 1000:.1f} mm each")
+        print(f"  A1 {lay.x[0]:.0f}, {lay.y[0]:.0f} µm   "
+              f"{lay.names[-1]} {lay.x[-1]:.0f}, {lay.y[-1]:.0f} µm")
+        return 0
     if not args.well:
-        print("give at least one --well NAME X Y (or --suggest)")
+        print("give at least one --well NAME X Y (or --suggest, or --show FILE)")
         return 1
     refs = [WellRef(name=w[0], x=float(w[1]), y=float(w[2])) for w in args.well]
     try:
@@ -205,15 +220,9 @@ def _cmd_plate(args) -> int:
         print(f"  warning: residual {cal.residual_um:.0f} µm is large for "
               "hand-centred wells; re-check the well identities.")
     if args.json:
-        Path(args.json).write_text(json.dumps({
-            "plate": cal.plate,
-            "a1_center_xy": list(cal.a1_center_xy),
-            "rotation": cal.rotation,
-            "residual_um": cal.residual_um,
-            "scale_error": cal.scale_error,
-            "n_refs": cal.n_refs,
-        }, indent=2))
-        print(f"  written to {args.json}")
+        plate_mod.save(cal, args.json)
+        print(f"  written to {args.json} — the /scope dashboard reads this "
+              f"file, and so does `plate --show`")
     return 0
 
 
@@ -258,6 +267,8 @@ def main() -> None:
     pl.add_argument("--suggest", action="store_true",
                     help="print which wells to use and stop")
     pl.add_argument("--json", help="write the calibration to this file")
+    pl.add_argument("--show", metavar="FILE",
+                    help="print a saved calibration and the wells it implies")
     pl.set_defaults(func=_cmd_plate)
 
     args = p.parse_args()

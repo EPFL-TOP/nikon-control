@@ -114,23 +114,66 @@ stage, focus, autofocus, shutter) and then the **stand** roles — the ones
 MMCore has no slot for, like the PFS offset and the nosepiece. An empty role
 is what makes a later script fail with an unhelpful error.
 
-## 4 · Register the plate against the stage
+## 4 · Operate it — the `/scope` dashboard
+
+```bat
+nikon-control-dashboard --data-dir . --mm-config C:\path\MMConfig.cfg
+```
+
+then open `http://localhost:5006/scope`. It has three panels, in session
+order: **Connect** (a `.cfg`, or Micro-Manager's demo devices to try the page
+with no microscope), **Drive** (snap/live image, stage jog, focus, PFS,
+objective, channel) and **Plate** (below).
+
+All the hardware behaviour lives in `scope/control.py`, not in the dashboard,
+so everything the page does is equally available to a script — which is what
+the unattended 40× scan will be:
+
+```python
+from nikon_control.scope.control import Scope
+
+s = Scope.from_config(r"C:\path\MMConfig.cfg")
+s.move_xy(12000, -4000)
+s.engage_pfs()                     # returns False if it did not lock
+img = s.snap()
+```
+
+Three behaviours are built into that class rather than left to callers:
+
+- **Moving Z suspends and restores PFS.** Setting Z disables continuous focus
+  on this hardware, so `move_z()` turns PFS off deliberately and back on
+  afterwards instead of leaving it silently off for the rest of the night.
+- **`focus_by()` picks the right control.** While PFS is locked it moves the
+  **PFS offset** — the only thing that changes focus under a lock — and moves
+  **Z** when PFS is off. The dashboard's `Focus ±` buttons use it, and the
+  line under them says which one is live right now.
+- **The turret needs `confirm=True`.** Rotating a nosepiece under a loaded
+  plate can drive a dry 40× into glass, and this project images entirely at
+  40×, so a turret move should read as the exceptional event it is. The
+  dashboard hides it behind a checkbox for the same reason.
+
+There is also a jog guard: a relative move over 5 mm is refused, because a
+mistyped step is the classic way to crash an objective. Absolute moves are
+never guarded — crossing the plate is legitimate travel.
+
+## 5 · Register the plate against the stage
 
 This is the step that makes every later position meaningful. A plate's
 geometry is fixed by its manufacturer, so locating it takes exactly **three
 numbers**: where the centre of well A1 sits on the stage, and how the plate is
 rotated relative to the stage axes.
 
+Either from the dashboard's **Plate** panel — pick the plate type, drive to
+each suggested well, type its name and press *Capture current XY*, then
+*Calibrate* — or from the command line:
+
 ```bat
 nikon-control-scope plate --plate 96-well --suggest
 ```
 
-It names three wells — A1 and the two far corners. Use corners: adjacent
-wells barely constrain the rotation, so the extra travel buys real accuracy.
-
-Drive to each, centre it under the objective, read the stage coordinates
-(Micro-Manager's stage control panel will do while there is no GUI of our
-own), then:
+Either way it names three wells — A1 and the two far corners. Use corners:
+adjacent wells barely constrain the rotation, so the extra travel buys real
+accuracy. Drive to each, centre it under the objective, capture it, then:
 
 ```bat
 nikon-control-scope plate --plate 96-well ^
@@ -142,6 +185,17 @@ Output reports A1's position, the fitted rotation, and the **residual** —
 how far the measured wells sit from where the fit says they should. A few
 tens of µm is normal for hand-centring; a few hundred means a well was
 misidentified.
+
+The dashboard then draws **every well in stage coordinates with the
+objective's position marked on it**, and the captured wells highlighted. That
+map is the check on the registration: if the marker is not inside the well you
+are actually looking at, the fit is wrong — far easier to see here than to
+infer from a scan that missed. Arm *click a well to drive there* and the same
+map becomes the navigator.
+
+`--json` / the panel's **Save** write one file that both read, so a plate
+registered at the microscope is available to a script, and
+`nikon-control-scope plate --show plate.json` prints it back.
 
 Two guards worth knowing:
 
@@ -189,5 +243,18 @@ nikon-control-scope adapters
 nikon-control-scope probe DemoCamera DXYStage
 ```
 
+The `/scope` dashboard has a **Demo devices** button that connects to exactly
+those, so the whole page — jog, snap, PFS, plate registration — can be driven
+with no microscope in the room. That is also how it is tested: the suite
+builds the real Bokeh document and fires the real handlers against the demo
+core.
+
 The plate calibration needs no hardware at all — it is pure geometry, and its
 tests round-trip against `useq`'s own forward model.
+
+## What is not built yet
+
+The 40× multi-well scan: walk the selected wells and fields of a
+`WellPlatePlan`, engage PFS at each, acquire, and hand the frames to the
+detector. Everything it needs — positions from the plate registration, PFS
+handling, snap — is in place; the scan itself is the next piece.

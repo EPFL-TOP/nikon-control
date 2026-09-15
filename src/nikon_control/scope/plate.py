@@ -209,3 +209,96 @@ def suggested_refs(plate: str) -> tuple[str, str, str]:
         WellPlatePlan(plate=plate, a1_center_xy=(0.0, 0.0)).all_well_names
     )
     return (str(names[0, 0]), str(names[0, -1]), str(names[-1, 0]))
+
+
+# --------------------------------------------------------------- persistence
+# The CLI writes a calibration to JSON and the dashboard reads it back, so the
+# shape of that file belongs here rather than in either of them.
+
+def to_dict(cal: PlateCalibration) -> dict:
+    return {
+        "plate": cal.plate,
+        "a1_center_xy": list(cal.a1_center_xy),
+        "rotation": cal.rotation,
+        "residual_um": cal.residual_um,
+        "scale_error": cal.scale_error,
+        "n_refs": cal.n_refs,
+    }
+
+
+def from_dict(obj: dict) -> PlateCalibration:
+    try:
+        a1 = tuple(float(v) for v in obj["a1_center_xy"])
+        return PlateCalibration(
+            plate=str(obj["plate"]),
+            a1_center_xy=(a1[0], a1[1]),
+            rotation=float(obj.get("rotation", 0.0)),
+            residual_um=float(obj.get("residual_um", 0.0)),
+            scale_error=float(obj.get("scale_error", 0.0)),
+            n_refs=int(obj.get("n_refs", 1)),
+        )
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        raise ValueError(f"not a plate calibration file: {exc}") from exc
+
+
+def save(cal: PlateCalibration, path) -> None:
+    import json
+    from pathlib import Path
+
+    Path(path).write_text(json.dumps(to_dict(cal), indent=2))
+
+
+def load(path) -> PlateCalibration:
+    import json
+    from pathlib import Path
+
+    return from_dict(json.loads(Path(path).read_text()))
+
+
+# ------------------------------------------------------------------- drawing
+
+@dataclass(frozen=True)
+class PlateLayout:
+    """Everything needed to draw a registered plate in stage coordinates."""
+
+    names: list[str]
+    x: list[float]
+    y: list[float]
+    well_width_um: float
+    well_height_um: float
+    circular: bool
+    rows: int
+    columns: int
+
+
+def layout(cal: PlateCalibration) -> PlateLayout:
+    """Stage position and size of every well, for a map of the plate.
+
+    Positions come from ``useq`` applying the calibration, so the map shows
+    where the microscope believes the wells are — which is the thing worth
+    checking against reality.
+    """
+    import numpy as np
+
+    plan = cal.to_plan()
+    names = [str(n) for n in np.asarray(plan.all_well_names).ravel()]
+    xs = [float(p.x) for p in plan.all_well_positions]
+    ys = [float(p.y) for p in plan.all_well_positions]
+    # useq holds plate dimensions in mm; the stage speaks µm.
+    w, h = (float(v) * 1000.0 for v in plan.plate.well_size)
+    return PlateLayout(
+        names=names, x=xs, y=ys,
+        well_width_um=w, well_height_um=h,
+        circular=bool(plan.plate.circular_wells),
+        rows=int(plan.plate.rows), columns=int(plan.plate.columns),
+    )
+
+
+def nearest_well(cal: PlateCalibration, x: float, y: float
+                 ) -> tuple[str, float, float, float]:
+    """Well nearest a stage point: ``(name, well_x, well_y, distance_um)``."""
+    lay = layout(cal)
+    best = min(range(len(lay.names)),
+               key=lambda i: (lay.x[i] - x) ** 2 + (lay.y[i] - y) ** 2)
+    dist = math.hypot(lay.x[best] - x, lay.y[best] - y)
+    return lay.names[best], lay.x[best], lay.y[best], dist

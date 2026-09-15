@@ -11,8 +11,11 @@ served by the one process, sharing the viewer and file browser:
 - ``/review`` — review an exported training dataset (the output of
   ``nikon-control-export``): step through the images the model will actually
   be trained on and fix any wrong label.
+- ``/scope`` — drive the microscope itself through Micro-Manager: stage,
+  focus, PFS, camera, and registering the well plate against the stage. This
+  one needs the ``[scope]`` extra, not the model.
 
-``/`` lists all three. The data directory (folder of ND2 files + their sidecar
+``/`` lists them all. The data directory (folder of ND2 files + their sidecar
 JSONs) reaches the apps via the ``NIKON_CONTROL_DATA`` environment variable.
 
 Examples::
@@ -42,6 +45,12 @@ def main() -> None:
     p.add_argument("--dataset", default="",
                    help="exported dataset folder the /review dashboard opens "
                         "at startup (see nikon-control-export)")
+    p.add_argument("--mm-config", default="",
+                   help="Micro-Manager .cfg the /scope dashboard offers at "
+                        "startup (it still has to be connected by hand)")
+    p.add_argument("--plate", default="",
+                   help="plate calibration JSON the /scope dashboard loads at "
+                        "startup (see nikon-control-scope plate --json)")
     p.add_argument("--port", type=int, default=5006)
     p.add_argument("--address", default=None,
                    help="bind address. Omit for localhost (fine when users "
@@ -57,13 +66,18 @@ def main() -> None:
     apps_dir = Path(__file__).parent / "apps"
     server_scripts = [str(apps_dir / "annotate.py"),
                       str(apps_dir / "simple.py"),
-                      str(apps_dir / "review.py")]
+                      str(apps_dir / "review.py"),
+                      str(apps_dir / "scope.py")]
     env = dict(os.environ)
     env["NIKON_CONTROL_DATA"] = str(Path(args.data_dir).resolve())
     if args.weights:
         env["NIKON_CONTROL_WEIGHTS"] = str(Path(args.weights).resolve())
     if args.dataset:
         env["NIKON_CONTROL_DATASET"] = str(Path(args.dataset).resolve())
+    if args.mm_config:
+        env["NIKON_CONTROL_MM_CONFIG"] = str(Path(args.mm_config).resolve())
+    if args.plate:
+        env["NIKON_CONTROL_PLATE"] = str(Path(args.plate).resolve())
 
     cmd = [sys.executable, "-m", "bokeh", "serve", *server_scripts,
            "--port", str(args.port)]
@@ -79,6 +93,7 @@ def main() -> None:
     print(f"  full dashboard  : http://{host}:{args.port}/annotate")
     print(f"  simple dashboard: http://{host}:{args.port}/simple")
     print(f"  review dataset  : http://{host}:{args.port}/review")
+    print(f"  microscope      : http://{host}:{args.port}/scope")
     print("running:", " ".join(cmd))
     raise SystemExit(subprocess.call(cmd, env=env))
 
