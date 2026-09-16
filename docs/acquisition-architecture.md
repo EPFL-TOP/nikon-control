@@ -47,7 +47,7 @@ Why a document rather than a chain of calls:
 | # | Plugin | State | Reads → writes |
 |---|--------|-------|----------------|
 | 1 | Plate identify + calibrate | **done** | — → `plate` (type, `a1_center_xy`, `rotation`) |
-| 2 | Well selector | to build | `plate` → `wells` |
+| 2 | Well selector | **done** | `plate` → `wells` |
 | 3 | Well scanner | to build | `wells` → `scan` (frames + their stage coords) |
 | 4 | Cell identifier | model exists | `scan` → `detections` (bbox, class, score, stage coords) |
 | 5 | Position selector | to build | `detections` → `positions` (+ the filter that chose them) |
@@ -60,10 +60,12 @@ those into every well and field position. "Identify" is plate *type*
 selection today; automatic identification (barcode, or a low-mag corner
 image) is a later refinement, not a blocker.
 
-**2 — Well selector.** `useq.WellPlatePlan.selected_wells` already models
-this. What is missing is the obvious thing: a clickable plate map. The Plate
-tab already draws every well in stage coordinates, so this is an extension of
-a figure that exists.
+**2 — Well selector.** `scope/wells.py` + the Plate tab's map. Click wells to
+toggle, or type `A1:D6` / `C*` / `*3` / `all`. Produces a
+`useq.WellPlatePlan` with `selected_wells` set, and saves into the same JSON
+as the calibration. Visiting order is **serpentine** by default — alternate
+rows reversed, which more than halves the travel of a full-plate scan and so
+comes straight off the time budget.
 
 **3 — Well scanner.** A grid of fields per well
 (`useq.GridRowsColumns` with the camera's real FOV) run as an `MDASequence` in

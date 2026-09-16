@@ -191,12 +191,25 @@ def build(core=None, *, stand_adapter: str | None = None,
             core.initializeDevice(hub_label)
         except Exception as exc:
             result.failures.append((hub_name, f"hub failed: {exc}"))
-            why = (f"{stand.driver.dll} and the stand's power state are the "
-                   f"usual causes." if stand else
-                   "Check the adapter's own requirements.")
+            # Ordered by how often each is actually the cause. The first is
+            # the one people hit repeatedly and never guess, because the
+            # conflicting program is usually their own.
+            causes = [
+                "another program already owns the stand — only ONE connection "
+                "exists at a time, so close the /scope dashboard, other "
+                "`nikon-control-scope` runs, Micro-Manager's GUI, "
+                "NIS-Elements and Ti2 Control before building",
+                "the stand or its controller is powered off (power the stand "
+                "on BEFORE the controller box)",
+            ]
+            if stand:
+                causes.append(f"{stand.driver.dll} missing or the wrong "
+                              f"version (`nikon-control-scope stand --deep`)")
             result.notes.append(
                 f"The {library} hub would not initialise, so nothing below it "
-                f"can be found. {why}"
+                f"can be found. In order of likelihood: "
+                + "; ".join(f"({i + 1}) {c}" for i, c in enumerate(causes))
+                + "."
             )
             return result
         taken.add(hub_label)

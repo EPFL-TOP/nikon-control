@@ -323,7 +323,43 @@ There is also a jog guard: a relative move over 5 mm is refused, because a
 mistyped step is the classic way to crash an objective. Absolute moves are
 never guarded — crossing the plate is legitimate travel.
 
-## 6 · Register the plate against the stage
+## 6 · PFS: engaged, in range, and at the right offset
+
+Three different things, and only the third decides whether the image is
+sharp:
+
+| state | means |
+|---|---|
+| **engaged** | continuous focus is switched on |
+| **in range** | the IR beam can see the coverslip at all |
+| **offset** | where the focal plane sits *relative to* that coverslip |
+
+**A lock at the wrong offset focuses on the glass, not the cells.** PFS
+reports everything is fine and the image is blurry — which is the single most
+confusing failure on this microscope, because nothing looks broken.
+
+The procedure:
+
+1. PFS **off**. Use **Z ±** to bring the cells sharp by eye.
+2. **Engage PFS.** It locks, and may jump away from your plane — that is
+   expected, it has gone to whatever offset was stored.
+3. Use **Offset ±** to bring the cells sharp again. Do **not** use Z here:
+   PFS pulls straight back, which is exactly what "Z does nothing" feels like.
+4. Note the offset. It is a property of the dish and objective, not of the
+   sample, so it is reusable.
+
+Z and the offset are separate controls in the dashboard on purpose. An
+earlier version had one **Focus ±** that silently switched between them, with
+a step labelled in µm — but the PFS offset is in the offset device's own
+units, and one unit is not one micron. A control that lies about its units is
+worse than two controls.
+
+Two more things worth checking when PFS will not hold: the **objective in
+use** (its offset range differs per objective — `nikon-control-scope config
+MMConfig.cfg --properties` shows `Nosepiece.Label`), and `PFS.LEDIntensity`,
+the search LED, which can be too low for a dish with weak reflectivity.
+
+## 7 · Register the plate against the stage
 
 This is the step that makes every later position meaningful. A plate's
 geometry is fixed by its manufacturer, so locating it takes exactly **three
@@ -399,6 +435,59 @@ for pos in plan.image_positions:
 
 That list of positions is what the 40× scan will iterate over.
 
+## 8 · Choose the wells to image
+
+Once the plate is registered, the Plate tab's map is also the **well
+selector**. Click wells to toggle them (the mode switch turns clicks back
+into "drive there"), or type a range:
+
+| typed | means |
+|---|---|
+| `A1` | one well |
+| `B2-B5`, `A1:D6` | the rectangle between two corners |
+| `C*` | all of row C |
+| `*3` | all of column 3 |
+| `all` | every well |
+
+A typo is skipped rather than refused, and the count is shown — so compare
+what you asked for against what you got. Fill colour is the imaging
+selection; the gold outlines are the wells you measured for calibration, and
+the two are independent.
+
+**Serpentine order** is on by default: alternate rows are visited in reverse.
+A raster drives back across the whole plate at the end of every row; on a
+full 96-well plate that is more than twice the travel, which comes straight
+out of the time budget below.
+
+The selection is saved into the same JSON as the calibration, so one file
+describes both where the plate is and which wells matter. From a script:
+
+```python
+from nikon_control.scope import plate, wells
+
+cal = plate.load("plate.json")
+sel = wells.load_selection("plate.json")
+plan = sel.to_plan(cal)            # a useq.WellPlatePlan
+for pos in plan.image_positions:
+    print(pos.name, pos.x, pos.y)
+```
+
+## How long will a timepoint take?
+
+The `/scope` **Throughput** tab measures this microscope — stage settling,
+camera readout, PFS lock, channel switching — and answers "how many positions
+fit in one interval?". Nothing there is a default: the numbers that matter
+cannot be guessed, and anything it could not measure is listed as assumed.
+
+```
+per position = move + PFS lock + Σ channels(switch + expose + read)
+```
+
+Pick the channels, the interval and the movie length, and it reports the
+per-position cost, how many positions fit, and whether the number you want
+fits. 20% of the interval is held back as slack — a timelapse scheduled to
+the full interval drifts later at every timepoint.
+
 ## Testing without the microscope
 
 `pymmcore-plus` ships Micro-Manager's demo devices, so discovery, probing and
@@ -418,22 +507,6 @@ core.
 
 The plate calibration needs no hardware at all — it is pure geometry, and its
 tests round-trip against `useq`'s own forward model.
-
-## How long will a timepoint take?
-
-The `/scope` **Throughput** tab measures this microscope — stage settling,
-camera readout, PFS lock, channel switching — and answers "how many positions
-fit in one interval?". Nothing there is a default: the numbers that matter
-cannot be guessed, and anything it could not measure is listed as assumed.
-
-```
-per position = move + PFS lock + Σ channels(switch + expose + read)
-```
-
-Pick the channels, the interval and the movie length, and it reports the
-per-position cost, how many positions fit, and whether the number you want
-fits. 20% of the interval is held back as slack — a timelapse scheduled to
-the full interval drifts later at every timepoint.
 
 ## What is not built yet
 

@@ -46,7 +46,10 @@ def by_label(doc, label):
 
 
 def by_title(doc, title):
-    found = [m for m in doc.select({}) if getattr(m, "title", None) == title]
+    """A widget by its title — skipping TabPanel, which also has one."""
+    found = [m for m in doc.select({})
+             if getattr(m, "title", None) == title
+             and type(m).__name__ != "TabPanel"]
     assert found, f"no widget titled {title!r}"
     return found[0]
 
@@ -128,8 +131,10 @@ def test_register_a_plate_from_captured_stage_positions(doc):
     wells = widget(doc, "wells")
     assert len(wells.data["name"]) == 96, "the plate map was not drawn"
     assert "A1" in wells.data["name"]
-    # the captured wells are marked differently from the rest
-    assert len(set(wells.data["color"])) == 2
+    # the three measured wells are outlined differently from the rest;
+    # fill colour is reserved for the imaging selection
+    marked = [n for n, lw in zip(wells.data["name"], wells.data["lw"]) if lw > 1]
+    assert sorted(marked) == ["A1", "A12", "H1"]
 
     here = widget(doc, "here")
     assert here.data["x"], "the current position is not on the map"
@@ -314,3 +319,62 @@ def test_changing_the_interval_updates_the_budget_without_remeasuring(doc):
     after = widget(doc, "budget").text
     assert after != before, "the budget did not follow the interval"
     assert "60 min interval" in after
+
+
+@needs_demo
+def test_wells_can_be_selected_by_clicking_and_by_typing(doc, tmp_path):
+    """Plugin 2 through the GUI: pick wells, keep them, save them."""
+    click(doc, "demo")
+    # register a plate so the map exists
+    well_box = widget(doc, "well")
+    for name, x, y in [("A1", 1000.0, 2000.0),
+                       ("A12", 100000.0, 2000.0),
+                       ("H1", 1000.0, -61000.0)]:
+        goto(doc, x, y)
+        well_box.value = name
+        click(doc, "capture")
+    click(doc, "calibrate")
+
+    src = widget(doc, "wells")
+    assert len(src.data["name"]) == 96
+    assert set(src.data["color"]) == {"#e8e8e8"}, "nothing should start selected"
+
+    # type a range
+    widget(doc, "wells_text").value = "A1:B3"
+    click(doc, "wells_add")
+    assert "6</b> well(s)" in widget(doc, "wells_status").text
+    chosen = [n for n, c in zip(src.data["name"], src.data["color"])
+              if c == "#2f7ed8"]
+    assert sorted(chosen) == ["A1", "A2", "A3", "B1", "B2", "B3"]
+
+    # click a well on the map (mode defaults to select)
+    src.selected.indices = [src.data["name"].index("D6")]
+    assert "D6" in [n for n, c in zip(src.data["name"], src.data["color"])
+                    if c == "#2f7ed8"]
+    assert src.selected.indices == [], "the tap selection should be cleared"
+
+    # clicking it again deselects
+    src.selected.indices = [src.data["name"].index("D6")]
+    assert "D6" not in [n for n, c in zip(src.data["name"], src.data["color"])
+                        if c == "#2f7ed8"]
+
+
+@needs_demo
+def test_a_nonsense_well_range_is_reported_not_silently_ignored(doc):
+    click(doc, "demo")
+    widget(doc, "wells_text").value = "Q99"
+    click(doc, "wells_add")
+    assert "matched a well" in widget(doc, "wells_status").text
+
+
+@needs_demo
+def test_changing_plate_type_drops_wells_that_no_longer_exist(doc):
+    """H12 is not on a 6-well plate; carrying it over would break a scan."""
+    click(doc, "demo")
+    widget(doc, "wells_text").value = "H12"
+    click(doc, "wells_add")
+    assert "1</b> well(s)" in widget(doc, "wells_status").text
+
+    widget(doc, "plate_type").value = "6-well"
+    click(doc, "wells_none")          # touches the selection for the new plate
+    assert "no wells selected" in widget(doc, "wells_status").text

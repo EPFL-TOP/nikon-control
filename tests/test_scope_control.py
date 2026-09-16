@@ -360,3 +360,24 @@ def test_no_intensity_anywhere_raises_with_a_way_forward():
     assert s.intensity_property() is None
     with pytest.raises(ScopeError, match="--properties"):
         s.set_intensity(50)
+
+
+def test_scope_state_declares_every_field_it_reports(scope):
+    """Regression: a field set only on one branch of state().
+
+    `st.pfs_in_range = ...` inside an `if` created the attribute on some
+    calls and not others, so a reader crashed with AttributeError exactly
+    when PFS was absent — the case it existed to describe.
+    """
+    import dataclasses
+
+    from nikon_control.scope.control import ScopeState
+
+    declared = {f.name for f in dataclasses.fields(ScopeState)}
+    no_pfs = Scope(FakeCore(), {"camera": "Cam"}).state()
+    assert set(vars(no_pfs)) <= declared, \
+        f"state() invented fields: {set(vars(no_pfs)) - declared}"
+    assert set(vars(scope.state())) <= declared
+    # and every declared field is readable on a bare instance
+    for name in declared:
+        getattr(ScopeState(), name)

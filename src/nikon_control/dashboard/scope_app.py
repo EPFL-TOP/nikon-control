@@ -32,7 +32,8 @@ from pathlib import Path
 import numpy as np
 
 from ..scope import (channels as channels_mod, config_build,
-                     plate as plate_mod, timing as timing_mod)
+                     plate as plate_mod, timing as timing_mod,
+                     wells as wells_mod)
 from ..scope.control import Scope, ScopeError
 from .common import build_image_figure, contrast_bounds
 
@@ -67,6 +68,7 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
         Div,
         MultiChoice,
         RangeSlider,
+        RadioButtonGroup,
         Select,
         Slider,
         Spinner,
@@ -91,6 +93,7 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
         # value the user set, four times a second.
         "syncing": False,
         "timings": None,        # timing_mod.Timings once measured
+        "sel": None,            # wells_mod.Selection
     }
 
     # ------------------------------------------------------------- connect
@@ -132,11 +135,17 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
     goto_y = Spinner(title="Y (µm)", value=0, step=100, width=110)
     goto_btn = Button(label="Go to XY", width=100)
 
-    zstep_spin = Spinner(title="Focus step (µm)", low=0.01, high=500,
-                         step=0.5, value=1.0, width=120)
-    zup_btn = Button(label="Focus +", width=90)
-    zdn_btn = Button(label="Focus −", width=90)
-    focus_note = Div(text="", width=380,
+    zstep_spin = Spinner(title="Z step (µm)", low=0.01, high=500,
+                         step=0.5, value=1.0, width=110)
+    zup_btn = Button(label="Z +", width=70, name="z_up")
+    zdn_btn = Button(label="Z −", width=70)
+    offstep_spin = Spinner(title="Offset step", low=0.01, high=10000,
+                           step=1, value=10, width=110)
+    offup_btn = Button(label="Offset +", width=90, name="offset_up")
+    offdn_btn = Button(label="Offset −", width=90)
+    offset_spin = Spinner(title="PFS offset", step=1, value=0, width=130,
+                          name="pfs_offset")
+    focus_note = Div(text="", width=400,
                      styles={"font-size": "11px", "color": "#666"})
 
     light_div = Div(text=_badge("light —", _DIM), width=380, name="light")
@@ -186,7 +195,7 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
 
     # --------------------------------------------------------------- plate
     plate_sel = Select(title="Plate", options=PLATE_TYPES, value="96-well",
-                       width=130)
+                       width=130, name="plate_type")
     well_input = TextInput(title="Well", value="A1", width=80, name="well")
     capture_btn = Button(label="Capture current XY", button_type="primary",
                          width=160, name="capture")
@@ -202,21 +211,34 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
     save_btn = Button(label="Save", width=80)
     load_btn = Button(label="Load", width=80)
 
+    # Selection and reference are independent states, so they use
+    # independent channels: fill says selected, outline says measured.
     well_src = ColumnDataSource({"name": [], "x": [], "y": [], "w": [],
-                                 "h": [], "color": []}, name="wells")
+                                 "h": [], "color": [], "line": [],
+                                 "lw": []}, name="wells")
     here_src = ColumnDataSource({"x": [], "y": []}, name="here")
     pmap = figure(width=520, height=380, match_aspect=True,
                   tools="pan,wheel_zoom,reset", title="plate not registered",
                   x_axis_label="stage x (µm)", y_axis_label="stage y (µm)")
     well_r = pmap.ellipse(x="x", y="y", width="w", height="h", source=well_src,
-                          fill_color="color", fill_alpha=0.25,
-                          line_color="#555", line_width=1,
-                          selection_fill_alpha=0.6,
-                          nonselection_fill_alpha=0.25)
+                          fill_color="color", fill_alpha=0.55,
+                          line_color="line", line_width="lw",
+                          selection_fill_alpha=0.75,
+                          nonselection_fill_alpha=0.55)
     pmap.scatter(x="x", y="y", source=here_src, marker="cross", size=18,
                  line_color=_BAD, line_width=3)
     pmap.add_tools(TapTool(renderers=[well_r]))
-    goto_well_tog = Toggle(label="🔒 click a well to drive there", width=250)
+    click_mode = RadioButtonGroup(labels=["click = select", "click = drive"],
+                                  active=0, width=260, name="click_mode")
+    wells_text = TextInput(title="Wells (A1, B2-B5, C*, *3, A1:D6, all)",
+                           value="", width=330, name="wells_text")
+    wells_add = Button(label="Select", width=80, name="wells_add")
+    wells_sub = Button(label="Deselect", width=90)
+    wells_all = Button(label="All", width=60)
+    wells_none = Button(label="None", width=70, name="wells_none")
+    wells_div = Div(text="", width=520, name="wells_status")
+    serp_ck = CheckboxGroup(labels=["serpentine order (halves travel)"],
+                            active=[0], width=280)
 
     # ------------------------------------------------------------ helpers
 
@@ -276,6 +298,21 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
 
     # ------------------------------------------------------------- connect
 
+    def _release() -> None:
+        """Drop the current connection before making another.
+
+        Only one connection to the stand exists at a time, so replacing a
+        Scope without closing the old one makes the new one fail — and the
+        failure looks like broken hardware rather than a held handle.
+        """
+        old = state.get("scope")
+        state["scope"] = None
+        if old is not None:
+            try:
+                old.close()
+            except Exception:
+                pass
+
     def _after_connect(s: Scope, what: str) -> None:
         state["scope"] = s
         named = ", ".join(f"<b>{r}</b>={n}" for r, n in s.roles.items())
@@ -300,12 +337,14 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
         if not Path(path).exists():
             say(f"no such file: {path}", _BAD)
             return
+        _release()
         try:
             _after_connect(Scope.from_config(path), Path(path).name)
         except Exception as exc:                        # noqa: BLE001
             say(f"could not load configuration: {exc}", _BAD)
 
     def do_demo() -> None:
+        _release()
         try:
             _after_connect(Scope.demo(), "demo devices")
         except Exception as exc:                        # noqa: BLE001
@@ -325,6 +364,11 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
         doc.add_next_tick_callback(lambda: _build_now(out))
 
     def _build_now(out: str) -> None:
+        # The build opens its own core and initialises the stand. If this
+        # session is still connected, that second connection is refused and
+        # the build reports a hub that would not initialise — so let go first.
+        _release()
+        core = None
         try:
             core = config_build.new_core()
             result = config_build.build(core)
@@ -333,11 +377,13 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
             return
         if not result.devices:
             say("; ".join(result.notes) or "nothing connected", _BAD)
+            _unload(core)
             return
         try:
             Path(out).write_text(config_build.to_text(result, core))
         except Exception as exc:                        # noqa: BLE001
             say(f"built, but could not write {out}: {exc}", _BAD)
+            _unload(core)
             return
         cfg_input.value = out
         failed = (f" — {len(result.failures)} device(s) did not connect"
@@ -347,12 +393,22 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
             + ("<br>did not connect: " +
                ", ".join(f"{n} ({w})" for n, w in result.failures[:6])
                if result.failures else ""))
-        # The build left a core holding the hardware; connect through the
-        # file instead, so what runs from here on is what the file says.
+        # The build's core still holds the hardware. Release it before
+        # loading the file, or the reload hits the same one-connection limit
+        # the build just escaped.
+        _unload(core)
         try:
             _after_connect(Scope.from_config(out), Path(out).name)
         except Exception as exc:                        # noqa: BLE001
             say(f"wrote {out} but could not load it: {exc}", _BAD)
+
+    def _unload(core) -> None:
+        if core is None:
+            return
+        try:
+            core.unloadAllDevices()
+        except Exception:
+            pass
 
     connect_btn.on_click(do_connect)
     demo_btn.on_click(do_demo)
@@ -420,8 +476,18 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
     right_btn.on_click(guard(lambda s: s.move_xy_by(float(step_spin.value), 0)))
     goto_btn.on_click(guard(lambda s: s.move_xy(float(goto_x.value),
                                                 float(goto_y.value))))
-    zup_btn.on_click(guard(lambda s: s.focus_by(float(zstep_spin.value))))
-    zdn_btn.on_click(guard(lambda s: s.focus_by(-float(zstep_spin.value))))
+    # Z and the PFS offset are separate controls on purpose. A single
+    # "Focus ±" that silently switched between them would be labelled in µm
+    # while moving a device whose units are not µm — the offset is in the
+    # offset device's own units, and one unit is not one micron.
+    zup_btn.on_click(guard(lambda s: s.move_z_by(float(zstep_spin.value))))
+    zdn_btn.on_click(guard(lambda s: s.move_z_by(-float(zstep_spin.value))))
+    offup_btn.on_click(guard(
+        lambda s: s.set_pfs_offset(s.pfs_offset() + float(offstep_spin.value))))
+    offdn_btn.on_click(guard(
+        lambda s: s.set_pfs_offset(s.pfs_offset() - float(offstep_spin.value))))
+    offset_spin.on_change("value", guard_change(
+        lambda s, new: s.set_pfs_offset(float(new))))
 
     def on_intensity(attr, old, new) -> None:
         if state["syncing"] or new == old:
@@ -579,19 +645,74 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
         if cal is None:
             well_src.data = {k: [] for k in well_src.data}
             pmap.title.text = "plate not registered"
+            # Wells can be chosen before the plate is registered — the names
+            # come from the plate type, not from the calibration — so the
+            # count must still update even with no map to draw.
+            show_wells()
             return
         lay = plate_mod.layout(cal)
         captured = {r.name.upper() for r in state["refs"]}
+        sel = selection()
+        chosen = set(sel.wells) if sel else set()
         well_src.data = {
             "name": lay.names, "x": lay.x, "y": lay.y,
             "w": [lay.well_width_um] * len(lay.names),
             "h": [lay.well_height_um] * len(lay.names),
-            # the wells that were actually measured, marked
-            "color": ["#ffcc00" if n.upper() in captured else "#4a90d9"
+            # fill = selected for imaging; outline = measured for calibration
+            "color": ["#2f7ed8" if n.upper() in chosen else "#e8e8e8"
                       for n in lay.names],
+            "line": ["#ffb400" if n.upper() in captured else "#9a9a9a"
+                     for n in lay.names],
+            "lw": [3 if n.upper() in captured else 1 for n in lay.names],
         }
         pmap.title.text = (f"{cal.plate} · rotation {cal.rotation:+.3f}° · "
-                           f"residual {cal.residual_um:.0f} µm")
+                           f"residual {cal.residual_um:.0f} µm · "
+                           f"{len(chosen)} well(s) selected")
+        show_wells()
+
+    def selection():
+        """The live selection, created (and re-created) for the current plate."""
+        sel = state.get("sel")
+        want = plate_sel.value
+        if sel is None or sel.plate != want:
+            # A plate-type change invalidates the well names entirely, so
+            # carrying the old set over would silently keep wells that do not
+            # exist on the new plate.
+            sel = wells_mod.Selection(want)
+            state["sel"] = sel
+        return sel
+
+    def show_wells() -> None:
+        sel = selection()
+        n = len(sel.wells)
+        if not n:
+            wells_div.text = ("<i>no wells selected — click wells on the map, "
+                              "or type a range above</i>")
+            return
+        order = (sel.serpentine() if serp_ck.active else sel.ordered())
+        shown = ", ".join(order[:16]) + (" …" if len(order) > 16 else "")
+        wells_div.text = (f"<b>{n}</b> well(s), visiting order: {shown}")
+
+    def _apply_wells(add: bool) -> None:
+        sel = selection()
+        text = wells_text.value.strip()
+        if not text:
+            wells_div.text = _badge("type a well range first", _WARN)
+            return
+        names = wells_mod.parse(sel.plate, text)
+        if not names:
+            wells_div.text = _badge(
+                f"nothing in {text!r} matched a well on a {sel.plate} plate",
+                _WARN)
+            return
+        sel.add(names) if add else sel.remove(names)
+        redraw_plate()
+
+    wells_add.on_click(lambda: _apply_wells(True))
+    wells_sub.on_click(lambda: _apply_wells(False))
+    wells_all.on_click(lambda: (selection().select_all(), redraw_plate()))
+    wells_none.on_click(lambda: (selection().clear(), redraw_plate()))
+    serp_ck.on_change("active", lambda a, o, n: show_wells())
 
     def show_refs() -> None:
         if not state["refs"]:
@@ -673,7 +794,12 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
             return
         try:
             plate_mod.save(state["cal"], plate_file.value)
-            cal_div.text = _badge(f"saved to {plate_file.value}", _OK)
+            sel = selection()
+            if sel.wells:
+                wells_mod.save_selection(sel, plate_file.value)
+            cal_div.text = _badge(
+                f"saved to {plate_file.value}"
+                + (f" with {len(sel.wells)} well(s)" if sel.wells else ""), _OK)
         except Exception as exc:                        # noqa: BLE001
             cal_div.text = _badge(f"could not save: {exc}", _BAD)
 
@@ -685,7 +811,9 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
             return
         state["cal"] = cal
         if cal.plate in PLATE_TYPES:
-            plate_sel.value = cal.plate
+            sync(plate_sel, cal.plate)
+        state["sel"] = (wells_mod.load_selection(plate_file.value)
+                        or wells_mod.Selection(cal.plate))
         cal_div.text = _badge("loaded", _OK) + " " + cal.describe()
         redraw_plate()
         refresh()
@@ -700,14 +828,13 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
         name = well_src.data["name"][idx]
         wx = well_src.data["x"][idx]
         wy = well_src.data["y"][idx]
-        if not goto_well_tog.active:
-            say(f"{name} at ({wx:.0f}, {wy:.0f}) µm — arm the toggle to drive "
-                f"there", _DIM)
-            well_src.selected.indices = []
+        well_src.selected.indices = []
+        if click_mode.active == 0:
+            selection().toggle(name)
+            redraw_plate()
             return
         run(lambda s: s.move_xy(wx, wy))
         say(f"moved to {name}", _OK)
-        well_src.selected.indices = []
 
     well_src.selected.on_change("indices", on_well_tap)
 
@@ -743,9 +870,14 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
             pfs_div.text = _badge("PFS on — not locked", _WARN)
         else:
             pfs_div.text = _badge("PFS off", _DIM)
+        if st.pfs_in_range is False:
+            pfs_div.text += " " + _badge("out of range", _BAD)
+        elif st.pfs_in_range is True:
+            pfs_div.text += " " + _badge("in range", _DIM)
         if st.pfs_offset is not None:
-            pfs_div.text += f" <span style='font-family:monospace'>" \
-                            f"offset {st.pfs_offset:.1f}</span>"
+            pfs_div.text += (f" <span style='font-family:monospace'>"
+                             f"offset {st.pfs_offset:.1f}</span>")
+            sync(offset_spin, st.pfs_offset)
 
         # "Why is my image black?" is answered here rather than left to be
         # guessed at: a config with no shutter cannot turn a light on at all.
@@ -788,11 +920,20 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
         finally:
             state["syncing"] = False
 
-        focus_note.text = (
-            "Focus ± moves the <b>PFS offset</b> (the only control that "
-            "changes focus while locked)." if st.pfs_locked and
-            st.pfs_offset is not None else
-            "Focus ± moves the <b>Z drive</b>.")
+        if st.pfs_locked:
+            focus_note.text = (
+                "PFS is holding, so <b>Z is not the focus control</b> — it "
+                "moves and PFS pulls straight back. Use <b>Offset ±</b>: it "
+                "is what sets where the focal plane sits relative to the "
+                "coverslip. <i>A lock at the wrong offset focuses on the "
+                "glass, not the cells — which looks blurry while PFS reports "
+                "everything is fine.</i>")
+        elif st.pfs_available and not st.pfs_engaged:
+            focus_note.text = ("PFS is off: <b>Z ±</b> moves focus. Engage "
+                               "PFS, then use <b>Offset ±</b> to bring the "
+                               "cells sharp, and reuse that offset.")
+        else:
+            focus_note.text = "<b>Z ±</b> moves the focus drive."
 
         if st.objectives:
             sync(obj_sel, st.objectives, "options")
@@ -829,6 +970,7 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
         pos_div,
         row(jog, column(step_spin, row(goto_x, goto_y), goto_btn)),
         row(zdn_btn, zup_btn, zstep_spin),
+        row(offdn_btn, offup_btn, offstep_spin, offset_spin),
         focus_note,
         light_div,
         row(shutter_tog, autoshut_ck),
@@ -848,7 +990,12 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
         row(plate_sel, well_input, capture_btn, clear_btn, calib_btn),
         suggest_div, refs_div, cal_div,
         row(plate_file, column(Div(text="<br>"), row(save_btn, load_btn))),
-        goto_well_tog, pmap,
+        Div(text="<b>Wells to image</b>", styles={"margin-top": "6px"}),
+        row(wells_text, column(Div(text="<br>"),
+                               row(wells_add, wells_sub, wells_all,
+                                   wells_none))),
+        row(click_mode, serp_ck),
+        wells_div, pmap,
     )
 
     channel_panel = column(

@@ -115,6 +115,7 @@ class ScopeState:
     pfs_engaged: bool = False
     pfs_locked: bool = False
     pfs_offset: float | None = None
+    pfs_in_range: bool | None = None
     objective: str = ""
     objectives: list[str] = field(default_factory=list)
     channel: str = ""
@@ -166,6 +167,28 @@ class Scope:
         core = CMMCorePlus()
         core.loadSystemConfiguration()      # ships as the demo config
         return cls(core)
+
+    def close(self) -> None:
+        """Release the hardware.
+
+        Only one connection to a Nikon stand exists at a time: while this
+        core holds the hub, a second core — another dashboard session, a
+        `nikon-control-scope build`, NIS-Elements, Ti2 Control — cannot
+        initialise it. So anything that replaces a Scope must close the old
+        one first, or the replacement fails with a hub that "would not
+        initialise" and no hint that the cause is the previous connection.
+        """
+        try:
+            self.core.unloadAllDevices()
+        except Exception:
+            pass
+        self.roles = {}
+
+    def __enter__(self) -> "Scope":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
 
     def _discover_roles(self) -> dict[str, str]:
         """Core roles are authoritative; stand resolution fills the rest.
@@ -347,6 +370,40 @@ class Scope:
     def disengage_pfs(self) -> None:
         self._require("autofocus")
         self.core.enableContinuousFocus(False)
+
+    def pfs_in_range(self) -> bool | None:
+        """Can PFS see the coverslip at all? Distinct from being locked.
+
+        "In range" means the IR beam is finding the glass; "locked" means it
+        is holding. A dish outside the search range never locks, and a lock
+        at the wrong OFFSET holds a plane that is nowhere near the cells —
+        which looks like a focus that is working but blurry.
+
+        Returns None when the device exposes no such property.
+        """
+        if not self.pfs_available():
+            return None
+        for info in self.properties("autofocus"):
+            if "range" in info.name.lower():
+                return "in range" in info.value.lower() or info.value in ("1", "Yes")
+        return None
+
+    def pfs_details(self) -> list[PropertyInfo]:
+        """The PFS device's own properties — its offset range, IR LED, status.
+
+        Worth surfacing: the search LED intensity and the objective in use
+        both change whether a lock is even possible.
+        """
+        return self.properties("autofocus") if self.pfs_available() else []
+
+    def pfs_offset_limits(self) -> tuple[float, float] | None:
+        """The offset device's travel, if it declares any."""
+        if not self.has("pfsoffset"):
+            return None
+        for info in self.properties("pfsoffset"):
+            if info.numeric and "position" in info.name.lower():
+                return (info.lower, info.upper)
+        return None
 
     def pfs_offset(self) -> float:
         return float(self.core.getPosition(self._require("pfsoffset")))
@@ -632,6 +689,8 @@ class Scope:
             st.pfs_locked = bool(attempt("pfs lock", self.pfs_locked))
         if self.has("pfsoffset"):
             st.pfs_offset = attempt("pfs offset", self.pfs_offset)
+        if st.pfs_available:
+            st.pfs_in_range = attempt("pfs range", self.pfs_in_range)
         if self.has("nosepiece"):
             st.objective = attempt("objective", self.objective) or ""
             st.objectives = attempt("objectives", self.objectives) or []
