@@ -31,7 +31,8 @@ from pathlib import Path
 
 import numpy as np
 
-from ..scope import config_build, plate as plate_mod
+from ..scope import (channels as channels_mod, config_build,
+                     plate as plate_mod, timing as timing_mod)
 from ..scope.control import Scope, ScopeError
 from .common import build_image_figure, contrast_bounds
 
@@ -64,10 +65,13 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
         CheckboxGroup,
         ColumnDataSource,
         Div,
+        MultiChoice,
         RangeSlider,
         Select,
         Slider,
         Spinner,
+        TabPanel,
+        Tabs,
         TapTool,
         TextInput,
         Toggle,
@@ -86,6 +90,7 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
         # a user asking to rotate the turret — and the poll would fight every
         # value the user set, four times a second.
         "syncing": False,
+        "timings": None,        # timing_mod.Timings once measured
     }
 
     # ------------------------------------------------------------- connect
@@ -149,6 +154,35 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
 
     obj_sel = Select(title="Objective", options=[], value="", width=230)
     obj_ok = CheckboxGroup(labels=["allow turret move"], active=[], width=230)
+
+    # ------------------------------------------------------------ channels
+    chan_name = TextInput(title="New channel name", value="BF", width=150,
+                          name="channel_name")
+    chan_capture = Button(label="Capture current settings", width=200,
+                          button_type="primary", name="capture_channel")
+    chan_exposure_ck = CheckboxGroup(labels=["include exposure"], active=[0],
+                                     width=160)
+    chan_div = Div(text="", width=520, name="channel_status")
+    chan_list = Div(text="", width=520, styles={"font-size": "12px"})
+
+    # ---------------------------------------------------------- throughput
+    acq_channels = MultiChoice(title="Channels per position", value=[],
+                               options=[], width=340, name="acq_channels")
+    interval_spin = Spinner(title="Interval (min)", low=0.1, high=600,
+                            step=1, value=5, width=110)
+    duration_spin = Spinner(title="Movie length (h)", low=0.1, high=200,
+                            step=1, value=10, width=120)
+    npos_spin = Spinner(title="Positions wanted", low=1, high=10000, step=10,
+                        value=100, width=130)
+    movedist_spin = Spinner(title="Typical hop (µm)", low=0, high=100000,
+                            step=100, value=2000, width=130)
+    measure_btn = Button(label="⏱ Measure on the microscope", width=230,
+                         button_type="primary", name="measure")
+    timing_div = Div(text="<i>press Measure — the numbers that matter "
+                          "(stage settling, readout, PFS lock) cannot be "
+                          "guessed.</i>", width=520, name="timing")
+    budget_div = Div(text="", width=520, name="budget",
+                     styles={"font-size": "14px"})
 
     # --------------------------------------------------------------- plate
     plate_sel = Select(title="Plate", options=PLATE_TYPES, value="96-well",
@@ -253,7 +287,9 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
         else:
             say(f"connected: {what}", _OK)
         sync(obj_sel, s.objectives(), "options")
-        sync(channel_sel, s.channels(), "options")
+        show_channels()
+        for warning in s.role_warnings:
+            roles_div.text += f"<br><b style='color:#b36b00'>{warning}</b>"
         refresh()
 
     def do_connect() -> None:
@@ -425,6 +461,116 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
         run(lambda sc: sc.set_objective(new, confirm=True))
 
     obj_sel.on_change("value", on_objective)
+
+    # ------------------------------------------------------------ channels
+
+    def show_channels() -> None:
+        s = scope()
+        if s is None:
+            return
+        names = s.channels()
+        sync(channel_sel, names, "options")
+        sync(acq_channels, names, "options")
+        chan_list.text = ("channels: " + ", ".join(f"<b>{n}</b>" for n in names)
+                          if names else
+                          "<i>no channels defined yet — set the light path, "
+                          "filters and intensity by eye, then capture</i>")
+
+    def do_capture_channel() -> None:
+        s = scope()
+        if s is None:
+            say("not connected", _WARN)
+            return
+        name = chan_name.value.strip()
+        if not channels_mod.valid_name(name):
+            chan_div.text = _badge("give a name without commas", _WARN)
+            return
+        try:
+            preset = channels_mod.capture(
+                s, name, with_exposure=bool(chan_exposure_ck.active))
+        except Exception as exc:                        # noqa: BLE001
+            chan_div.text = _badge(f"capture failed: {exc}", _BAD)
+            return
+        if not preset.settings:
+            chan_div.text = _badge(
+                "nothing to capture — no shutters, filter turrets or light "
+                "path in this configuration", _WARN)
+            return
+        # Define it in the running core so it works now, and write it to the
+        # .cfg so it survives a restart.
+        try:
+            channels_mod.apply_to_core(s, preset)
+        except Exception as exc:                        # noqa: BLE001
+            chan_div.text = _badge(f"could not define it live: {exc}", _BAD)
+            return
+        target = cfg_input.value.strip()
+        written = ""
+        if target and Path(target).exists():
+            try:
+                channels_mod.append_to_config(target, preset)
+                written = f" and saved to {Path(target).name}"
+            except Exception as exc:                    # noqa: BLE001
+                written = f" (but could not write the .cfg: {exc})"
+        chan_div.text = (_badge(f"channel {name!r} defined{written}", _OK)
+                         + f"<br><span style='font-size:11px'>"
+                         f"{preset.describe()}</span>")
+        show_channels()
+
+    chan_capture.on_click(do_capture_channel)
+
+    # ---------------------------------------------------------- throughput
+
+    def do_measure() -> None:
+        s = scope()
+        if s is None:
+            say("not connected", _WARN)
+            return
+        wanted = list(acq_channels.value) or None
+        timing_div.text = ("<i>measuring — the stage will move and the camera "
+                           "will snap a few times…</i>")
+        doc.add_next_tick_callback(lambda: _measure_now(wanted))
+
+    def _measure_now(wanted) -> None:
+        s = scope()
+        if s is None:
+            return
+        try:
+            t = timing_mod.measure(s, channels=wanted)
+        except Exception as exc:                        # noqa: BLE001
+            timing_div.text = _badge(f"measurement failed: {exc}", _BAD)
+            return
+        state["timings"] = t
+        timing_div.text = ("<b>measured</b><br><pre style='margin:4px 0;"
+                           "font-size:12px'>"
+                           + "\n".join(t.describe()) + "</pre>")
+        recompute_budget()
+
+    def recompute_budget() -> None:
+        t = state.get("timings")
+        if t is None:
+            return
+        chans = list(acq_channels.value) or [""]
+        budget = timing_mod.plan(
+            t, chans,
+            interval_s=float(interval_spin.value) * 60.0,
+            requested=int(npos_spin.value),
+            move_um=float(movedist_spin.value),
+            refocus=True,
+            duration_h=float(duration_spin.value),
+        )
+        colour = _OK if budget.fits else _BAD
+        lines = budget.describe()
+        budget_div.text = (
+            _badge("fits" if budget.fits else "does not fit", colour)
+            + "<br>" + "<br>".join(lines)
+            + "<br><span style='font-size:11px;color:#666'>20% of the "
+              "interval is held back as slack — a timelapse scheduled to the "
+              "full interval drifts later at every timepoint.</span>")
+
+    measure_btn.on_click(do_measure)
+    for w in (interval_spin, duration_spin, npos_spin, movedist_spin):
+        w.on_change("value", lambda attr, old, new: recompute_budget())
+    acq_channels.on_change("value", lambda attr, old, new: recompute_budget())
 
     # --------------------------------------------------------------- plate
 
@@ -652,8 +798,9 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
             sync(obj_sel, st.objectives, "options")
         if st.objective:
             sync(obj_sel, st.objective)
-        if st.channels:
+        if st.channels and list(channel_sel.options) != list(st.channels):
             sync(channel_sel, st.channels, "options")
+            sync(acq_channels, st.channels, "options")
         if st.channel:
             sync(channel_sel, st.channel)
         if st.exposure_ms is not None:
@@ -671,7 +818,7 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
         toolbar_location=None, merge_tools=False)
 
     connect_panel = column(
-        Div(text="<h3 style='margin:0'>1 · Connect</h3>"),
+        Div(text="<h3 style='margin:0'>Connect</h3>"),
         row(cfg_input,
             column(Div(text="<br>"),
                    row(connect_btn, build_btn, demo_btn))),
@@ -679,7 +826,6 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
     )
 
     drive_panel = column(
-        Div(text="<h3 style='margin:0'>2 · Drive</h3>"),
         pos_div,
         row(jog, column(step_spin, row(goto_x, goto_y), goto_btn)),
         row(zdn_btn, zup_btn, zstep_spin),
@@ -699,17 +845,41 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
     )
 
     plate_panel = column(
-        Div(text="<h3 style='margin:0'>3 · Plate</h3>"),
         row(plate_sel, well_input, capture_btn, clear_btn, calib_btn),
         suggest_div, refs_div, cal_div,
         row(plate_file, column(Div(text="<br>"), row(save_btn, load_btn))),
         goto_well_tog, pmap,
     )
 
-    doc.add_root(column(
-        connect_panel,
-        row(image_panel, column(drive_panel, plate_panel)),
-    ))
+    channel_panel = column(
+        Div(text="<b>Define a channel</b><br>"
+                 "<span style='font-size:12px;color:#666'>Set the light path, "
+                 "filter turret, shutter and intensity by eye — then capture "
+                 "what the microscope is doing. The objective, stage and "
+                 "focus are never captured.</span>"),
+        row(chan_name, chan_exposure_ck),
+        chan_capture, chan_div, chan_list,
+    )
+
+    throughput_panel = column(
+        Div(text="<b>How many positions fit in one timepoint?</b><br>"
+                 "<span style='font-size:12px;color:#666'>Measured on this "
+                 "microscope: stage settling, camera readout, PFS lock and "
+                 "channel switching.</span>"),
+        acq_channels,
+        row(interval_spin, duration_spin),
+        row(npos_spin, movedist_spin),
+        measure_btn, timing_div, budget_div,
+    )
+
+    tabs = Tabs(tabs=[
+        TabPanel(child=drive_panel, title="Drive"),
+        TabPanel(child=plate_panel, title="Plate"),
+        TabPanel(child=channel_panel, title="Channels"),
+        TabPanel(child=throughput_panel, title="Throughput"),
+    ], width=560)
+
+    doc.add_root(column(connect_panel, row(image_panel, tabs)))
     doc.title = "Nikon scope control"
 
     do_suggest()

@@ -130,6 +130,18 @@ def _setting_property(scope, label: str) -> str | None:
     return None
 
 
+def apply_to_core(scope, preset: Preset, group: str = DEFAULT_GROUP) -> None:
+    """Define the preset in the *running* core, so it works immediately.
+
+    Writing it to the ``.cfg`` alone would mean restarting before the new
+    channel appeared. Doing both means the file is the record and the core is
+    usable now.
+    """
+    for s in preset.settings:
+        scope.core.defineConfig(group, preset.name, s.device, s.property,
+                                str(s.value))
+
+
 def groups(scope) -> dict[str, list[str]]:
     """Config groups already defined, and the presets in each."""
     out: dict[str, list[str]] = {}

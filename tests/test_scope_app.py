@@ -250,3 +250,67 @@ def test_light_panel_names_the_missing_device_when_there_is_none(doc,
     text = widget(doc, "light").text
     assert "no light control" in text
     assert "dark frame is expected" in text
+
+
+def _drain_next_ticks(doc):
+    for cb in list(doc.callbacks.session_callbacks):
+        if type(cb).__name__ == "NextTickCallback":
+            cb.callback()
+
+
+@needs_demo
+def test_define_a_channel_from_the_gui(doc, tmp_path):
+    """The user should not have to run a CLI command to get a channel."""
+    cfg = tmp_path / "MMConfig.cfg"
+    cfg.write_text("Property,Core,Initialize,1\n")
+    by_title(doc, "Micro-Manager configuration (.cfg)").value = str(cfg)
+    click(doc, "demo")
+
+    widget(doc, "channel_name").value = "MyBF"
+    click(doc, "capture_channel")
+
+    assert "defined" in widget(doc, "channel_status").text
+    # live in the running core...
+    assert "MyBF" in by_title(doc, "Channel").options
+    # ...and persisted, so it survives a restart
+    assert "ConfigGroup,Channel,MyBF" in cfg.read_text()
+
+
+@needs_demo
+def test_a_channel_name_with_a_comma_is_refused(doc):
+    click(doc, "demo")
+    widget(doc, "channel_name").value = "bad,name"
+    click(doc, "capture_channel")
+    assert "without commas" in widget(doc, "channel_status").text
+
+
+@needs_demo
+def test_throughput_measures_and_answers_the_question(doc):
+    """'How many cells can we image in a 5 min interval?'"""
+    click(doc, "demo")
+    acq = widget(doc, "acq_channels")
+    acq.value = list(acq.options)[:3]
+
+    click(doc, "measure")
+    assert "measuring" in widget(doc, "timing").text
+    _drain_next_ticks(doc)
+
+    assert "measured" in widget(doc, "timing").text
+    budget = widget(doc, "budget").text
+    assert "positions fit" in budget
+    assert "per position" in budget
+    assert "timepoints over" in budget
+
+
+@needs_demo
+def test_changing_the_interval_updates_the_budget_without_remeasuring(doc):
+    click(doc, "demo")
+    click(doc, "measure")
+    _drain_next_ticks(doc)
+    before = widget(doc, "budget").text
+
+    by_title(doc, "Interval (min)").value = 60
+
+    after = widget(doc, "budget").text
+    assert after != before, "the budget did not follow the interval"
+    assert "60 min interval" in after

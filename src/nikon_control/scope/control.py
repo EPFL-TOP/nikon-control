@@ -34,7 +34,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .stand import ROLES, resolve_roles
+from .stand import ROLES, resolve_roles, role_excluded
 
 # A jog larger than this is refused unless the caller says it means it. The
 # stage travels ~10 cm; a mistyped step has crashed objectives into plates.
@@ -141,6 +141,7 @@ class Scope:
     def __init__(self, core, roles: dict[str, str] | None = None,
                  timeout_ms: int = DEVICE_TIMEOUT_MS):
         self.core = core
+        self.role_warnings: list[str] = []
         try:
             core.setTimeoutMs(int(timeout_ms))
         except Exception:
@@ -196,8 +197,34 @@ class Scope:
                                           _type_name(core.getDeviceType(label))))
             except Exception:
                 continue
-        for role, name in resolve_roles(labelled).items():
+        resolved = resolve_roles(labelled)
+        for role, name in resolved.items():
             roles.setdefault(role, name)
+
+        # A configuration can name a device that cannot possibly fill its
+        # role — a .cfg written before the Ti2's TIRF positioners were
+        # excluded still says the XY stage is TIRF1. Honouring that drives
+        # the wrong axis and looks exactly like broken stage hardware, so
+        # refuse it rather than pass it through.
+        for role, name in list(roles.items()):
+            if not role_excluded(name, role):
+                continue
+            replacement = resolved.get(role, "")
+            if replacement and replacement != name:
+                roles[role] = replacement
+                self.role_warnings.append(
+                    f"the configuration names {name!r} as the {role}, which "
+                    f"can never be one — using {replacement!r} instead. "
+                    f"Re-run `nikon-control-scope build --force` to fix the "
+                    f".cfg itself."
+                )
+            else:
+                roles.pop(role, None)
+                self.role_warnings.append(
+                    f"the configuration names {name!r} as the {role}, which "
+                    f"can never be one, and nothing else fits — that role is "
+                    f"unavailable."
+                )
         return roles
 
     def has(self, role: str) -> bool:

@@ -179,6 +179,16 @@ def _excluded(name: str, role: str) -> bool:
     return any(bad in name for bad in _NEVER.get(role, ()))
 
 
+def role_excluded(device_name: str, role: str) -> bool:
+    """Is this device one that can never fill this role?
+
+    Public because a *configuration file* can also name the wrong device —
+    a `.cfg` written before the TIRF exclusion existed still says the XY
+    stage is TIRF1, and loading it would silently drive the wrong axis.
+    """
+    return _excluded(_norm(device_name), role)
+
+
 def _candidates(devices, role: str) -> list:
     out = []
     for d in devices:

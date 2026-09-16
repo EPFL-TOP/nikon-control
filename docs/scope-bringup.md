@@ -243,7 +243,15 @@ sees, which is the entire point.
 
 A "channel" in Micro-Manager is a **config group preset**: a set of
 `device, property, value` settings applied together. Rather than writing
-those by hand, set the microscope up by eye and capture what it is doing:
+those by hand, set the microscope up by eye and capture what it is doing.
+
+**From the dashboard** — the `/scope` **Channels** tab: set the light path,
+filter turret, shutter and intensity by eye, type a name, press *Capture
+current settings*. The preset is defined in the running core (so it works
+immediately) **and** written to the `.cfg` (so it survives a restart), and it
+appears in the Channel menu at once.
+
+**Or from the command line:**
 
 ```bat
 nikon-control-scope channel --config MMConfig.cfg --name BF
@@ -411,9 +419,25 @@ core.
 The plate calibration needs no hardware at all — it is pure geometry, and its
 tests round-trip against `useq`'s own forward model.
 
+## How long will a timepoint take?
+
+The `/scope` **Throughput** tab measures this microscope — stage settling,
+camera readout, PFS lock, channel switching — and answers "how many positions
+fit in one interval?". Nothing there is a default: the numbers that matter
+cannot be guessed, and anything it could not measure is listed as assumed.
+
+```
+per position = move + PFS lock + Σ channels(switch + expose + read)
+```
+
+Pick the channels, the interval and the movie length, and it reports the
+per-position cost, how many positions fit, and whether the number you want
+fits. 20% of the interval is held back as slack — a timelapse scheduled to
+the full interval drifts later at every timepoint.
+
 ## What is not built yet
 
-The 40× multi-well scan: walk the selected wells and fields of a
-`WellPlatePlan`, engage PFS at each, acquire, and hand the frames to the
-detector. Everything it needs — positions from the plate registration, PFS
-handling, snap — is in place; the scan itself is the next piece.
+The acquisition loop itself. See
+[acquisition-architecture.md](acquisition-architecture.md) for how the seven
+plugins fit together, what is already in place, and what carries data between
+them.
