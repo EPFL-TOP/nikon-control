@@ -38,19 +38,28 @@ TI_DEVICES = [
     Dev("TITIRF", "Stage"),
 ]
 
-# The Ti2 adapter names its devices dynamically, so these are plausible-shape
-# names rather than a transcript — which is the point: resolution must work
-# off device TYPE, not off names we had to know in advance.
+# Verbatim from `nikon-control-scope build` on the lab's Ti2-E, once the
+# vendor DLL was in place. The Ti2 adapter names its devices dynamically, so
+# this list could not have been known in advance — which is exactly why
+# resolution works off device TYPE rather than names.
 TI2_DEVICES = [
-    Dev("*Ti2-E__0: Nikon Ti2 microscope", "Hub"),
-    Dev("XYStage", "XYStage"),
+    Dev("Ti2-E__0", "Hub"),
     Dev("ZDrive", "Stage"),
-    Dev("PFSOffset", "Stage"),
-    Dev("PFStatus", "AutoFocus"),
+    Dev("XYStage", "XYStage"),
     Dev("Nosepiece", "State"),
+    Dev("CondenserTurret", "State"),
     Dev("FilterTurret1", "State"),
+    Dev("Turret1Shutter", "Shutter"),
+    Dev("FilterTurret2", "State"),
+    Dev("Turret2Shutter", "Shutter"),
     Dev("LightPath", "State"),
-    Dev("EpiShutter", "Shutter"),
+    Dev("PFS", "AutoFocus"),
+    Dev("PFSOffset", "Stage"),
+    Dev("IntermediateMagnification", "Magnifier"),
+    Dev("DiaLamp", "Shutter"),
+    Dev("TIRF1", "XYStage"),
+    Dev("TIRF2", "XYStage"),
+    Dev("TIRF3", "XYStage"),
 ]
 
 
@@ -94,9 +103,44 @@ def test_ti2_roles_resolve_without_hardcoded_names():
     roles = stand.resolve_roles(TI2_DEVICES)
     assert roles["xystage"] == "XYStage"
     assert roles["focus"] == "ZDrive"
-    assert roles["autofocus"] == "PFStatus"
+    assert roles["autofocus"] == "PFS"
     assert roles["pfsoffset"] == "PFSOffset"
+    assert roles["nosepiece"] == "Nosepiece"
+    assert roles["lightpath"] == "LightPath"
     assert not stand.missing_roles(roles)
+
+
+def test_the_stage_is_not_a_tirf_positioner():
+    """Regression, from the rig: the stage read 0,0 and would not move.
+
+    A Ti2 types FOUR devices as XYStage — the stage and three TIRF
+    illuminator positioners — and an alphabetical tie-break picked TIRF1.
+    Driving that looks exactly like broken stage hardware.
+    """
+    xy_typed = [d.name for d in TI2_DEVICES if d.type == "XYStage"]
+    assert xy_typed == ["XYStage", "TIRF1", "TIRF2", "TIRF3"]
+    assert stand.resolve_roles(TI2_DEVICES)["xystage"] == "XYStage"
+    # and a TIRF drive must never be offered as a candidate at all
+    assert stand.role_choices(TI2_DEVICES)["xystage"] == ["XYStage"]
+
+
+def test_the_dia_lamp_is_the_brightfield_shutter_on_a_ti2():
+    """Three Shutter devices; the transmitted lamp is the brightfield one."""
+    roles = stand.resolve_roles(TI2_DEVICES)
+    assert roles["shutter"] == "DiaLamp"
+    # the epi shutters are still offered, for fluorescence later
+    assert set(stand.role_choices(TI2_DEVICES)["shutter"]) == {
+        "DiaLamp", "Turret1Shutter", "Turret2Shutter"}
+
+
+def test_ambiguous_roles_are_reported_so_a_wrong_pick_cannot_hide():
+    ambiguous = stand.ambiguous_roles(TI2_DEVICES)
+    # the condenser turret is a State device like the nosepiece
+    assert ambiguous["nosepiece"][0] == "Nosepiece"
+    assert "CondenserTurret" in ambiguous["nosepiece"]
+    # a role with exactly one candidate is not ambiguous
+    assert "xystage" not in ambiguous
+    assert "focus" not in ambiguous
 
 
 def test_both_stands_report_the_same_role_vocabulary():

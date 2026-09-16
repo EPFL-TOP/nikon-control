@@ -9,6 +9,8 @@ Subcommands follow the order a rig is actually brought up:
     nikon-control-scope build --out MMConfig.cfg  write a config for what
                                                   is really attached
     nikon-control-scope config MMConfig.cfg      inspect an existing config
+    nikon-control-scope channel --name BF        capture the current
+                                                 illumination as a channel
     nikon-control-scope plate ...                register a plate on the stage
 
 Both stand generations are supported: the Ti2-E via ``NikonTi2`` and the
@@ -21,7 +23,8 @@ import argparse
 import difflib
 from pathlib import Path
 
-from . import config_build, discover, plate as plate_mod, stand as stand_mod
+from . import (channels as channels_mod, config_build, discover,
+               plate as plate_mod, stand as stand_mod)
 from .plate import WellRef, calibrate, suggested_refs
 
 
@@ -44,10 +47,23 @@ def _cmd_adapters(args) -> int:
     return 0
 
 
-def _print_roles(roles: dict[str, str]) -> None:
+def _print_roles(roles: dict[str, str], devices=None) -> None:
     print("\n  roles:")
     for line in stand_mod.describe_roles(roles):
         print(f"    {line}")
+    if devices is None:
+        return
+    # A role with several candidates is where a silent wrong pick hides —
+    # four devices on a Ti2 are typed XYStage and only one is the stage.
+    ambiguous = stand_mod.ambiguous_roles(devices)
+    if ambiguous:
+        print("\n  chosen from several candidates "
+              "(override in the .cfg if wrong):")
+        for role, names in ambiguous.items():
+            chosen = roles.get(role, "")
+            others = ", ".join(n for n in names if n != chosen)
+            print(f"    {stand_mod.ROLE_LABELS[role]:<18} {chosen}"
+                  f"   (also: {others})")
 
 
 def _cmd_devices(args) -> int:
@@ -86,7 +102,7 @@ def _cmd_devices(args) -> int:
         print(f"  {e.name:<{width}}  {e.type:<14} {e.description}")
     st = stand_mod.stand_for_adapter(args.adapter)
     if st:
-        _print_roles(stand_mod.resolve_roles(scan.devices))
+        _print_roles(stand_mod.resolve_roles(scan.devices), scan.devices)
         if not st.dynamic:
             print(f"\n  {st.empty_list_meaning}")
     return 0
@@ -105,7 +121,7 @@ def _cmd_stand(args) -> int:
         for line in st.diagnosis(mm):
             print(f"  {line}")
         if st.devices:
-            _print_roles(st.roles)
+            _print_roles(st.roles, st.devices)
         if st.usable:
             usable += 1
         if args.deep and st.installed and not st.devices:
@@ -192,7 +208,10 @@ def _cmd_build(args) -> int:
 
     missing = stand_mod.missing_roles(result.roles)
     if result.devices:
-        _print_roles(result.roles)
+        from .discover import DeviceEntry
+        entries = [DeviceEntry(library=d.library, name=d.label, type=d.type)
+                   for d in result.devices]
+        _print_roles(result.roles, entries)
     if missing:
         print(f"\n  not resolved: {', '.join(missing)}")
 
@@ -250,7 +269,75 @@ def _cmd_config(args) -> int:
     labelled = [discover.DeviceEntry(library=d.library, name=d.label,
                                      type=d.type, description=d.description)
                 for d in devices]
-    _print_roles(stand_mod.resolve_roles(labelled))
+    _print_roles(stand_mod.resolve_roles(labelled), labelled)
+
+    groups = channels_mod.groups(_scope_from(core))
+    if groups:
+        print("\nconfig groups (channels):")
+        for g, presets in groups.items():
+            print(f"  {g}: {', '.join(presets) or '(no presets)'}")
+    else:
+        print("\nno config groups defined — see `nikon-control-scope channel`")
+
+    if args.properties:
+        scope = _scope_from(core)
+        print("\nproperties:")
+        for d in devices:
+            props = scope.properties(d.label)
+            if not props:
+                continue
+            print(f"\n  {d.label}")
+            for info in props:
+                print(f"    {info.describe()}")
+    return 0
+
+
+def _scope_from(core):
+    from .control import Scope
+
+    return Scope(core)
+
+
+def _cmd_channel(args) -> int:
+    from .control import Scope
+
+    if not channels_mod.valid_name(args.name or ""):
+        if not args.list:
+            print("give a --name for the preset (no commas)")
+            return 1
+    try:
+        scope = Scope.from_config(args.config)
+    except Exception as exc:
+        print(f"could not load {args.config}: {exc}")
+        return 1
+
+    existing = channels_mod.read_presets(args.config, args.group)
+    if args.list:
+        if not existing:
+            print(f"no presets in group {args.group!r} in {args.config}")
+            return 0
+        print(f"group {args.group!r}:")
+        for preset in existing.values():
+            print(f"  {preset.describe()}")
+        return 0
+
+    preset = channels_mod.capture(scope, args.name,
+                                  with_exposure=args.with_exposure)
+    if not preset.settings:
+        print("nothing to capture — this configuration has no shutters, "
+              "filter turrets or light path devices.")
+        return 1
+    print(f"captured from the microscope's current state:\n  "
+          f"{preset.describe()}")
+    if args.dry_run:
+        print("\n--- would add ---")
+        print("\n".join(preset.lines(args.group)))
+        return 0
+    channels_mod.append_to_config(args.config, preset, args.group)
+    verb = "updated" if args.name in existing else "added"
+    print(f"\n{verb} preset {args.name!r} in group {args.group!r} "
+          f"-> {args.config}")
+    print("reload the dashboard to see it in the Channel menu")
     return 0
 
 
@@ -363,7 +450,27 @@ def main() -> None:
 
     c = sub.add_parser("config", help="inspect a Micro-Manager .cfg")
     c.add_argument("path")
+    c.add_argument("--properties", action="store_true",
+                   help="also dump every device property, with its limits "
+                        "and allowed values — this is how to find the real "
+                        "name of e.g. the lamp intensity")
     c.set_defaults(func=_cmd_config)
+
+    ch = sub.add_parser("channel",
+                        help="capture the microscope's current illumination "
+                             "as a named channel preset")
+    ch.add_argument("--config", default="MMConfig.cfg",
+                    help="the .cfg to read and write (default MMConfig.cfg)")
+    ch.add_argument("--name", help="preset name, e.g. BF or GFP")
+    ch.add_argument("--group", default=channels_mod.DEFAULT_GROUP,
+                    help=f"config group (default {channels_mod.DEFAULT_GROUP})")
+    ch.add_argument("--with-exposure", action="store_true",
+                    help="capture the camera exposure into the preset too")
+    ch.add_argument("--list", action="store_true",
+                    help="list the presets already defined and stop")
+    ch.add_argument("--dry-run", action="store_true",
+                    help="print the lines instead of writing them")
+    ch.set_defaults(func=_cmd_channel)
 
     pl = sub.add_parser("plate", help="register a well plate against the stage")
     pl.add_argument("--plate", default="96-well",

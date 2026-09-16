@@ -41,6 +41,15 @@ from .stand import ROLES, resolve_roles
 MAX_JOG_UM = 5000.0
 # Wait for PFS to report a lock, then give up rather than block a UI forever.
 PFS_LOCK_TIMEOUT_S = 5.0
+# Property names that mean "how bright", across vendors. The Ti2's dia lamp
+# exposes its intensity as a device property, not as anything MMCore has an
+# API for, so it has to be found by name.
+INTENSITY_HINTS = ("intensity", "brightness", "power", "level", "voltage")
+# …but only looked for on devices that could plausibly BE a light source.
+# Sweeping every device finds things like a demo camera's "BeadBrightness"
+# and would hand the user a slider that silently does nothing useful.
+LIGHT_LABEL_HINTS = ("lamp", "light", "led", "dia", "epi", "illum", "shutter")
+
 # MMCore defaults to a 5 s device timeout, which is shorter than a plate
 # traverse: crossing a 96-well plate is ~100 mm, and both a real Nikon stage
 # and Micro-Manager's simulated one take longer than that. Left at the
@@ -62,6 +71,40 @@ class Position:
         yield self.y
 
 
+@dataclass(frozen=True)
+class PropertyInfo:
+    """One device property, with everything needed to build a control for it."""
+
+    device: str
+    name: str
+    value: str
+    read_only: bool = False
+    allowed: tuple[str, ...] = ()
+    lower: float | None = None
+    upper: float | None = None
+
+    @property
+    def numeric(self) -> bool:
+        return self.lower is not None and self.upper is not None
+
+    @property
+    def number(self) -> float | None:
+        try:
+            return float(self.value)
+        except (TypeError, ValueError):
+            return None
+
+    def describe(self) -> str:
+        bits = [f"{self.device}.{self.name} = {self.value}"]
+        if self.read_only:
+            bits.append("(read-only)")
+        elif self.numeric:
+            bits.append(f"[{self.lower:g} … {self.upper:g}]")
+        elif self.allowed:
+            bits.append("{" + ", ".join(self.allowed[:8]) + "}")
+        return " ".join(bits)
+
+
 @dataclass
 class ScopeState:
     """A snapshot of everything the dashboard shows. Cheap to build."""
@@ -80,6 +123,7 @@ class ScopeState:
     shutter_open: bool = False
     auto_shutter: bool = False
     illumination: str = ""
+    intensity: PropertyInfo | None = None
     roles: dict[str, str] = field(default_factory=dict)
     error: str = ""
 
@@ -324,7 +368,119 @@ class Scope:
         self.core.waitForDevice(dev)
         return self.objective()
 
+    # ----------------------------------------------------------- properties
+
+    def device_labels(self) -> list[str]:
+        try:
+            return [str(d) for d in self.core.getLoadedDevices()
+                    if str(d) != "Core"]
+        except Exception:
+            return []
+
+    def _target(self, name: str) -> str:
+        """Accept either a role ('shutter') or a device label ('DiaLamp')."""
+        return self.roles.get(name, name)
+
+    def properties(self, target: str) -> list[PropertyInfo]:
+        """Every property of a device, with its limits and allowed values.
+
+        This is the escape hatch for everything MMCore has no dedicated API
+        for — lamp intensity, camera binning, a filter wheel's speed.
+        """
+        dev = self._target(target)
+        out: list[PropertyInfo] = []
+        try:
+            names = [str(p) for p in self.core.getDevicePropertyNames(dev)]
+        except Exception:
+            return out
+        for prop in names:
+            try:
+                value = str(self.core.getProperty(dev, prop))
+            except Exception:
+                value = "<unreadable>"
+            try:
+                read_only = bool(self.core.isPropertyReadOnly(dev, prop))
+            except Exception:
+                read_only = False
+            lower = upper = None
+            try:
+                if self.core.hasPropertyLimits(dev, prop):
+                    lower = float(self.core.getPropertyLowerLimit(dev, prop))
+                    upper = float(self.core.getPropertyUpperLimit(dev, prop))
+            except Exception:
+                pass
+            try:
+                allowed = tuple(str(a) for a in
+                                self.core.getAllowedPropertyValues(dev, prop))
+            except Exception:
+                allowed = ()
+            out.append(PropertyInfo(dev, prop, value, read_only, allowed,
+                                    lower, upper))
+        return out
+
+    def get_property(self, target: str, prop: str) -> str:
+        return str(self.core.getProperty(self._target(target), prop))
+
+    def set_property(self, target: str, prop: str, value) -> str:
+        dev = self._target(target)
+        self.core.setProperty(dev, prop, value)
+        try:
+            self.core.waitForDevice(dev)
+        except Exception:
+            pass
+        return self.get_property(dev, prop)
+
     # --------------------------------------------------------- illumination
+
+    def intensity_property(self) -> PropertyInfo | None:
+        """The 'how bright' knob, wherever the vendor decided to put it.
+
+        Looked for on the shutter/lamp device first, then the hub, then
+        anything else — because there is no MMCore API for brightness and
+        every adapter names it differently.
+        """
+        order: list[str] = []
+        for role in ("shutter", "lightpath"):
+            if label := self.roles.get(role):
+                order.append(label)
+        for label in self.device_labels():
+            low = label.lower()
+            if label not in order and any(h in low for h in LIGHT_LABEL_HINTS):
+                order.append(label)
+
+        seen: set[str] = set()
+        best: PropertyInfo | None = None
+        for label in order:
+            if label in seen:
+                continue
+            seen.add(label)
+            for info in self.properties(label):
+                if info.read_only:
+                    continue
+                low = info.name.lower()
+                if not any(h in low for h in INTENSITY_HINTS):
+                    continue
+                if info.numeric:
+                    return info          # numeric with limits is ideal
+                best = best or info
+        return best
+
+    def intensity(self) -> float | None:
+        info = self.intensity_property()
+        return info.number if info else None
+
+    def set_intensity(self, value: float) -> float | None:
+        info = self.intensity_property()
+        if info is None:
+            raise ScopeError(
+                "no intensity property found on any loaded device — list "
+                "them with `nikon-control-scope config <cfg> --properties` "
+                "and set it directly with set_property()."
+            )
+        if info.numeric:
+            value = max(info.lower, min(info.upper, float(value)))
+        self.set_property(info.device, info.name, value)
+        return self.intensity()
 
     def shutter_open(self) -> bool:
         if not self.has("shutter"):
@@ -457,6 +613,7 @@ class Scope:
         st.shutter_open = bool(attempt("shutter", self.shutter_open))
         st.auto_shutter = bool(attempt("auto shutter", self.auto_shutter))
         st.illumination = attempt("illumination", self.illumination) or ""
+        st.intensity = attempt("intensity", self.intensity_property)
         st.channels = attempt("channels", self.channels) or []
         st.channel = attempt("channel", self.channel) or ""
         st.error = "; ".join(problems)

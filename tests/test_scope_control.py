@@ -283,3 +283,80 @@ def test_auto_shutter_takes_precedence_in_the_explanation():
     core.auto = True
     s = Scope(core, ROLES)
     assert "auto-shutter" in s.illumination()
+
+
+# ------------------------------------------------------- device properties
+
+class PropCore(FakeCore):
+    """A core whose lamp has an intensity property, and a camera that also
+    has a 'brightness' — the false positive a loose search would pick."""
+
+    def getLoadedDevices(self):
+        return ["Core", "DiaLamp", "Cam", "XY"]
+
+    def getDevicePropertyNames(self, label):
+        return {"DiaLamp": ["State", "Intensity"],
+                "Cam": ["Exposure", "BeadBrightness"],
+                "XY": []}.get(label, [])
+
+    def getProperty(self, label, prop):
+        return {"Intensity": "37.5", "BeadBrightness": "1.0",
+                "State": "1", "Exposure": "10"}.get(prop, "0")
+
+    def setProperty(self, label, prop, value):
+        self.log.append(f"{label}.{prop}={value}")
+
+    def isPropertyReadOnly(self, label, prop):
+        return False
+
+    def hasPropertyLimits(self, label, prop):
+        return prop in ("Intensity", "BeadBrightness")
+
+    def getPropertyLowerLimit(self, label, prop):
+        return 0.0
+
+    def getPropertyUpperLimit(self, label, prop):
+        return 100.0
+
+    def getAllowedPropertyValues(self, label, prop):
+        return []
+
+
+@pytest.fixture
+def prop_scope():
+    roles = dict(ROLES)
+    roles.update({"shutter": "DiaLamp", "camera": "Cam"})
+    return Scope(PropCore(), roles)
+
+
+def test_properties_can_be_reached_by_role_or_by_label(prop_scope):
+    by_role = {p.name for p in prop_scope.properties("shutter")}
+    by_label = {p.name for p in prop_scope.properties("DiaLamp")}
+    assert by_role == by_label == {"State", "Intensity"}
+
+
+def test_property_limits_are_reported(prop_scope):
+    info = next(p for p in prop_scope.properties("DiaLamp")
+                if p.name == "Intensity")
+    assert info.numeric and info.lower == 0.0 and info.upper == 100.0
+    assert info.number == 37.5
+    assert "DiaLamp.Intensity = 37.5" in info.describe()
+
+
+def test_intensity_is_found_on_the_lamp_not_the_camera(prop_scope):
+    """A camera's 'BeadBrightness' matches the same word and is not a lamp."""
+    info = prop_scope.intensity_property()
+    assert info is not None
+    assert info.device == "DiaLamp" and info.name == "Intensity"
+
+
+def test_setting_intensity_is_clamped_to_the_device_limits(prop_scope):
+    prop_scope.set_intensity(500)
+    assert "DiaLamp.Intensity=100.0" in prop_scope.core.log
+
+
+def test_no_intensity_anywhere_raises_with_a_way_forward():
+    s = Scope(FakeCore(), {"camera": "Cam"})
+    assert s.intensity_property() is None
+    with pytest.raises(ScopeError, match="--properties"):
+        s.set_intensity(50)

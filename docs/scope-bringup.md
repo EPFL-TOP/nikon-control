@@ -169,6 +169,26 @@ there). Use it when a device needs a **pre-init property** that cannot be
 guessed — a COM port, a camera model selection. Build the config there, then
 point this project at the file.
 
+### Roles with more than one candidate
+
+`build`, `stand` and `config` print a *chosen from several candidates* block
+whenever a role had competition. Read it — this is where a wrong pick hides.
+On the lab's Ti2-E, **four devices are typed `XYStage`**: the stage and three
+TIRF illuminator positioners. Driving the wrong one looks exactly like
+broken stage hardware: the readout sits at 0,0 and nothing moves. TIRF
+drives are now excluded outright, and the remaining contests are shown:
+
+```
+  chosen from several candidates (override in the .cfg if wrong):
+    objective turret   Nosepiece    (also: CondenserTurret)
+    shutter            DiaLamp      (also: Turret1Shutter, Turret2Shutter)
+```
+
+`DiaLamp` is the transmitted-light source, which is the right shutter for
+brightfield; `Turret1Shutter` / `Turret2Shutter` are the epi shutters you
+will want for fluorescence. To change one, edit the `Property,Core,Shutter,…`
+line in the `.cfg`.
+
 ### Why is the image black?
 
 A camera with no shutter or lamp device in the configuration returns a black
@@ -182,6 +202,64 @@ stand is in: the **light path** must send light to the camera rather than the
 eyepieces, and on a brightfield rig the **dia lamp** must be on. That lamp is
 `TIDiaLamp` on the Ti-E; it is included by default, and `--skip TIDiaLamp` is
 the escape hatch if it destabilises your driver version.
+
+### Lamp intensity, and any other knob
+
+Micro-Manager has an API for the stage, the focus and the shutter, but **not
+for brightness** — a lamp's intensity is a plain device property whose name
+differs per vendor. To see the real names:
+
+```bat
+nikon-control-scope config MMConfig.cfg --properties
+```
+
+which dumps every property of every device with its limits and allowed
+values. The dashboard finds the intensity knob automatically (searching only
+devices that could plausibly be a light source, so a camera's
+"BeadBrightness" is not mistaken for a lamp) and **labels the slider with the
+property it is driving**, e.g. `Intensity — DiaLamp.Intensity`. If it finds
+nothing, the slider says so instead of pretending. From a script:
+
+```python
+scope.set_intensity(40)                       # the found knob
+scope.set_property("DiaLamp", "Intensity", 40)   # or name it yourself
+for p in scope.properties("shutter"):
+    print(p.describe())
+```
+
+### Is the light switched on and off automatically?
+
+Yes, when **auto-shutter** is on — which the generated config sets whenever
+there is a shutter. MMCore then opens the Core shutter device before each
+acquisition and closes it after, for snaps and for every live frame.
+
+For brightfield that is often not what you want: at a few frames a second
+the lamp is being switched constantly. Turn auto-shutter off in the light
+panel and open the shutter once; the lamp then simply stays on. For
+fluorescence, leave auto-shutter on — it minimises the light the sample
+sees, which is the entire point.
+
+### Defining channels
+
+A "channel" in Micro-Manager is a **config group preset**: a set of
+`device, property, value` settings applied together. Rather than writing
+those by hand, set the microscope up by eye and capture what it is doing:
+
+```bat
+nikon-control-scope channel --config MMConfig.cfg --name BF
+nikon-control-scope channel --config MMConfig.cfg --name GFP --with-exposure
+nikon-control-scope channel --config MMConfig.cfg --list
+```
+
+It captures the shutters, filter and condenser turrets, the light path and
+the lamp intensity. It deliberately does **not** capture the objective
+turret, the stage or the focus: a channel that rotated the turret would
+swing an objective under a loaded plate on every BF→GFP switch, and one that
+moved the stage would teleport the sample. Re-capturing a name replaces that
+preset rather than leaving two conflicting definitions in the file.
+
+Presets appear in the dashboard's **Channel** menu after a reload, and in a
+script as `scope.channels()` / `scope.set_channel("GFP")`.
 
 ### Check it either way
 

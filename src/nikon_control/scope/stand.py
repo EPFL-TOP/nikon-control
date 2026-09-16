@@ -156,12 +156,27 @@ def _norm(text: str) -> str:
 # same-typed devices. That is what lets this handle the Ti2's dynamic names
 # without anyone having written them down.
 _NAME_HINTS: dict[str, tuple[str, ...]] = {
+    "xystage": ("xystage", "xydrive", "stage"),
     "focus": ("zdrive", "focus", "z"),
     "pfsoffset": ("pfsoffset", "pfs"),
     "nosepiece": ("nosepiece", "objective", "turret"),
     "lightpath": ("lightpath", "eyepiece", "port"),
     "shutter": ("epishutter", "epi", "diashutter", "dia"),
 }
+
+# Devices whose TYPE fits a role but which never fill it. The Ti2 presents
+# its three TIRF illuminator positioners as XYStage devices and its PFS
+# offset as a Stage; none of them moves the sample or the objective, and
+# driving one in place of the real thing looks exactly like a stage that
+# will not move.
+_NEVER: dict[str, tuple[str, ...]] = {
+    "xystage": ("tirf",),
+    "focus": ("pfs", "tirf"),
+}
+
+
+def _excluded(name: str, role: str) -> bool:
+    return any(bad in name for bad in _NEVER.get(role, ()))
 
 
 def _candidates(devices, role: str) -> list:
@@ -170,7 +185,8 @@ def _candidates(devices, role: str) -> list:
         dtype = str(getattr(d, "type", "") or "")
         name = _norm(getattr(d, "name", ""))
         if role == "xystage" and dtype == "XYStage":
-            out.append(d)
+            if not _excluded(name, role):
+                out.append(d)
         elif role == "autofocus" and dtype == "AutoFocus":
             out.append(d)
         elif role == "pfsoffset" and dtype == "Stage" and "pfs" in name:
@@ -178,7 +194,7 @@ def _candidates(devices, role: str) -> list:
         elif role == "focus" and dtype == "Stage":
             # the PFS offset and the TIRF drive are Stages too, and neither
             # is the focus drive
-            if "pfs" not in name and "tirf" not in name:
+            if not _excluded(name, role):
                 out.append(d)
         elif role == "nosepiece" and dtype == "State":
             if ("nose" in name or "objective" in name
@@ -218,6 +234,29 @@ def resolve_roles(devices) -> dict[str, str]:
         if name := str(getattr(found[0], "name", "")):
             roles[role] = name
     return roles
+
+
+def role_choices(devices) -> dict[str, list[str]]:
+    """Every candidate for each role, best first.
+
+    Worth surfacing: a role with several candidates is where a silent wrong
+    pick hides. On a Ti2 four devices are typed ``XYStage`` and only one is
+    the stage, and the symptom of choosing wrong is a stage that reads 0,0
+    and never moves — which reads as broken hardware, not a bad guess.
+    """
+    out: dict[str, list[str]] = {}
+    for role in ROLES:
+        found = _candidates(devices, role)
+        found.sort(key=lambda d: (_rank(d, role), str(getattr(d, "name", ""))))
+        names = [str(getattr(d, "name", "")) for d in found]
+        out[role] = [n for n in names if n]
+    return out
+
+
+def ambiguous_roles(devices) -> dict[str, list[str]]:
+    """Roles where more than one device could have been chosen."""
+    return {r: names for r, names in role_choices(devices).items()
+            if len(names) > 1}
 
 
 def missing_roles(roles: dict[str, str]) -> list[str]:

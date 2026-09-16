@@ -66,6 +66,7 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
         Div,
         RangeSlider,
         Select,
+        Slider,
         Spinner,
         TapTool,
         TextInput,
@@ -136,6 +137,10 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
     light_div = Div(text=_badge("light —", _DIM), width=380, name="light")
     shutter_tog = Toggle(label="💡 Open shutter", width=140, name="shutter")
     autoshut_ck = CheckboxGroup(labels=["auto-shutter"], active=[0], width=140)
+    intensity = Slider(start=0, end=100, value=0, step=1, width=300,
+                       title="Intensity", name="intensity", disabled=True)
+    intensity_note = Div(text="", width=380,
+                         styles={"font-size": "11px", "color": "#666"})
 
     pfs_div = Div(text=_badge("PFS —", _DIM), width=200, name="pfs")
     pfs_on_btn = Button(label="Engage PFS", button_type="success", width=110,
@@ -382,6 +387,13 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
     zup_btn.on_click(guard(lambda s: s.focus_by(float(zstep_spin.value))))
     zdn_btn.on_click(guard(lambda s: s.focus_by(-float(zstep_spin.value))))
 
+    def on_intensity(attr, old, new) -> None:
+        if state["syncing"] or new == old:
+            return
+        run(lambda s: s.set_intensity(float(new)))
+
+    intensity.on_change("value_throttled", on_intensity)
+
     def on_shutter(attr, old, new) -> None:
         if state["syncing"]:
             return
@@ -606,6 +618,27 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
         try:
             shutter_tog.active = bool(st.shutter_open)
             autoshut_ck.active = [0] if st.auto_shutter else []
+            # There is no MMCore API for brightness — it is a device property
+            # whose name differs per vendor, so name the one being driven
+            # rather than leave an unlabelled slider to be trusted blindly.
+            info = st.intensity
+            if info is None:
+                intensity.disabled = True
+                intensity_note.text = (
+                    "no intensity property found on the lamp — list them with "
+                    "<code>nikon-control-scope config &lt;cfg&gt; "
+                    "--properties</code>")
+            else:
+                intensity.disabled = False
+                if info.numeric:
+                    intensity.start = info.lower
+                    intensity.end = info.upper
+                    intensity.step = max((info.upper - info.lower) / 100.0,
+                                         0.01)
+                if (n := info.number) is not None:
+                    intensity.value = n
+                intensity.title = f"Intensity — {info.device}.{info.name}"
+                intensity_note.text = ""
         finally:
             state["syncing"] = False
 
@@ -653,6 +686,7 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
         focus_note,
         light_div,
         row(shutter_tog, autoshut_ck),
+        intensity, intensity_note,
         row(pfs_div),
         row(pfs_on_btn, pfs_off_btn),
         obj_sel, obj_ok,
