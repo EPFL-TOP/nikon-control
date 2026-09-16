@@ -298,6 +298,29 @@ def find_driver(stand: Stand, mm_dir: Path | None = None) -> DriverLocation:
     return DriverLocation(dll)
 
 
+# The Micro-Manager GUI ships the Hardware Configuration Wizard. `mmcore
+# install` fetches a build that may or may not include it, so check rather
+# than assume — the wizard is the right tool when a device needs pre-init
+# properties (a COM port, a camera model) that cannot be guessed.
+GUI_LAUNCHERS = ("ImageJ.exe", "micromanager.exe", "Micro-Manager.exe",
+                 "ImageJ-win64.exe")
+
+
+def gui_launcher(mm_dir: Path | None = None) -> Path | None:
+    """Micro-Manager's GUI executable, if this install has one."""
+    mm_dir = mm_dir if mm_dir is not None else mm_install()
+    if not mm_dir:
+        return None
+    for name in GUI_LAUNCHERS:
+        candidate = Path(mm_dir) / name
+        try:
+            if candidate.exists():
+                return candidate
+        except OSError:
+            pass
+    return None
+
+
 def stand_status(core=None, mm_dir: Path | None = None) -> list[StandStatus]:
     """Scan every known Nikon stand generation on this machine."""
     core = core or new_core()

@@ -186,3 +186,40 @@ def test_a_deliberate_turret_move_still_needs_the_checkbox(doc):
     boxes[0].active = [0]
     obj.value = other
     assert obj.value == other
+
+
+@needs_demo
+def test_build_button_writes_a_config_and_connects(tmp_path, doc, monkeypatch):
+    """The 'not sure how to build the .cfg' path, end to end.
+
+    The build runs on a next-tick callback so the browser sees the notice
+    first, so the test has to drain that queue the way the server would.
+    """
+    out = tmp_path / "MMConfig_built.cfg"
+    by_title(doc, "Micro-Manager configuration (.cfg)").value = str(out)
+
+    # Only the demo adapter is installed here, so aim the build at it.
+    from nikon_control.scope import config_build
+
+    real_build = config_build.build
+    monkeypatch.setattr(
+        config_build, "build",
+        lambda core=None, **kw: real_build(core, stand_adapter="DemoCamera"))
+
+    click(doc, "build")
+    assert "can take a minute" in widget(doc, "status").text
+
+    for cb in list(doc.callbacks.session_callbacks):
+        if type(cb).__name__ == "NextTickCallback":
+            cb.callback()
+
+    assert out.exists(), "no configuration was written"
+    text = out.read_text()
+    assert "Property,Core,Initialize,1" in text
+    assert "connected" in widget(doc, "status").text
+    assert "DXYStage" in widget(doc, "status").text or "DXYStage" in text
+
+    # and the dashboard is now driving through that file
+    click(doc, "snap")
+    imgs = [m for m in doc.select({}) if "image" in getattr(m, "data", {})]
+    assert imgs[0].data["image"][0].shape[0] > 1

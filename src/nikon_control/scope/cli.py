@@ -6,6 +6,8 @@ Subcommands follow the order a rig is actually brought up:
     nikon-control-scope stand                    which Nikon stand is here
     nikon-control-scope devices NikonTi2         what one adapter offers
     nikon-control-scope probe NikonTi2 TIXYDrive try to connect one device
+    nikon-control-scope build --out MMConfig.cfg  write a config for what
+                                                  is really attached
     nikon-control-scope config MMConfig.cfg      inspect an existing config
     nikon-control-scope plate ...                register a plate on the stage
 
@@ -17,8 +19,9 @@ from __future__ import annotations
 
 import argparse
 import difflib
+from pathlib import Path
 
-from . import discover, plate as plate_mod, stand as stand_mod
+from . import config_build, discover, plate as plate_mod, stand as stand_mod
 from .plate import WellRef, calibrate, suggested_refs
 
 
@@ -149,6 +152,58 @@ def _cmd_probe(args) -> int:
     return 1 if failures and args.device else 0
 
 
+def _cmd_build(args) -> int:
+    mm = discover.mm_install()
+    core = discover.new_core()
+    print(f"Micro-Manager: {mm or 'NOT FOUND'}")
+    print("Connecting devices one at a time — this powers up the stand and "
+          "may take a moment.\n")
+
+    result = config_build.build(
+        core,
+        stand_adapter=args.adapter,
+        camera_adapter=args.camera_adapter,
+        camera_device=args.camera_device,
+        skip=set(args.skip or ()),
+    )
+    for line in result.summary():
+        print(line)
+    for note in result.notes:
+        print(f"\n! {note}")
+
+    missing = stand_mod.missing_roles(result.roles)
+    if result.devices:
+        _print_roles(result.roles)
+    if missing:
+        print(f"\n  not resolved: {', '.join(missing)}")
+
+    if not result.devices:
+        gui = discover.gui_launcher(mm)
+        if gui:
+            print(f"\nNothing connected. This install does have the "
+                  f"Micro-Manager GUI ({gui}); its Hardware Configuration "
+                  f"Wizard is the fallback when a device needs pre-init "
+                  f"properties this command cannot guess.")
+        return 1
+
+    text = config_build.to_text(result, core)
+    if args.dry_run:
+        print("\n--- would write ---")
+        print(text)
+        return 0
+
+    out = Path(args.out)
+    if out.exists() and not args.force:
+        print(f"\n{out} already exists — pass --force to overwrite.")
+        return 1
+    out.write_text(text)
+    print(f"\nwrote {out}")
+    print(f"check it with:  nikon-control-scope config {out}")
+    print(f"then connect the /scope dashboard to it, or:\n"
+          f"  nikon-control-dashboard --mm-config {out.resolve()}")
+    return 0
+
+
 def _cmd_config(args) -> int:
     core = discover.new_core()
     try:
@@ -253,6 +308,26 @@ def main() -> None:
     pr.add_argument("--properties", action="store_true",
                     help="print the device's properties when it connects")
     pr.set_defaults(func=_cmd_probe)
+
+    b = sub.add_parser("build", help="write a Micro-Manager .cfg containing "
+                                     "the devices that actually connect")
+    b.add_argument("--out", default="MMConfig.cfg",
+                   help="file to write (default MMConfig.cfg)")
+    b.add_argument("--adapter", default=None,
+                   help="stand adapter to build from (default: the installed "
+                        "Nikon one)")
+    b.add_argument("--camera-adapter", default=None,
+                   help="camera adapter, e.g. HamamatsuHam / PVCAM / "
+                        "AndorSDK3 (default: try each installed one)")
+    b.add_argument("--camera-device", default=None,
+                   help="specific camera device name within that adapter")
+    b.add_argument("--skip", action="append", default=[],
+                   help="device name to leave out; repeatable")
+    b.add_argument("--dry-run", action="store_true",
+                   help="print the configuration instead of writing it")
+    b.add_argument("--force", action="store_true",
+                   help="overwrite an existing file")
+    b.set_defaults(func=_cmd_build)
 
     c = sub.add_parser("config", help="inspect a Micro-Manager .cfg")
     c.add_argument("path")

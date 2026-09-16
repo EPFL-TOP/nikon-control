@@ -213,7 +213,10 @@ def resolve_roles(devices) -> dict[str, str]:
         if not found:
             continue
         found.sort(key=lambda d: (_rank(d, role), str(getattr(d, "name", ""))))
-        roles[role] = str(getattr(found[0], "name", ""))
+        # A nameless device fills no role — better an absent key than a role
+        # mapped to "", which reads as present everywhere downstream.
+        if name := str(getattr(found[0], "name", "")):
+            roles[role] = name
     return roles
 
 

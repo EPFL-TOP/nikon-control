@@ -7,9 +7,11 @@ is deliberate — the same operations have to be scriptable for the unattended
 
 Three panels, in the order a session actually goes:
 
-**Connect** — load a Micro-Manager ``.cfg``, or the demo devices to try the
-dashboard with no microscope attached. The status line then names which
-device filled which role, so a missing PFS is visible before it matters.
+**Connect** — load a Micro-Manager ``.cfg``; or **build one** by connecting
+every attached device in turn and writing out what answered; or the demo
+devices, to try the dashboard with no microscope. The status line then names
+which device filled which role, so a missing PFS is visible before it
+matters.
 
 **Drive** — live/snapped image, stage jog, focus, PFS, objective, channel.
 Focus deserves a note: the ``Focus ±`` buttons call ``focus_by()``, which
@@ -29,7 +31,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ..scope import plate as plate_mod
+from ..scope import config_build, plate as plate_mod
 from ..scope.control import Scope, ScopeError
 from .common import build_image_figure, contrast_bounds
 
@@ -91,6 +93,7 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
     connect_btn = Button(label="Connect", button_type="primary", width=110,
                          name="connect")
     demo_btn = Button(label="Demo devices", width=130, name="demo")
+    build_btn = Button(label="Build from hardware", width=160, name="build")
     conn_div = Div(text=_badge("not connected", _DIM), width=460,
                    name="status")
     roles_div = Div(text="", width=460,
@@ -263,8 +266,52 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
         except Exception as exc:                        # noqa: BLE001
             say(f"demo devices unavailable: {exc}", _BAD)
 
+    def do_build() -> None:
+        """Write a .cfg for whatever is attached, then connect to it.
+
+        Connecting every device takes seconds to minutes, and a Bokeh
+        callback blocks the session while it runs — so paint the notice
+        first and do the work on the next tick, or the user watches an
+        unchanged page and assumes the button is broken.
+        """
+        out = cfg_input.value.strip() or "MMConfig.cfg"
+        say("connecting every attached device — this can take a minute…",
+            _WARN)
+        doc.add_next_tick_callback(lambda: _build_now(out))
+
+    def _build_now(out: str) -> None:
+        try:
+            core = config_build.new_core()
+            result = config_build.build(core)
+        except Exception as exc:                        # noqa: BLE001
+            say(f"build failed: {exc}", _BAD)
+            return
+        if not result.devices:
+            say("; ".join(result.notes) or "nothing connected", _BAD)
+            return
+        try:
+            Path(out).write_text(config_build.to_text(result, core))
+        except Exception as exc:                        # noqa: BLE001
+            say(f"built, but could not write {out}: {exc}", _BAD)
+            return
+        cfg_input.value = out
+        failed = (f" — {len(result.failures)} device(s) did not connect"
+                  if result.failures else "")
+        roles_div.text = (
+            f"wrote <b>{out}</b>: {len(result.devices)} device(s){failed}"
+            + ("<br>did not connect: " +
+               ", ".join(f"{n} ({w})" for n, w in result.failures[:6])
+               if result.failures else ""))
+        # The build left a core holding the hardware; connect through the
+        # file instead, so what runs from here on is what the file says.
+        try:
+            _after_connect(Scope.from_config(out), Path(out).name)
+        except Exception as exc:                        # noqa: BLE001
+            say(f"wrote {out} but could not load it: {exc}", _BAD)
+
     connect_btn.on_click(do_connect)
     demo_btn.on_click(do_demo)
+    build_btn.on_click(do_build)
 
     # --------------------------------------------------------------- image
 
@@ -558,7 +605,9 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
 
     connect_panel = column(
         Div(text="<h3 style='margin:0'>1 · Connect</h3>"),
-        row(cfg_input, column(Div(text="<br>"), row(connect_btn, demo_btn))),
+        row(cfg_input,
+            column(Div(text="<br>"),
+                   row(connect_btn, build_btn, demo_btn))),
         conn_div, roles_div,
     )
 

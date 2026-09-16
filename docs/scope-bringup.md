@@ -102,8 +102,49 @@ inventory with it. This is the honest test of whether hardware is connected
 and talking, and it is how to bring a rig up incrementally: probe, fix, probe
 the next.
 
-Once a set of devices probes clean, build a `.cfg` with Micro-Manager's
-Hardware Configuration Wizard and check it:
+## 4 · Write the configuration file
+
+A Micro-Manager `.cfg` is the list of devices to load and which role each
+fills; nothing can be driven without one. Two ways to get it.
+
+### Build it from what is actually attached (no GUI needed)
+
+```bat
+nikon-control-scope build --out MMConfig.cfg
+```
+
+or press **Build from hardware** in the `/scope` dashboard. Either one:
+
+1. loads the stand's **hub** and initialises it;
+2. asks the *initialised hub* what peripherals are really there
+   (`getInstalledDevices`) — **this is the only way to learn a Ti2's device
+   names**, since that adapter enumerates from Nikon's SDK and nothing can be
+   known in advance;
+3. loads each peripheral **one at a time**, keeping what initialises and
+   reporting what does not, rather than failing the whole build on one bad
+   device;
+4. adds a camera (`--camera-adapter HamamatsuHam`, or it tries each installed
+   one) — no stand adapter provides a camera;
+5. resolves the roles and writes the file.
+
+The result contains exactly the devices that answered, which is a much better
+starting point than one listing everything the adapter *could* offer.
+`--dry-run` prints it instead of writing; `--skip NAME` leaves a device out.
+`TIDiaLamp` is skipped by default — it has crashed Micro-Manager with some
+Nikon driver versions and nothing here drives it.
+
+The stand has to be **powered on** for this to find anything, since step 2
+asks the hardware.
+
+### Or use Micro-Manager's Hardware Configuration Wizard
+
+The wizard ships with the Micro-Manager **GUI**, which the adapter download
+may or may not include (`nikon-control-scope build` tells you if it is
+there). Use it when a device needs a **pre-init property** that cannot be
+guessed — a COM port, a camera model selection. Build the config there, then
+point this project at the file.
+
+### Check it either way
 
 ```bat
 nikon-control-scope config C:\path\to\MMConfig.cfg
@@ -114,15 +155,16 @@ stage, focus, autofocus, shutter) and then the **stand** roles — the ones
 MMCore has no slot for, like the PFS offset and the nosepiece. An empty role
 is what makes a later script fail with an unhelpful error.
 
-## 4 · Operate it — the `/scope` dashboard
+
+## 5 · Operate it — the `/scope` dashboard
 
 ```bat
 nikon-control-dashboard --data-dir . --mm-config C:\path\MMConfig.cfg
 ```
 
 then open `http://localhost:5006/scope`. It has three panels, in session
-order: **Connect** (a `.cfg`, or Micro-Manager's demo devices to try the page
-with no microscope), **Drive** (snap/live image, stage jog, focus, PFS,
+order: **Connect** (a `.cfg`, *Build from hardware*, or Micro-Manager's demo
+devices to try the page with no microscope), **Drive** (snap/live image, stage jog, focus, PFS,
 objective, channel) and **Plate** (below).
 
 All the hardware behaviour lives in `scope/control.py`, not in the dashboard,
@@ -156,7 +198,7 @@ There is also a jog guard: a relative move over 5 mm is refused, because a
 mistyped step is the classic way to crash an objective. Absolute moves are
 never guarded — crossing the plate is legitimate travel.
 
-## 5 · Register the plate against the stage
+## 6 · Register the plate against the stage
 
 This is the step that makes every later position meaningful. A plate's
 geometry is fixed by its manufacturer, so locating it takes exactly **three
