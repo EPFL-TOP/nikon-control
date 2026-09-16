@@ -321,6 +321,138 @@ def gui_launcher(mm_dir: Path | None = None) -> Path | None:
     return None
 
 
+# What Windows' own loader errors mean for a Micro-Manager device adapter.
+# MMCore reports only "Failed to load device adapter", which is the same
+# message for every one of these, and they have completely different fixes.
+WINERROR_HINTS = {
+    126: ("a DLL it depends on could not be found — for a Nikon adapter that "
+          "is almost always the vendor driver DLL not sitting beside it"),
+    127: ("an entry point is missing — the vendor DLL is a different version "
+          "from the one this adapter was built against"),
+    193: ("wrong architecture — a 32-bit DLL under a 64-bit Micro-Manager, "
+          "or the reverse"),
+    1114: ("the DLL loaded but its initialisation routine failed — usually a "
+           "vendor SDK version mismatch, or hardware that is powered off"),
+}
+
+
+def dll_probe(path: Path, search_dir: Path | None = None) -> tuple[bool, str]:
+    """Ask Windows itself to load a DLL, and report what it says.
+
+    MMCore swallows the operating system's error behind one generic message.
+    Loading the library directly gets the real code back, which is the
+    difference between "copy a file" and "you installed the wrong build".
+
+    ``search_dir`` is added to the DLL search path first, because that is
+    what MMCore does when it loads an adapter — without it, a dependency
+    sitting right beside the adapter would still not be found.
+    """
+    import ctypes
+    import os
+
+    if os.name != "nt":
+        return False, "not Windows — cannot load a .dll here"
+    p = Path(path)
+    if not p.exists():
+        return False, f"{p} does not exist"
+
+    cookie = None
+    try:
+        if search_dir and hasattr(os, "add_dll_directory"):
+            try:
+                cookie = os.add_dll_directory(str(search_dir))
+            except OSError:
+                cookie = None
+        ctypes.WinDLL(str(p))
+        return True, ""
+    except OSError as exc:
+        code = getattr(exc, "winerror", None)
+        detail = getattr(exc, "strerror", None) or str(exc)
+        hint = WINERROR_HINTS.get(code, "")
+        text = f"WinError {code}: {detail}" if code else str(exc)
+        return False, (f"{text} — {hint}" if hint else text)
+    except Exception as exc:                            # noqa: BLE001
+        return False, str(exc)
+    finally:
+        if cookie is not None:
+            cookie.close()
+
+
+def adapter_dll(stand: Stand, mm_dir: Path | None = None) -> Path | None:
+    """Where Micro-Manager's adapter library for this stand should be."""
+    mm_dir = mm_dir if mm_dir is not None else mm_install()
+    if not mm_dir:
+        return None
+    candidate = Path(mm_dir) / f"mmgr_dal_{stand.adapter}.dll"
+    try:
+        return candidate if candidate.exists() else None
+    except OSError:
+        return None
+
+
+def deep_check(stand: Stand, mm_dir: Path | None = None) -> list[str]:
+    """Why won't this adapter load? Ask the OS rather than guess.
+
+    Only meaningful on Windows, and only worth running when the adapter has
+    already refused to produce devices.
+    """
+    import os
+
+    mm_dir = mm_dir if mm_dir is not None else mm_install()
+    out: list[str] = []
+    if os.name != "nt":
+        return ["deep DLL check only runs on Windows"]
+
+    found = find_driver(stand, mm_dir)
+    dll = stand.driver.dll
+    if not found.path:
+        out.append(f"{dll}: not on this machine — {stand.driver.fix(mm_dir)}")
+    else:
+        ok, why = dll_probe(found.path, found.path.parent)
+        out.append(f"{dll} at {found.path}: "
+                   + ("loads cleanly" if ok else f"WILL NOT LOAD — {why}"))
+        if not found.satisfied:
+            out.append(f"…but it is not in {mm_dir}, which is where the "
+                       f"{stand.adapter} adapter looks. Copy it there "
+                       f"(`nikon-control-scope fix-driver`).")
+
+    adapter = adapter_dll(stand, mm_dir)
+    if not adapter:
+        out.append(f"mmgr_dal_{stand.adapter}.dll is not in {mm_dir}")
+        return out
+    ok, why = dll_probe(adapter, mm_dir)
+    out.append(f"mmgr_dal_{stand.adapter}.dll: "
+               + ("loads cleanly — the adapter itself is fine" if ok
+                  else f"WILL NOT LOAD — {why}"))
+    return out
+
+
+def install_driver(stand: Stand, mm_dir: Path | None = None,
+                   source: Path | None = None) -> tuple[bool, str]:
+    """Copy the vendor DLL to where the adapter looks for it.
+
+    Copy, never move: the vendor's own software still needs its copy.
+    """
+    import shutil
+
+    mm_dir = mm_dir if mm_dir is not None else mm_install()
+    if not mm_dir:
+        return False, "no Micro-Manager installation found"
+    src = Path(source) if source else Path(stand.driver.sdk_path) / stand.driver.dll
+    if not src.exists():
+        return False, (f"{src} does not exist — install "
+                       f"{stand.driver.installer}, or pass --from PATH")
+    dest = Path(mm_dir) / stand.driver.dll
+    if dest.exists():
+        return True, f"{dest} is already there"
+    try:
+        shutil.copy2(src, dest)
+    except OSError as exc:
+        return False, (f"could not copy to {dest}: {exc}. Micro-Manager's "
+                       f"folder may need an elevated prompt.")
+    return True, f"copied {src} -> {dest}"
+
+
 def stand_status(core=None, mm_dir: Path | None = None) -> list[StandStatus]:
     """Scan every known Nikon stand generation on this machine."""
     core = core or new_core()

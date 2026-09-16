@@ -1,14 +1,14 @@
 """The two Nikon stand generations, and which device fills which role.
 
 This lab has both: a Ti2-E driven through Micro-Manager's ``NikonTi2``
-adapter, and an older Ti/Ti-E driven through ``NikonTI``. They are different
+adapter, and an older **Ti-E** driven through ``NikonTI``. They are different
 adapters with different device names, different SDKs and different failure
 modes, so everything above this module should ask for a *role* ("the XY
 stage") and never for a device name.
 
 The two differ in one way that matters more than the names:
 
-* ``NikonTI`` publishes a **fixed** device list. It will happily list
+* ``NikonTI`` (the lab's older **Ti-E**) publishes a **fixed** device list. It will happily list
   eighteen devices on a laptop with no microscope attached — so a device
   list is not evidence of a connected stand.
 * ``NikonTi2`` enumerates **dynamically** by asking Nikon's SDK what is
@@ -119,7 +119,7 @@ TI2 = Stand(
 TI = Stand(
     key="ti",
     adapter="NikonTI",
-    label="Ti / Ti-E (older stand)",
+    label="Ti-E (older stand)",
     hub="TIScope",
     dynamic=False,
     driver=Driver(

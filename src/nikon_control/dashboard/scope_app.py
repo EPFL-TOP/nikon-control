@@ -133,6 +133,10 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
     focus_note = Div(text="", width=380,
                      styles={"font-size": "11px", "color": "#666"})
 
+    light_div = Div(text=_badge("light —", _DIM), width=380, name="light")
+    shutter_tog = Toggle(label="💡 Open shutter", width=140, name="shutter")
+    autoshut_ck = CheckboxGroup(labels=["auto-shutter"], active=[0], width=140)
+
     pfs_div = Div(text=_badge("PFS —", _DIM), width=200, name="pfs")
     pfs_on_btn = Button(label="Engage PFS", button_type="success", width=110,
                         name="pfs_on")
@@ -378,6 +382,16 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
     zup_btn.on_click(guard(lambda s: s.focus_by(float(zstep_spin.value))))
     zdn_btn.on_click(guard(lambda s: s.focus_by(-float(zstep_spin.value))))
 
+    def on_shutter(attr, old, new) -> None:
+        if state["syncing"]:
+            return
+        run(lambda s: s.set_shutter(bool(new)))
+
+    shutter_tog.on_change("active", on_shutter)
+    autoshut_ck.on_change("active", lambda a, o, n:
+                          None if state["syncing"] else
+                          run(lambda s: s.set_auto_shutter(bool(n))))
+
     def do_engage(s: Scope) -> None:
         if not s.engage_pfs():
             say("PFS engaged but did not lock — out of range?", _WARN)
@@ -575,6 +589,26 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
             pfs_div.text += f" <span style='font-family:monospace'>" \
                             f"offset {st.pfs_offset:.1f}</span>"
 
+        # "Why is my image black?" is answered here rather than left to be
+        # guessed at: a config with no shutter cannot turn a light on at all.
+        if not st.roles.get("shutter"):
+            light_div.text = _badge("no light control in this config", _WARN) \
+                + " <span style='font-size:11px'>a dark frame is expected</span>"
+        elif st.auto_shutter:
+            light_div.text = _badge("auto-shutter", _OK) + \
+                " <span style='font-size:11px'>opened for each acquisition" \
+                "</span>"
+        elif st.shutter_open:
+            light_div.text = _badge("shutter open", _OK)
+        else:
+            light_div.text = _badge("shutter CLOSED", _WARN)
+        state["syncing"] = True
+        try:
+            shutter_tog.active = bool(st.shutter_open)
+            autoshut_ck.active = [0] if st.auto_shutter else []
+        finally:
+            state["syncing"] = False
+
         focus_note.text = (
             "Focus ± moves the <b>PFS offset</b> (the only control that "
             "changes focus while locked)." if st.pfs_locked and
@@ -617,6 +651,8 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
         row(jog, column(step_spin, row(goto_x, goto_y), goto_btn)),
         row(zdn_btn, zup_btn, zstep_spin),
         focus_note,
+        light_div,
+        row(shutter_tog, autoshut_ck),
         row(pfs_div),
         row(pfs_on_btn, pfs_off_btn),
         obj_sel, obj_ok,

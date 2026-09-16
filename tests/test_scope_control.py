@@ -13,6 +13,7 @@ from nikon_control.scope.control import MAX_JOG_UM, Position, Scope, ScopeError
 ROLES = {
     "camera": "Cam", "xystage": "XY", "focus": "Z",
     "autofocus": "PFS", "pfsoffset": "PFSOffset", "nosepiece": "Turret",
+    "shutter": "Shutter",
 }
 
 
@@ -26,6 +27,8 @@ class FakeCore:
         self.locked = False
         self.objective = "40x"
         self.exposure = 10.0
+        self.shutter = False
+        self.auto = False
         self.log: list[str] = []
 
     # stage
@@ -63,6 +66,14 @@ class FakeCore:
     def setStateLabel(self, dev, label):
         self.objective = label
         self.log.append(f"objective={label}")
+
+    # shutter
+    def getShutterOpen(self, dev): return self.shutter
+    def setShutterOpen(self, dev, on):
+        self.shutter = bool(on)
+        self.log.append(f"shutter={'open' if on else 'closed'}")
+    def getAutoShutter(self): return self.auto
+    def setAutoShutter(self, on): self.auto = bool(on)
 
     # camera / misc
     def getExposure(self): return self.exposure
@@ -240,3 +251,35 @@ def test_demo_scope_state_and_channels():
     assert st.objectives                   # demo nosepiece
     assert st.exposure_ms is not None
     assert not st.error
+
+
+# ------------------------------------------------------- illumination
+
+def test_no_shutter_says_a_dark_frame_is_expected():
+    """The rig's actual state: a camera-only config returning black frames.
+
+    With nothing that can switch a light on, 'the camera is broken' is the
+    wrong conclusion and the one a user reaches first.
+    """
+    s = Scope(FakeCore(), {"camera": "Cam"})
+    text = s.illumination()
+    assert "no shutter or lamp" in text
+    assert "dark frame is expected" in text
+    assert s.state().illumination == text
+
+
+def test_shutter_state_is_reported_and_settable():
+    core = FakeCore()
+    core.shutter = False
+    core.auto = False
+    s = Scope(core, ROLES)
+    assert "CLOSED" in s.illumination()
+    s.set_shutter(True)
+    assert s.illumination() == "shutter open"
+
+
+def test_auto_shutter_takes_precedence_in_the_explanation():
+    core = FakeCore()
+    core.auto = True
+    s = Scope(core, ROLES)
+    assert "auto-shutter" in s.illumination()

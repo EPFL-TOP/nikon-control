@@ -3,7 +3,7 @@
 One class, :class:`Scope`, wrapping a Micro-Manager core. Everything is
 addressed by **role** — ``xystage``, ``focus``, ``autofocus``, ``pfsoffset``,
 ``nosepiece`` — never by device name, so the same code drives the Ti2-E, the
-older Ti, and Micro-Manager's demo devices. :mod:`.stand` works out which
+older Ti-E, and Micro-Manager's demo devices. :mod:`.stand` works out which
 device fills which role.
 
 Two pieces of microscope behaviour are encoded here rather than left to the
@@ -13,6 +13,12 @@ caller, because getting either wrong ruins an overnight run:
 disables continuous focus (micro-manager#1815). So :meth:`Scope.move_z`
 suspends PFS deliberately and re-engages it afterwards, instead of leaving it
 silently off.
+
+**Nothing is illuminated unless something opens the shutter.** A camera with
+no shutter device in the configuration returns a black frame and no error,
+which reads as a broken camera. :meth:`Scope.illumination` reports what light
+control exists at all, so "the config has no light source" is distinguishable
+from "the lamp is off".
 
 **With PFS on, you do not change focus with Z.** PFS holds a fixed distance
 from the coverslip; move Z and it simply pulls back. The control that means
@@ -71,6 +77,9 @@ class ScopeState:
     channel: str = ""
     channels: list[str] = field(default_factory=list)
     exposure_ms: float | None = None
+    shutter_open: bool = False
+    auto_shutter: bool = False
+    illumination: str = ""
     roles: dict[str, str] = field(default_factory=dict)
     error: str = ""
 
@@ -315,6 +324,47 @@ class Scope:
         self.core.waitForDevice(dev)
         return self.objective()
 
+    # --------------------------------------------------------- illumination
+
+    def shutter_open(self) -> bool:
+        if not self.has("shutter"):
+            return False
+        try:
+            return bool(self.core.getShutterOpen(self.roles["shutter"]))
+        except Exception:
+            return False
+
+    def set_shutter(self, open_: bool) -> bool:
+        dev = self._require("shutter")
+        self.core.setShutterOpen(dev, bool(open_))
+        self.core.waitForDevice(dev)
+        return self.shutter_open()
+
+    def auto_shutter(self) -> bool:
+        """Whether MMCore opens the shutter around each acquisition itself."""
+        try:
+            return bool(self.core.getAutoShutter())
+        except Exception:
+            return False
+
+    def set_auto_shutter(self, on: bool) -> bool:
+        self.core.setAutoShutter(bool(on))
+        return self.auto_shutter()
+
+    def illumination(self) -> str:
+        """Plain words for why a frame might be black.
+
+        A configuration with no shutter and no lamp cannot turn a light on at
+        all, and that is worth saying out loud rather than leaving someone to
+        wonder whether the camera is broken.
+        """
+        if not self.has("shutter"):
+            return ("no shutter or lamp in this configuration — nothing here "
+                    "can switch a light on, so a dark frame is expected")
+        if self.auto_shutter():
+            return "auto-shutter on: opened for each acquisition"
+        return "shutter open" if self.shutter_open() else "shutter CLOSED"
+
     # --------------------------------------------------------------- camera
 
     def snap(self):
@@ -404,6 +454,9 @@ class Scope:
             st.objectives = attempt("objectives", self.objectives) or []
         if self.has("camera"):
             st.exposure_ms = attempt("exposure", self.exposure_ms)
+        st.shutter_open = bool(attempt("shutter", self.shutter_open))
+        st.auto_shutter = bool(attempt("auto shutter", self.auto_shutter))
+        st.illumination = attempt("illumination", self.illumination) or ""
         st.channels = attempt("channels", self.channels) or []
         st.channel = attempt("channel", self.channel) or ""
         st.error = "; ".join(problems)

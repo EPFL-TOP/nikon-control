@@ -38,9 +38,17 @@ def test_a_blank_name_still_yields_a_label():
     assert cb.safe_label("*") == "Device"
 
 
-def test_the_dia_lamp_is_skipped_by_default():
-    """It has crashed Micro-Manager, and nothing here drives it."""
-    assert "TIDiaLamp" in cb.SKIP_DEVICES
+def test_nothing_is_excluded_by_default():
+    """The dia lamp IS the brightfield light source.
+
+    An earlier version skipped TIDiaLamp because it has crashed
+    Micro-Manager with some driver versions. On a brightfield rig that
+    guarantees a config which can never turn the light on — the wrong
+    trade. It is flagged instead, and `--skip` is the escape hatch.
+    """
+    assert cb.SKIP_DEVICES == set()
+    assert "TIDiaLamp" in cb.RISKY_DEVICES
+    assert "--skip" in cb.RISKY_DEVICES["TIDiaLamp"]
 
 
 def test_config_text_has_the_required_shape():
@@ -136,3 +144,27 @@ def test_a_skipped_device_is_reported_not_silently_dropped(tmp_path):
                       skip={"DGalvo"})
     assert "DGalvo" not in {d.label for d in result.devices}
     assert any(name == "DGalvo" for name, _why in result.failures)
+
+
+def test_a_stand_that_contributes_nothing_says_so():
+    """Regression: a camera-only config with no explanation for it.
+
+    The rig produced exactly this — NikonTi2 installed, failing to load, and
+    a build that walked past in silence and wrote a config with no stage.
+    """
+    res = cb.build(stand_adapter="NoSuchAdapter")
+    assert res.notes
+
+
+@needs_demo
+def test_autoshutter_is_only_claimed_when_a_shutter_exists():
+    result = cb.BuildResult(
+        devices=[cb.ConfigDevice("Cam", "PVCAM", "Camera-1", type="Camera")],
+        roles={"camera": "Cam"},
+    )
+    assert "AutoShutter" not in cb.to_text(result)
+
+    result.devices.append(
+        cb.ConfigDevice("Sh", "NikonTi2", "Shutter", type="Shutter"))
+    result.roles["shutter"] = "Sh"
+    assert "Property,Core,AutoShutter,1" in cb.to_text(result)

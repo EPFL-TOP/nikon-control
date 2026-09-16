@@ -44,6 +44,7 @@ The 4-phase roadmap below is still the destination; these two tracks feed it.
 python -m venv .venv
 source .venv/bin/activate
 pip install -e '.[nd2,dev]'
+pip install -e ".[scope]"
 python -m nikon_control.cli data/some_10x_BF.nd2 --out out/overlay.png
 pytest
 ```

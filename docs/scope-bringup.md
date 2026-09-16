@@ -34,7 +34,7 @@ nikon-control-scope stand          :: add --notes for each stand's gotchas
 This lab has both generations, and Micro-Manager drives them through
 different adapters with different device names and different SDKs:
 
-| | Ti2 / Ti2-E | Ti / Ti-E (older) |
+| | Ti2-E | Ti-E (older) |
 |---|---|---|
 | adapter | `NikonTi2` | `NikonTI` |
 | vendor DLL | `Ti2_Mic_Driver.dll` | `NikonTi.dll` |
@@ -48,7 +48,7 @@ opposite things on the two stands:**
 - On the **Ti2**, `devices NikonTi2` printing nothing means the SDK could not
   be reached — almost always the missing `Ti2_Mic_Driver.dll`. It does *not*
   mean the adapter is absent.
-- On the **Ti**, `devices NikonTI` prints eighteen devices on a laptop with no
+- On the **Ti-E**, `devices NikonTI` prints eighteen devices on a laptop with no
   microscope in the room. A device list there is evidence of nothing; only
   `probe` is.
 
@@ -72,14 +72,14 @@ the same control code runs on both stands:
 
 ```
 roles:
-  XY stage          TIXYDrive          <- Ti           XYStage    <- Ti2
+  XY stage          TIXYDrive          <- Ti-E         XYStage    <- Ti2
   Z drive           TIZDrive                           ZDrive
   PFS (autofocus)   TIPFSStatus                        PFStatus
   PFS offset        TIPFSOffset                        PFSOffset
   objective turret  TINosePiece                        Nosepiece
 ```
 
-Type-first matters more than it looks: on the Ti, *three* devices report type
+Type-first matters more than it looks: on the Ti-E, *three* devices report type
 `Stage` — the Z drive, the PFS offset and the TIRF drive — and picking the
 wrong one moves the wrong axis.
 
@@ -136,6 +136,31 @@ Nikon driver versions and nothing here drives it.
 The stand has to be **powered on** for this to find anything, since step 2
 asks the hardware.
 
+### When the stand contributes nothing
+
+If `build` reports devices from the camera only, the stand adapter did not
+load. `stand --deep` then loads the DLLs **directly** and reports Windows'
+own error, which MMCore hides behind one generic message:
+
+```bat
+nikon-control-scope stand --deep
+```
+
+- **WinError 126** — a dependency is missing. For a Nikon adapter that is
+  nearly always the vendor DLL not sitting beside it. Fix it with:
+  ```bat
+  nikon-control-scope fix-driver --stand ti2
+  ```
+  which copies (never moves) `Ti2_Mic_Driver.dll` from the Ti2 SDK into the
+  Micro-Manager folder, then re-checks. Micro-Manager's folder may need an
+  elevated prompt.
+- **WinError 193** — wrong architecture: a 32-bit DLL under a 64-bit
+  Micro-Manager, or the reverse.
+- **WinError 1114** — the DLL loaded but its init routine failed: a vendor
+  SDK version mismatch, or hardware that is powered off.
+- **WinError 127** — a missing entry point: the vendor DLL is a different
+  version from the one the adapter was built against.
+
 ### Or use Micro-Manager's Hardware Configuration Wizard
 
 The wizard ships with the Micro-Manager **GUI**, which the adapter download
@@ -143,6 +168,20 @@ may or may not include (`nikon-control-scope build` tells you if it is
 there). Use it when a device needs a **pre-init property** that cannot be
 guessed — a COM port, a camera model selection. Build the config there, then
 point this project at the file.
+
+### Why is the image black?
+
+A camera with no shutter or lamp device in the configuration returns a black
+frame and **no error**, which reads as a broken camera. The dashboard's light
+panel says which case you are in — *no light control in this config* (a dark
+frame is expected), *auto-shutter*, *shutter open*, or *shutter CLOSED* — and
+`Scope.illumination()` returns the same in a script.
+
+So a config with no stand has no light. Two further things to check once the
+stand is in: the **light path** must send light to the camera rather than the
+eyepieces, and on a brightfield rig the **dia lamp** must be on. That lamp is
+`TIDiaLamp` on the Ti-E; it is included by default, and `--skip TIDiaLamp` is
+the escape hatch if it destabilises your driver version.
 
 ### Check it either way
 

@@ -223,3 +223,30 @@ def test_build_button_writes_a_config_and_connects(tmp_path, doc, monkeypatch):
     click(doc, "snap")
     imgs = [m for m in doc.select({}) if "image" in getattr(m, "data", {})]
     assert imgs[0].data["image"][0].shape[0] > 1
+
+
+@needs_demo
+def test_light_panel_explains_a_dark_frame(doc, monkeypatch):
+    """The rig's question: 'I can snap, but is the light on?'"""
+    click(doc, "demo")
+    # the demo config has a shutter, so the panel reports its actual state
+    assert "shutter" in widget(doc, "light").text.lower() or \
+           "auto-shutter" in widget(doc, "light").text.lower()
+
+
+def test_light_panel_names_the_missing_device_when_there_is_none(doc,
+                                                                 monkeypatch):
+    """A camera-only config — exactly what the rig's build produced."""
+    from nikon_control.dashboard import scope_app
+    from nikon_control.scope.control import Scope
+
+    from tests.test_scope_control import ROLES, FakeCore
+
+    roles = {k: v for k, v in ROLES.items() if k != "shutter"}
+    monkeypatch.setattr(Scope, "demo",
+                        classmethod(lambda cls: Scope(FakeCore(), roles)))
+    click(doc, "demo")
+
+    text = widget(doc, "light").text
+    assert "no light control" in text
+    assert "dark frame is expected" in text

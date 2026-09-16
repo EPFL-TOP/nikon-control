@@ -46,10 +46,18 @@ CORE_ROLE_PROPERTIES = {
     "AutoFocus": "autofocus",
 }
 
-# Devices that are more trouble than they are worth in a generated config.
-# TIDiaLamp has crashed Micro-Manager with some Nikon driver versions, and
-# nothing in this project uses the transmitted-light lamp programmatically.
-SKIP_DEVICES = {"TIDiaLamp"}
+# Nothing is excluded by default. An earlier version left out TIDiaLamp
+# because it has crashed Micro-Manager with some Nikon driver versions — but
+# that device IS the transmitted-light source, and this project images
+# brightfield, so excluding it guarantees a config that can never turn the
+# light on. If it does destabilise a particular driver version, exclude it
+# explicitly with `--skip TIDiaLamp`.
+SKIP_DEVICES: set[str] = set()
+# Devices worth a warning when they are included.
+RISKY_DEVICES = {
+    "TIDiaLamp": "has crashed Micro-Manager with some Nikon driver versions; "
+                 "re-run with `--skip TIDiaLamp` if it does",
+}
 
 
 @dataclass
@@ -205,6 +213,21 @@ def build(core=None, *, stand_adapter: str | None = None,
         peripherals = [e.name for e in scan_adapter(library, core).devices
                        if e.type != "Hub"]
 
+    if not peripherals:
+        # Walking on in silence here produced a camera-only config and no
+        # explanation for it — the one thing the user most needed to read.
+        scan = scan_adapter(library, core)
+        result.notes.append(
+            f"The {library} adapter contributed NO devices, so this "
+            f"configuration has no stage, focus or PFS."
+        )
+        if scan.error:
+            result.notes.append(f"{library} error: {scan.error}")
+        if stand:
+            result.notes.append(stand.empty_list_meaning)
+            result.notes.append(
+                f"Diagnose it with: nikon-control-scope stand --deep")
+
     # --- peripherals, one at a time ---------------------------------------
     for name in peripherals:
         if name in skip:
@@ -228,6 +251,10 @@ def build(core=None, *, stand_adapter: str | None = None,
         result.devices.append(ConfigDevice(label, library, name,
                                            parent=hub_label,
                                            type=_type_name(core, label)))
+
+    for d in result.devices:
+        if warning := RISKY_DEVICES.get(d.device):
+            result.notes.append(f"{d.device} is included — it {warning}.")
 
     # --- the camera, which the stand never provides ------------------------
     cam = _add_camera(core, result, taken, camera_adapter, camera_device)
@@ -280,8 +307,13 @@ def _add_camera(core, result: BuildResult, taken: set[str],
                 core.loadDevice(label, lib, name)
                 core.initializeDevice(label)
             except Exception as exc:
-                result.failures.append((f"{lib}/{name}",
-                                        str(exc).split("\n")[0][:200]))
+                # Trying every installed camera adapter means most of them
+                # legitimately have no hardware behind them; that is not a
+                # fault worth alarming anyone about.
+                result.failures.append((
+                    f"{lib}/{name}",
+                    str(exc).split("\n")[0][:200]
+                    + " (expected, if this brand of camera is not fitted)"))
                 try:
                     core.unloadDevice(label)
                 except Exception:
@@ -322,7 +354,8 @@ def to_text(result: BuildResult, core=None) -> str:
     for prop, role in CORE_ROLE_PROPERTIES.items():
         if label := result.roles.get(role):
             lines.append(f"Property,Core,{prop},{label}")
-    lines.append("Property,Core,AutoShutter,1")
+    if result.roles.get("shutter"):
+        lines.append("Property,Core,AutoShutter,1")
 
     if core is not None:
         labels = _state_labels(core, result)

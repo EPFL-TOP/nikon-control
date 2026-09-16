@@ -12,7 +12,7 @@ Subcommands follow the order a rig is actually brought up:
     nikon-control-scope plate ...                register a plate on the stage
 
 Both stand generations are supported: the Ti2-E via ``NikonTi2`` and the
-older Ti/Ti-E via ``NikonTI``. Nothing above :mod:`.stand` names a device
+older Ti-E via ``NikonTI``. Nothing above :mod:`.stand` names a device
 directly — the commands report *roles*, so the same code serves both.
 """
 from __future__ import annotations
@@ -108,6 +108,11 @@ def _cmd_stand(args) -> int:
             _print_roles(st.roles)
         if st.usable:
             usable += 1
+        if args.deep and st.installed and not st.devices:
+            print("\n  deep check (asking Windows why the adapter will not "
+                  "load):")
+            for line in discover.deep_check(st.stand, mm):
+                print(f"    {line}")
         if args.notes:
             print("\n  notes:")
             for n in st.stand.notes:
@@ -130,6 +135,20 @@ def _cmd_stand(args) -> int:
         print("No stand is ready yet. Fix the driver findings above, then "
               "re-run this command.")
     return 0 if usable else 1
+
+
+def _cmd_fix_driver(args) -> int:
+    st = stand_mod.STANDS_BY_KEY[args.stand]
+    mm = discover.mm_install()
+    ok, msg = discover.install_driver(st, mm, args.source)
+    print(msg)
+    if not ok:
+        return 1
+    print("\nre-checking:")
+    for line in discover.deep_check(st, mm):
+        print(f"  {line}")
+    print("\nthen: nikon-control-scope stand")
+    return 0
 
 
 def _cmd_probe(args) -> int:
@@ -294,7 +313,20 @@ def main() -> None:
                                       "machine can drive, and its roles")
     st.add_argument("--notes", action="store_true",
                     help="print each stand's known gotchas too")
+    st.add_argument("--deep", action="store_true",
+                    help="for a stand whose adapter offers no devices, load "
+                         "the DLLs directly and report the operating "
+                         "system's own error (Windows only)")
     st.set_defaults(func=_cmd_stand)
+
+    fd = sub.add_parser("fix-driver",
+                        help="copy a stand's vendor DLL into the "
+                             "Micro-Manager folder, where the adapter looks")
+    fd.add_argument("--stand", default="ti2", choices=["ti2", "ti"],
+                    help="which stand's driver (default ti2)")
+    fd.add_argument("--from", dest="source", default=None,
+                    help="copy from this path instead of the vendor default")
+    fd.set_defaults(func=_cmd_fix_driver)
 
     d = sub.add_parser("devices", help="list the devices one adapter offers")
     d.add_argument("adapter")

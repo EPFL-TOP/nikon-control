@@ -201,3 +201,57 @@ def test_dll_in_the_sdk_folder_is_not_enough_for_the_ti2():
                        .diagnosis("C:/mm"))
     assert "found at" in ti_text
     assert "COPY" not in ti_text
+
+
+def test_dll_probe_refuses_cleanly_off_windows_and_on_a_missing_file():
+    ok, why = discover.dll_probe(Path("/definitely/not/here.dll"))
+    assert ok is False and why
+
+
+def test_winerror_hints_cover_the_load_failures_that_actually_happen():
+    """MMCore reports one generic message for all of these; they differ."""
+    hints = discover.WINERROR_HINTS
+    assert "vendor driver DLL not sitting beside it" in hints[126]
+    assert "architecture" in hints[193]
+    assert "initialisation routine failed" in hints[1114]
+
+
+def test_install_driver_refuses_rather_than_guessing(tmp_path):
+    from nikon_control.scope.stand import TI2
+
+    ok, msg = discover.install_driver(TI2, tmp_path,
+                                      source=tmp_path / "nope.dll")
+    assert ok is False
+    assert "does not exist" in msg
+
+
+def test_install_driver_copies_and_leaves_the_source_alone(tmp_path):
+    """Copy, never move — the vendor's own software still needs its copy."""
+    from nikon_control.scope.stand import TI2
+
+    src = tmp_path / "src" / TI2.driver.dll
+    src.parent.mkdir()
+    src.write_bytes(b"not really a dll")
+    mm = tmp_path / "mm"
+    mm.mkdir()
+
+    ok, msg = discover.install_driver(TI2, mm, source=src)
+    assert ok, msg
+    assert (mm / TI2.driver.dll).exists()
+    assert src.exists(), "the source was moved instead of copied"
+
+    # and the stand now regards its driver as satisfied
+    assert discover.find_driver(TI2, mm).satisfied
+
+    # running it twice is not an error
+    ok2, msg2 = discover.install_driver(TI2, mm, source=src)
+    assert ok2 and "already there" in msg2
+
+
+def test_adapter_dll_path_matches_micro_managers_naming(tmp_path):
+    from nikon_control.scope.stand import TI2
+
+    assert discover.adapter_dll(TI2, tmp_path) is None
+    (tmp_path / "mmgr_dal_NikonTi2.dll").write_bytes(b"x")
+    found = discover.adapter_dll(TI2, tmp_path)
+    assert found and found.name == "mmgr_dal_NikonTi2.dll"
