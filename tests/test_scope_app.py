@@ -378,3 +378,76 @@ def test_changing_plate_type_drops_wells_that_no_longer_exist(doc):
     widget(doc, "plate_type").value = "6-well"
     click(doc, "wells_none")          # touches the selection for the new plate
     assert "no wells selected" in widget(doc, "wells_status").text
+
+
+@needs_demo
+def test_build_refuses_to_replace_an_existing_config_without_consent(doc, tmp_path):
+    """Regression: the Build button truncated the connected .cfg.
+
+    The target is pre-filled with the file the session connected to — the
+    same file the Channels tab appends presets into — and a degraded build
+    (only the camera connects) still reached the write.
+    """
+    cfg = tmp_path / "MMConfig.cfg"
+    cfg.write_text("Property,Core,Initialize,1\n"
+                   "ConfigGroup,Channel,BF,DiaLamp,State,1\n")
+    original = cfg.read_text()
+    by_title(doc, "Micro-Manager configuration (.cfg)").value = str(cfg)
+    click(doc, "demo")
+
+    from nikon_control.scope import config_build
+    real_build = config_build.build
+    monkey = lambda core=None, **kw: real_build(core, stand_adapter="DemoCamera")
+    config_build.build, saved = monkey, config_build.build
+    try:
+        click(doc, "build")
+        _drain_next_ticks(doc)
+        assert cfg.read_text() == original, "the config was overwritten"
+        assert "tick 'replace" in widget(doc, "status").text
+
+        # consent, and it writes — keeping a backup and the channel preset
+        overwrite = widget(doc, "overwrite")
+        overwrite.active = [0]
+        click(doc, "build")
+        _drain_next_ticks(doc)
+    finally:
+        config_build.build = saved
+
+    assert cfg.read_text() != original
+    assert (tmp_path / "MMConfig.cfg.bak").exists(), "no backup was kept"
+    assert "ConfigGroup,Channel,BF" in cfg.read_text(), \
+        "the rebuild destroyed the channel preset"
+
+
+@needs_demo
+def test_a_failed_well_move_is_not_reported_as_success(doc):
+    """Regression: on_well_tap printed 'moved to X' over run()'s failure."""
+    click(doc, "demo")
+    well_box = widget(doc, "well")
+    for name, x, y in [("A1", 1000.0, 2000.0),
+                       ("A12", 100000.0, 2000.0),
+                       ("H1", 1000.0, -61000.0)]:
+        goto(doc, x, y)
+        well_box.value = name
+        click(doc, "capture")
+    click(doc, "calibrate")
+
+    # arm "click = drive", then break the stage
+    widget(doc, "click_mode").active = 1
+    src = widget(doc, "wells")
+
+    import nikon_control.scope.control as control_mod
+    real = control_mod.Scope.move_xy
+
+    def boom(self, *a, **kw):
+        raise control_mod.ScopeError("stage not responding")
+
+    control_mod.Scope.move_xy = boom
+    try:
+        src.selected.indices = [src.data["name"].index("B2")]
+    finally:
+        control_mod.Scope.move_xy = real
+
+    text = widget(doc, "status").text
+    assert "moved to B2" not in text
+    assert "stage not responding" in text

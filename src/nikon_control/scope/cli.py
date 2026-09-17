@@ -224,18 +224,31 @@ def _cmd_build(args) -> int:
                   f"properties this command cannot guess.")
         return 1
 
-    text = config_build.to_text(result, core)
+    # Carry over the channel presets / pixel sizes the generator does not
+    # write, or --force silently deletes the illumination definitions that
+    # describe the experiment.
+    text = config_build.to_text(result, core, preserve_from=args.out)
     if args.dry_run:
         print("\n--- would write ---")
         print(text)
         return 0
 
     out = Path(args.out)
+    kept = config_build.preserved_lines(out)
     if out.exists() and not args.force:
-        print(f"\n{out} already exists — pass --force to overwrite.")
+        print(f"\n{out} already exists — pass --force to replace it.")
+        if kept:
+            print(f"  it holds {len(kept)} channel-preset / pixel-size "
+                  f"line(s); --force keeps them and saves a .bak.")
         return 1
+    if out.exists():
+        backup = out.with_suffix(out.suffix + ".bak")
+        backup.write_text(out.read_text())
+        print(f"\nprevious configuration saved as {backup}")
     out.write_text(text)
-    print(f"\nwrote {out}")
+    print(f"wrote {out}")
+    if kept:
+        print(f"  carried over {len(kept)} channel-preset / pixel-size line(s)")
     print(f"check it with:  nikon-control-scope config {out}")
     print(f"then connect the /scope dashboard to it, or:\n"
           f"  nikon-control-dashboard --mm-config {out.resolve()}")

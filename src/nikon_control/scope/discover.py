@@ -248,11 +248,33 @@ def probe(library: str, name: str, *, read_properties: bool = True,
         return ProbeResult(library, name, False,
                            f"no adapter named {library!r} is installed.{hint}")
 
+    # Both Nikon stands are hub-based: a peripheral loaded with no parent
+    # does not initialise, so probing one without its hub would report every
+    # device on a perfectly healthy microscope as "not connected". MMCore
+    # neither auto-loads a parent nor assigns one.
+    hub_label = ""
+    hub_name = _hub_of(core, library)
+    if hub_name and hub_name != name:
+        hub_label = "__probe_hub__"
+        try:
+            core.loadDevice(hub_label, library, hub_name)
+            core.initializeDevice(hub_label)
+        except Exception as exc:
+            return ProbeResult(library, name, False,
+                               f"the {library} hub ({hub_name}) would not "
+                               f"initialise, so {name} cannot be reached: "
+                               f"{exc}")
+
     label = "__probe__"
     try:
         core.loadDevice(label, library, name)
     except Exception as exc:
         return ProbeResult(library, name, False, f"load failed: {exc}")
+    if hub_label:
+        try:
+            core.setParentLabel(label, hub_label)
+        except Exception:
+            pass
     try:
         core.initializeDevice(label)
     except Exception as exc:
@@ -268,11 +290,22 @@ def probe(library: str, name: str, *, read_properties: bool = True,
                     props[str(p)] = "<unreadable>"
         except Exception:
             pass
-    try:
-        core.unloadDevice(label)
-    except Exception:
-        pass
+    for lbl in (label, hub_label):
+        if not lbl:
+            continue
+        try:
+            core.unloadDevice(lbl)
+        except Exception:
+            pass
     return ProbeResult(library, name, True, "", props)
+
+
+def _hub_of(core, library: str) -> str:
+    """The Hub-typed device an adapter offers, if it has one."""
+    for entry in scan_adapter(library, core).devices:
+        if entry.type == "Hub":
+            return entry.name
+    return ""
 
 
 def find_driver(stand: Stand, mm_dir: Path | None = None) -> DriverLocation:
@@ -285,8 +318,20 @@ def find_driver(stand: Stand, mm_dir: Path | None = None) -> DriverLocation:
     dll = stand.driver.dll
     mm_dir = mm_dir if mm_dir is not None else mm_install()
     if mm_dir:
+        # Beside the adapter means a DIRECT child of the Micro-Manager
+        # folder. A copy in some subdirectory satisfies a recursive search
+        # and still does not satisfy the loader, which is the failure this
+        # whole check exists to catch.
+        direct = Path(mm_dir) / dll
+        try:
+            if direct.exists():
+                return DriverLocation(dll, direct, beside_adapter=True,
+                                      satisfied=True)
+        except OSError:
+            pass
         for hit in Path(mm_dir).rglob(dll):
-            return DriverLocation(dll, hit, beside_adapter=True, satisfied=True)
+            return DriverLocation(dll, hit, beside_adapter=False,
+                                  satisfied=not stand.driver.beside_adapter)
     sdk = Path(stand.driver.sdk_path) / dll
     try:
         if sdk.exists():

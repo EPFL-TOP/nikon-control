@@ -168,3 +168,54 @@ def test_autoshutter_is_only_claimed_when_a_shutter_exists():
         cb.ConfigDevice("Sh", "NikonTi2", "Shutter", type="Shutter"))
     result.roles["shutter"] = "Sh"
     assert "Property,Core,AutoShutter,1" in cb.to_text(result)
+
+
+def test_rebuilding_preserves_channel_presets(tmp_path):
+    """Regression: re-running the build deleted every channel definition.
+
+    They are written into the same file by `nikon-control-scope channel` and
+    by the dashboard's Capture button, and the generator does not produce
+    them — so an unconditional rewrite silently destroyed the illumination
+    settings that define the experiment.
+    """
+    from nikon_control.scope import channels
+
+    cfg = tmp_path / "MMConfig.cfg"
+    result = cb.BuildResult(
+        devices=[cb.ConfigDevice("Cam", "PVCAM", "Camera-1", type="Camera")],
+        roles={"camera": "Cam"})
+    cfg.write_text(cb.to_text(result))
+
+    channels.append_to_config(
+        cfg, channels.Preset("BF", [channels.Setting("DiaLamp", "State", "1")]))
+    channels.append_to_config(
+        cfg, channels.Preset("GFP", [channels.Setting("FilterTurret2", "Label",
+                                                      "3-GF")]))
+    assert set(channels.read_presets(cfg)) == {"BF", "GFP"}
+
+    # rebuild over the same file
+    cfg.write_text(cb.to_text(result, preserve_from=cfg))
+
+    assert set(channels.read_presets(cfg)) == {"BF", "GFP"}, \
+        "the rebuild destroyed the channel presets"
+
+
+def test_preserved_lines_covers_what_the_generator_does_not_write(tmp_path):
+    cfg = tmp_path / "MMConfig.cfg"
+    cfg.write_text("\n".join([
+        "Device,Cam,PVCAM,Camera-1",              # generated — not preserved
+        "Property,Core,Camera,Cam",               # generated — not preserved
+        "ConfigGroup,Channel,BF,DiaLamp,State,1",
+        "ConfigPixelSize,40x,Nosepiece,Label,3-Plan Apo 40x",
+        "PixelSize_um,40x,0.1625",
+        "Delay,FilterTurret1,50",
+        "FocusDirection,ZDrive,0",
+    ]))
+    kept = cb.preserved_lines(cfg)
+    assert len(kept) == 5
+    assert not any(ln.startswith("Device,") for ln in kept)
+    assert not any(ln.startswith("Property,") for ln in kept)
+
+
+def test_preserved_lines_on_a_missing_file_is_empty(tmp_path):
+    assert cb.preserved_lines(tmp_path / "nope.cfg") == []

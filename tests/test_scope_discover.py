@@ -255,3 +255,46 @@ def test_adapter_dll_path_matches_micro_managers_naming(tmp_path):
     (tmp_path / "mmgr_dal_NikonTi2.dll").write_bytes(b"x")
     found = discover.adapter_dll(TI2, tmp_path)
     assert found and found.name == "mmgr_dal_NikonTi2.dll"
+
+
+def test_a_dll_in_a_subfolder_is_not_beside_the_adapter(tmp_path):
+    """Regression: rglob marked a copy anywhere under the MM tree as
+    correctly installed, but the Ti2 adapter loads its driver only from the
+    folder it sits in — the exact failure this check exists to catch."""
+    from nikon_control.scope.stand import TI2
+
+    mm = tmp_path / "mm"
+    (mm / "sub").mkdir(parents=True)
+    (mm / "sub" / TI2.driver.dll).write_bytes(b"x")
+
+    found = discover.find_driver(TI2, mm)
+    assert found.path is not None            # it is on the machine…
+    assert found.beside_adapter is False     # …but not where it must be
+    assert found.satisfied is False
+    assert "COPY it" in " ".join(
+        discover.StandStatus(TI2, True, [], "", found, {}).diagnosis(mm))
+
+    # a direct child is the real thing
+    (mm / TI2.driver.dll).write_bytes(b"x")
+    ok = discover.find_driver(TI2, mm)
+    assert ok.beside_adapter and ok.satisfied
+    assert ok.path.parent == mm
+
+
+@needs_demo
+def test_probe_loads_the_parent_hub_for_a_hub_based_adapter():
+    """Both Nikon stands are hub-based: a peripheral with no parent does not
+    initialise, so probing without the hub would report every device on a
+    healthy microscope as not connected."""
+    res = discover.probe("DemoCamera", "DXYStage")
+    assert res.ok, res.error
+
+    # and the probe leaves nothing loaded behind it
+    core = discover.new_core()
+    discover.probe("DemoCamera", "DCam", core_factory=lambda: core)
+    assert [d for d in core.getLoadedDevices() if str(d) != "Core"] == []
+
+
+@needs_demo
+def test_probing_the_hub_itself_still_works():
+    assert discover.probe("DemoCamera", "DHub").ok

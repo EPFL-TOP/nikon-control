@@ -185,14 +185,29 @@ def measure(scope, *, channels=None, repeats: int = REPEATS,
             was = scope.pfs_engaged()
             # Each timed engage must start from disengaged — engaging while
             # already locked returns instantly and would time a no-op.
-            samples = []
+            samples, locked = [], []
             for _ in range(repeats):
                 scope.disengage_pfs()
-                samples.append(_time_ms(scope.engage_pfs))
+                start = time.perf_counter()
+                ok = scope.engage_pfs()
+                samples.append((time.perf_counter() - start) * 1000.0)
+                locked.append(bool(ok))
             if not was:
                 scope.disengage_pfs()
-            t.refocus_ms = statistics.median(samples)
-            t.samples += repeats
+            if all(locked):
+                t.refocus_ms = statistics.median(samples)
+                t.samples += repeats
+            else:
+                # An engage that never locks returns after the timeout, and
+                # recording that as the refocus cost turns a 5 s timeout into
+                # a "measurement" that the whole experiment gets planned on —
+                # in the module whose own docstring says a silent plausible
+                # default is worse than no estimate.
+                t.refocus_ms = ASSUMED_PFS_LOCK_MS
+                t.assumed.append(
+                    f"PFS never locked ({sum(locked)}/{len(locked)} samples) "
+                    f"— lock time is not measurable without a dish in range, "
+                    f"so {ASSUMED_PFS_LOCK_MS:.0f} ms is assumed")
         except Exception:
             t.refocus_ms = ASSUMED_PFS_LOCK_MS
             t.assumed.append(f"PFS lock {ASSUMED_PFS_LOCK_MS:.0f} ms "

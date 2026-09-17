@@ -187,3 +187,31 @@ def test_each_pfs_sample_starts_from_disengaged():
     for i in engages[:3]:
         assert i > 0 and order[i - 1] == "off", \
             f"an engage at {i} was not preceded by a disengage: {order}"
+
+
+def test_a_pfs_that_never_locks_is_assumed_not_measured():
+    """Regression: a 5 s timeout was recorded as the measured refocus cost.
+
+    The whole experiment gets planned on that number — it turned ~300
+    positions per interval into 47, in the module whose docstring says a
+    silent plausible default is worse than no estimate.
+    """
+    from nikon_control.scope.control import Scope
+    from tests.test_scope_control import ROLES, NeverLocks
+
+    scope = Scope(NeverLocks(), ROLES)
+    t = timing.measure(scope, channels=[], repeats=2, distances=(200.0,))
+
+    assert t.refocus_ms == timing.ASSUMED_PFS_LOCK_MS
+    assert any("never locked" in a for a in t.assumed)
+    assert any("assumed" in line for line in t.describe())
+
+
+def test_a_pfs_that_locks_is_measured_normally():
+    from nikon_control.scope.control import Scope
+    from tests.test_scope_control import ROLES, FakeCore
+
+    scope = Scope(FakeCore(), ROLES)
+    t = timing.measure(scope, channels=[], repeats=2, distances=(200.0,))
+    assert not any("never locked" in a for a in t.assumed)
+    assert t.samples > 0

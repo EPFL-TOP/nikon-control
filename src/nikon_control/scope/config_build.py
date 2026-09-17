@@ -339,12 +339,41 @@ def _add_camera(core, result: BuildResult, taken: set[str],
     return ""
 
 
-def to_text(result: BuildResult, core=None) -> str:
+# Directives this generator does not produce, and therefore must never
+# destroy. Channel presets are the painful one: they are written into the same
+# file by `nikon-control-scope channel` / the dashboard's Capture button, and
+# re-running a build used to silently delete every one of them.
+PRESERVED_DIRECTIVES = ("ConfigGroup", "ConfigPixelSize", "PixelSize_um",
+                        "PixelSizeAffine", "Delay", "FocusDirection",
+                        "ParentID", "ImageSynchro")
+
+
+def preserved_lines(path) -> list[str]:
+    """Lines in an existing .cfg that a rebuild must carry over."""
+    from pathlib import Path
+
+    p = Path(path)
+    if not p.exists():
+        return []
+    try:
+        text = p.read_text()
+    except OSError:
+        return []
+    return [ln for ln in text.splitlines()
+            if ln.split(",")[0].strip() in PRESERVED_DIRECTIVES]
+
+
+def to_text(result: BuildResult, core=None, preserve_from=None) -> str:
     """Render a ``.cfg``.
 
     State labels are written out for every State device that has them, so a
     reloaded configuration still calls objective 3 "Plan Fluor 40x" instead
     of "State-2".
+
+    ``preserve_from`` is the file being replaced: its channel presets, pixel
+    sizes and delays are carried into the new text, because this generator
+    does not produce them and overwriting without them silently destroys the
+    channel definitions that describe the experiment.
     """
     stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     lines = [
@@ -374,6 +403,13 @@ def to_text(result: BuildResult, core=None) -> str:
         labels = _state_labels(core, result)
         if labels:
             lines += ["", "# Labels", *labels]
+
+    carried = preserved_lines(preserve_from) if preserve_from else []
+    if carried:
+        lines += ["", "# Carried over from the previous configuration",
+                  "# (channel presets, pixel sizes, delays — this generator "
+                  "does not produce them)"]
+        lines += carried
 
     if result.failures:
         lines += ["", "# Did not connect:"]

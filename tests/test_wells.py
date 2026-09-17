@@ -186,3 +186,66 @@ def test_loading_a_missing_or_broken_file_returns_none(tmp_path):
     bad = tmp_path / "bad.json"
     bad.write_text("{not json")
     assert wells.load_selection(bad) is None
+
+
+def test_the_visiting_order_reaches_the_plan_and_the_file(tmp_path, cal96):
+    """Regression: the serpentine choice only changed a label on screen.
+
+    to_plan and save_selection both used ordered(), so the order the
+    operator picked never left the dashboard.
+    """
+    sel = wells.Selection("96-well").add(wells.parse("96-well", "A1:B4"))
+    assert sel.serpentine_order is True
+    assert [p.name for p in sel.to_plan(cal96).image_positions] == \
+        ["A1", "A2", "A3", "A4", "B4", "B3", "B2", "B1"]
+
+    sel.serpentine_order = False
+    assert [p.name for p in sel.to_plan(cal96).image_positions] == \
+        ["A1", "A2", "A3", "A4", "B1", "B2", "B3", "B4"]
+
+    path = tmp_path / "plate.json"
+    plate_mod.save(cal96, path)
+    sel.serpentine_order = True
+    wells.save_selection(sel, path)
+    import json
+    saved = json.loads(path.read_text())
+    assert saved["wells"][4] == "B4", "the file records raster, not the route"
+    assert saved["serpentine"] is True
+    assert wells.load_selection(path).serpentine_order is True
+
+
+def test_re_registering_the_plate_keeps_the_well_selection(tmp_path, cal96):
+    """Regression: plate.save() truncated the file, deleting the wells key.
+
+    The merge was one-way — wells.save_selection preserved the calibration,
+    but saving the calibration destroyed the selection.
+    """
+    path = tmp_path / "plate.json"
+    plate_mod.save(cal96, path)
+    wells.save_selection(wells.Selection("96-well").add(["A1", "C5"]), path)
+
+    # re-register the plate (a nudged A1)
+    again = plate_mod.calibrate("96-well", [
+        plate_mod.WellRef("A1", 1010, 2010),
+        plate_mod.WellRef("A12", 100010, 2010),
+        plate_mod.WellRef("H1", 1010, -60990),
+    ])
+    plate_mod.save(again, path)
+
+    assert plate_mod.load(path).a1_center_xy[0] == pytest.approx(1010, abs=1)
+    kept = wells.load_selection(path)
+    assert kept is not None and kept.wells == {"A1", "C5"}
+
+
+def test_changing_plate_type_drops_wells_that_cannot_exist(tmp_path, cal96):
+    """H12 is not on a 6-well plate; carrying it over would break a scan."""
+    path = tmp_path / "plate.json"
+    plate_mod.save(cal96, path)
+    wells.save_selection(wells.Selection("96-well").add(["H12"]), path)
+
+    six = plate_mod.calibrate("6-well", [plate_mod.WellRef("A1", 0, 0)])
+    plate_mod.save(six, path)
+
+    loaded = wells.load_selection(path)
+    assert loaded.plate == "6-well"
+    assert loaded.wells == set()

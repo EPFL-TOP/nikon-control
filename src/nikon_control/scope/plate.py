@@ -242,10 +242,31 @@ def from_dict(obj: dict) -> PlateCalibration:
 
 
 def save(cal: PlateCalibration, path) -> None:
+    """Write a calibration, merging into whatever else the file holds.
+
+    The well selection lives in this same file (``wells.save_selection``
+    merges into it the other way round). A whole-file overwrite here would
+    make the merge one-way: re-registering the plate would silently delete
+    the wells someone chose.
+    """
     import json
     from pathlib import Path
 
-    Path(path).write_text(json.dumps(to_dict(cal), indent=2))
+    p = Path(path)
+    obj = {}
+    if p.exists():
+        try:
+            obj = json.loads(p.read_text())
+        except (ValueError, OSError):
+            obj = {}
+        if not isinstance(obj, dict):
+            obj = {}
+        if obj.get("plate") and obj["plate"] != cal.plate:
+            # A different plate type invalidates the well names too, so
+            # carrying them over would be worse than dropping them.
+            obj = {}
+    obj.update(to_dict(cal))
+    p.write_text(json.dumps(obj, indent=2))
 
 
 def load(path) -> PlateCalibration:

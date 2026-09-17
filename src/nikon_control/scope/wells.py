@@ -84,10 +84,12 @@ def grid(plate: str) -> WellGrid:
 
 @dataclass
 class Selection:
-    """Which wells are chosen, and the plate they belong to."""
+    """Which wells are chosen, the plate they belong to, and in what order."""
 
     plate: str
     wells: set[str] = field(default_factory=set)
+    # Serpentine by default: it is strictly less travel and never worse.
+    serpentine_order: bool = True
 
     def __post_init__(self) -> None:
         self.wells = {normalise(w) for w in self.wells}
@@ -145,9 +147,15 @@ class Selection:
     # ------------------------------------------------------------ ordering
 
     def ordered(self) -> list[str]:
-        """Selected wells in plate order — the order a scan should visit."""
+        """Selected wells in plate (raster) order."""
         g = grid(self.plate)
         return [n for n in g.all_names() if n in self.wells]
+
+    def visiting_order(self) -> list[str]:
+        """The order a scan should actually visit — what everything downstream
+        must use, so the choice reaches the plan and the saved file rather
+        than only the screen."""
+        return self.serpentine() if self.serpentine_order else self.ordered()
 
     def serpentine(self) -> list[str]:
         """Plate order, but alternate rows reversed.
@@ -178,7 +186,7 @@ class Selection:
             )
         g = grid(self.plate)
         rows, cols = [], []
-        for name in self.ordered():
+        for name in self.visiting_order():
             idx = g.index(name)
             if idx is not None:
                 rows.append(idx[0])
@@ -188,9 +196,10 @@ class Selection:
     def describe(self) -> str:
         if not self.wells:
             return f"{self.plate}: no wells selected"
-        names = self.ordered()
+        names = self.visiting_order()
         shown = ", ".join(names[:8]) + (" …" if len(names) > 8 else "")
-        return f"{self.plate}: {len(names)} well(s) — {shown}"
+        order = "serpentine" if self.serpentine_order else "raster"
+        return f"{self.plate}: {len(names)} well(s), {order} — {shown}"
 
 
 def parse(plate: str, text: str) -> list[str]:
@@ -255,7 +264,8 @@ def load_selection(path) -> Selection | None:
     plate = obj.get("plate")
     if not plate:
         return None
-    return Selection(str(plate), set(obj.get("wells", [])))
+    return Selection(str(plate), set(obj.get("wells", [])),
+                     serpentine_order=bool(obj.get("serpentine", True)))
 
 
 def save_selection(selection: Selection, path) -> None:
@@ -276,5 +286,8 @@ def save_selection(selection: Selection, path) -> None:
             f"a {selection.plate} selection over it."
         )
     obj.setdefault("plate", selection.plate)
-    obj["wells"] = selection.ordered()
+    # Saved in visiting order, so the file records the route rather than
+    # leaving every reader to re-derive it (and possibly differently).
+    obj["wells"] = selection.visiting_order()
+    obj["serpentine"] = selection.serpentine_order
     p.write_text(json.dumps(obj, indent=2))

@@ -103,6 +103,8 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
                          name="connect")
     demo_btn = Button(label="Demo devices", width=130, name="demo")
     build_btn = Button(label="Build from hardware", width=160, name="build")
+    overwrite_ck = CheckboxGroup(labels=["replace the existing file"],
+                                 active=[], width=210, name="overwrite")
     conn_div = Div(text=_badge("not connected", _DIM), width=460,
                    name="status")
     roles_div = Div(text="", width=460,
@@ -248,8 +250,11 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
     def scope() -> Scope | None:
         return state["scope"]
 
-    def run(fn) -> None:
+    def run(fn) -> bool:
         """Run a hardware action, reporting a failure instead of raising.
+
+        Returns whether it actually ran, so a caller cannot announce success
+        over the top of the failure this just displayed.
 
         Every control goes through this: a Bokeh callback that raises leaves
         the user staring at an unchanged page with the reason only in the
@@ -258,15 +263,17 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
         s = scope()
         if s is None:
             say("not connected", _WARN)
-            return
+            return False
         try:
             fn(s)
         except ScopeError as exc:
             say(str(exc), _WARN)
+            return False
         except Exception as exc:                       # noqa: BLE001
             say(f"{type(exc).__name__}: {exc}", _BAD)
-        else:
-            refresh()
+            return False
+        refresh()
+        return True
 
     def guard(fn):
         """Wrap a hardware action as a Button.on_click handler."""
@@ -379,8 +386,26 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
             say("; ".join(result.notes) or "nothing connected", _BAD)
             _unload(core)
             return
+        # The target is pre-filled with the file this session connected to —
+        # the one the Channels tab appends presets into, and the one someone
+        # may have hand-edited. A degraded build (stand powered on after the
+        # controller, so only the camera connects) still reaches here, so an
+        # unconditional write can replace a working configuration with a
+        # camera-only one and lose every channel preset with it.
+        target = Path(out)
+        if target.exists() and 0 not in overwrite_ck.active:
+            say(f"{target.name} already exists — tick 'replace the existing "
+                f"file' to overwrite it, or change the name. "
+                f"({len(result.devices)} device(s) were found.)", _WARN)
+            _unload(core)
+            return
+        backup = None
         try:
-            Path(out).write_text(config_build.to_text(result, core))
+            if target.exists():
+                backup = target.with_suffix(target.suffix + ".bak")
+                backup.write_text(target.read_text())
+            target.write_text(config_build.to_text(result, core,
+                                                   preserve_from=out))
         except Exception as exc:                        # noqa: BLE001
             say(f"built, but could not write {out}: {exc}", _BAD)
             _unload(core)
@@ -388,8 +413,11 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
         cfg_input.value = out
         failed = (f" — {len(result.failures)} device(s) did not connect"
                   if result.failures else "")
+        kept = len(config_build.preserved_lines(backup)) if backup else 0
         roles_div.text = (
             f"wrote <b>{out}</b>: {len(result.devices)} device(s){failed}"
+            + (f"<br>previous file saved as {backup.name}" if backup else "")
+            + (f"; carried {kept} preset/pixel-size line(s) over" if kept else "")
             + ("<br>did not connect: " +
                ", ".join(f"{n} ({w})" for n, w in result.failures[:6])
                if result.failures else ""))
@@ -833,8 +861,8 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
             selection().toggle(name)
             redraw_plate()
             return
-        run(lambda s: s.move_xy(wx, wy))
-        say(f"moved to {name}", _OK)
+        if run(lambda s: s.move_xy(wx, wy)):
+            say(f"moved to {name}", _OK)
 
     well_src.selected.on_change("indices", on_well_tap)
 
@@ -963,6 +991,7 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
         row(cfg_input,
             column(Div(text="<br>"),
                    row(connect_btn, build_btn, demo_btn))),
+        overwrite_ck,
         conn_div, roles_div,
     )
 
@@ -1025,6 +1054,20 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
         TabPanel(child=channel_panel, title="Channels"),
         TabPanel(child=throughput_panel, title="Throughput"),
     ], width=560)
+
+    def _on_session_end(session_context):
+        """A closed tab (or a dropped RDP session) must not leave the lamp
+        burning the specimen, nor keep the stand claimed against the next
+        session's Connect."""
+        if state.get("live_cb") is not None:
+            try:
+                doc.remove_periodic_callback(state["live_cb"])
+            except Exception:
+                pass
+            state["live_cb"] = None
+        _release()          # closes the shutter, then unloads the devices
+
+    doc.on_session_destroyed(_on_session_end)
 
     doc.add_root(column(connect_panel, row(image_panel, tabs)))
     doc.title = "Nikon scope control"

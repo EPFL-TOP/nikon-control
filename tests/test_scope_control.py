@@ -381,3 +381,104 @@ def test_scope_state_declares_every_field_it_reports(scope):
     # and every declared field is readable on a bare instance
     for name in declared:
         getattr(ScopeState(), name)
+
+
+# ------------------------------------------- the microscope that won't lock
+
+class NeverLocks(FakeCore):
+    """PFS switches on but never reports locked.
+
+    The normal state with no dish loaded, or a dish outside the search
+    range. The plain FakeCore locks instantly, which hid every bug on this
+    path — and this path is the likeliest one to hit on a real microscope.
+    """
+
+    def enableContinuousFocus(self, on):
+        self.continuous = bool(on)
+        self.locked = False
+        self.log.append(f"pfs={'on' if on else 'off'}")
+
+
+def test_engage_reports_failure_when_pfs_never_locks():
+    s = Scope(NeverLocks(), ROLES)
+    assert s.engage_pfs(timeout_s=0.05) is False
+    assert s.pfs_engaged() is True          # switched on…
+    assert s.pfs_locked() is False          # …but not holding
+
+
+def test_illumination_and_state_survive_a_pfs_that_never_locks():
+    s = Scope(NeverLocks(), ROLES)
+    s.engage_pfs(timeout_s=0.05)
+    st = s.state()
+    assert st.pfs_engaged and not st.pfs_locked
+    assert not st.error
+
+
+def test_move_z_restores_the_engage_attempt_even_without_a_lock():
+    """Z must not be left with PFS off just because it could not re-lock."""
+    s = Scope(NeverLocks(), ROLES)
+    s.engage_pfs(timeout_s=0.05)
+    s.move_z(50)
+    assert s.z() == 50
+    assert s.pfs_engaged(), "PFS was left switched off"
+
+
+# ---------------------------------------------- what counts as a channel
+
+def test_a_config_group_that_is_not_channels_is_not_treated_as_one():
+    """Guessing groups[0] drives whatever happens to be first — a Camera
+    group changes resolution mid-experiment, an Objective group rotates the
+    turret with none of set_objective's confirmation."""
+    class Grouped(FakeCore):
+        def getAvailableConfigGroups(self):
+            return ["Camera", "Objective", "System"]
+
+    s = Scope(Grouped(), ROLES)
+    assert s.channel_group() == ""
+    assert s.channels() == []
+    with pytest.raises(ScopeError, match="no channel group"):
+        s.set_channel("HighRes")
+
+
+def test_a_site_specific_channel_group_can_be_named_explicitly():
+    class Grouped(FakeCore):
+        def getAvailableConfigGroups(self):
+            return ["Illumination", "Camera"]
+
+    s = Scope(Grouped(), ROLES, channel_group="Illumination")
+    assert s.channel_group() == "Illumination"
+
+
+def test_an_override_naming_a_missing_group_is_ignored():
+    class Grouped(FakeCore):
+        def getAvailableConfigGroups(self):
+            return ["Camera"]
+
+    assert Scope(Grouped(), ROLES, channel_group="Nope").channel_group() == ""
+
+
+# ------------------------------------------------------ releasing hardware
+
+def test_close_darkens_the_lamp_before_releasing_the_devices():
+    """Unloading devices does not turn a lamp off; a released session that
+    left the shutter open keeps illuminating the specimen."""
+    core = FakeCore()
+    core.unloaded = False
+    core.unloadAllDevices = lambda: (core.log.append("unloadAll"),
+                                     setattr(core, "unloaded", True))
+    s = Scope(core, ROLES)
+    s.set_shutter(True)
+    core.log.clear()
+
+    s.close()
+
+    assert core.log == ["shutter=closed", "unloadAll"]
+    assert core.unloaded
+    assert s.roles == {}
+
+
+def test_close_is_safe_on_a_scope_with_no_shutter():
+    core = FakeCore()
+    core.unloadAllDevices = lambda: core.log.append("unloadAll")
+    Scope(core, {"camera": "Cam"}).close()
+    assert "unloadAll" in core.log

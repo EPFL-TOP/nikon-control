@@ -44,6 +44,9 @@ PFS_LOCK_TIMEOUT_S = 5.0
 # Property names that mean "how bright", across vendors. The Ti2's dia lamp
 # exposes its intensity as a device property, not as anything MMCore has an
 # API for, so it has to be found by name.
+# Config groups that mean "which channel". Nothing else is treated as one.
+CHANNEL_GROUP_NAMES = ("Channel", "Channels", "channel")
+
 INTENSITY_HINTS = ("intensity", "brightness", "power", "level", "voltage")
 # …but only looked for on devices that could plausibly BE a light source.
 # Sweeping every device finds things like a demo camera's "BeadBrightness"
@@ -140,9 +143,13 @@ class Scope:
     """
 
     def __init__(self, core, roles: dict[str, str] | None = None,
-                 timeout_ms: int = DEVICE_TIMEOUT_MS):
+                 timeout_ms: int = DEVICE_TIMEOUT_MS,
+                 channel_group: str = ""):
         self.core = core
         self.role_warnings: list[str] = []
+        # A site whose channel group is named something else says so
+        # explicitly, rather than having it inferred.
+        self.channel_group_override = channel_group
         try:
             core.setTimeoutMs(int(timeout_ms))
         except Exception:
@@ -178,6 +185,14 @@ class Scope:
         one first, or the replacement fails with a hub that "would not
         initialise" and no hint that the cause is the previous connection.
         """
+        # Close the shutter first. Unloading the devices does not darken the
+        # lamp, so a session that ends with the shutter open leaves the
+        # transmitted light on the specimen for as long as nobody notices.
+        try:
+            if self.has("shutter"):
+                self.set_shutter(False)
+        except Exception:
+            pass
         try:
             self.core.unloadAllDevices()
         except Exception:
@@ -318,13 +333,21 @@ class Scope:
     def move_z_by(self, dz: float, **kw) -> float:
         return self.move_z(self.z() + float(dz), **kw)
 
-    def focus_by(self, dz: float) -> float:
-        """Shift focus by ``dz`` µm using whichever control is correct.
+    def focus_by(self, delta: float) -> float:
+        """Nudge focus by ``delta``, using whichever control is correct.
 
         PFS engaged → move the PFS offset, which is the only thing that
-        changes focus while locked. PFS off → move Z. Returns the new value
-        of whichever was moved.
+        changes focus while locked. PFS off → move Z.
+
+        **The units differ between those two cases**: microns for the Z
+        drive, the offset device's own units for the PFS offset, and one
+        offset unit is not one micron. Nothing here converts between them,
+        because the conversion is per-stand and per-objective and this code
+        does not know it. Callers that need a known physical distance must
+        use :meth:`move_z` (microns) or :meth:`set_pfs_offset` (offset
+        units) and say which they mean.
         """
+        dz = delta
         if self.pfs_engaged() and self.has("pfsoffset"):
             return self.set_pfs_offset(self.pfs_offset() + float(dz))
         return self.move_z_by(dz)
@@ -625,15 +648,26 @@ class Scope:
     # ------------------------------------------------------------- channels
 
     def channel_group(self) -> str:
-        """The config group that selects a channel, if there is one."""
+        """The config group that selects a channel, if there is one.
+
+        Only a group actually named for channels counts. An earlier version
+        fell back to the first group MMCore reported, which means
+        :meth:`set_channel` writes to whatever that happens to be — a
+        "Camera" group (silently changing resolution mid-experiment) or an
+        "Objective" group (rotating the turret under a loaded plate, with
+        none of the confirmation :meth:`set_objective` demands). A
+        configuration with no channel group has no channels; saying so is
+        the honest answer.
+        """
         try:
             groups = [str(g) for g in self.core.getAvailableConfigGroups()]
         except Exception:
             return ""
-        for want in ("Channel", "Channels", "channel"):
+        for want in CHANNEL_GROUP_NAMES:
             if want in groups:
                 return want
-        return groups[0] if groups else ""
+        return self.channel_group_override if \
+            self.channel_group_override in groups else ""
 
     def channels(self) -> list[str]:
         group = self.channel_group()
