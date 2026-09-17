@@ -32,8 +32,8 @@ from pathlib import Path
 import numpy as np
 
 from ..scope import (channels as channels_mod, config_build,
-                     plate as plate_mod, timing as timing_mod,
-                     wells as wells_mod)
+                     plate as plate_mod, scan as scan_mod,
+                     timing as timing_mod, wells as wells_mod)
 from ..scope.control import Scope, ScopeError
 from .common import build_image_figure, contrast_bounds
 
@@ -94,6 +94,11 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
         "syncing": False,
         "timings": None,        # timing_mod.Timings once measured
         "sel": None,            # wells_mod.Selection
+        "edges": {},            # well -> {"left": x, "right": x, ...}
+        "scan_plan": None,      # scan_mod.ScanPlan
+        "scan_iter": None,      # the running generator
+        "scan_cb": None,        # its periodic callback
+        "scan_stop": False,
     }
 
     # ------------------------------------------------------------- connect
@@ -195,12 +200,50 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
     budget_div = Div(text="", width=520, name="budget",
                      styles={"font-size": "14px"})
 
+    # ---------------------------------------------------------------- scan
+    px_spin = Spinner(title="Pixel size (µm/px)", low=0.0001, high=100,
+                      step=0.001, value=0.1625, width=150, name="pixel_size")
+    px_set = Button(label="Apply", width=80, name="pixel_set")
+    px_div = Div(text="", width=520, styles={"font-size": "12px"},
+                 name="pixel_status")
+    cover_spin = Spinner(title="Cover this fraction of each well", low=0.01,
+                         high=1.5, step=0.05, value=0.33, width=220)
+    scan_rows = Spinner(title="Rows", low=1, high=200, step=1, value=7,
+                        width=90, name="scan_rows")
+    scan_cols = Spinner(title="Columns", low=1, high=200, step=1, value=7,
+                        width=100, name="scan_cols")
+    fit_btn = Button(label="Fit grid to coverage", width=180, name="fit_grid")
+    overlap_spin = Spinner(title="Overlap (%)", low=0, high=90, step=5,
+                           value=10, width=110)
+    refocus_spin = Spinner(title="Refocus every N fields (0 = never)", low=0,
+                           high=1000, step=1, value=1, width=250)
+    scan_chan = Select(title="Channel (blank = leave as is)", options=[],
+                       value="", width=230, name="scan_channel")
+    scan_dir = TextInput(title="Write frames to", value="scan", width=330,
+                         name="scan_dir")
+    plan_btn = Button(label="Plan", width=90, name="scan_plan")
+    scan_btn = Button(label="▶ Run scan", button_type="primary", width=130,
+                      name="scan_run")
+    stop_btn = Button(label="■ Stop", width=90, name="scan_stop")
+    scan_div = Div(text="", width=520, name="scan_status")
+    scan_progress = Div(text="", width=520, name="scan_progress",
+                        styles={"font-family": "monospace",
+                                "font-size": "12px"})
+
     # --------------------------------------------------------------- plate
     plate_sel = Select(title="Plate", options=PLATE_TYPES, value="96-well",
                        width=130, name="plate_type")
     well_input = TextInput(title="Well", value="A1", width=80, name="well")
-    capture_btn = Button(label="Capture current XY", button_type="primary",
-                         width=160, name="capture")
+    capture_btn = Button(label="Centre is here", button_type="primary",
+                         width=140, name="capture")
+    edge_x0 = Button(label="◀ −X wall", width=95, name="edge_x0")
+    edge_x1 = Button(label="+X wall ▶", width=95, name="edge_x1")
+    edge_y0 = Button(label="▼ −Y wall", width=95, name="edge_y0")
+    edge_y1 = Button(label="▲ +Y wall", width=95, name="edge_y1")
+    edge_use = Button(label="Centre from walls", button_type="success",
+                      width=160, name="edge_use")
+    edge_div = Div(text="", width=520, name="edge_status",
+                   styles={"font-size": "12px"})
     clear_btn = Button(label="Clear", width=70)
     calib_btn = Button(label="Calibrate", button_type="success", width=110,
                        name="calibrate")
@@ -332,6 +375,7 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
             say(f"connected: {what}", _OK)
         sync(obj_sel, s.objectives(), "options")
         show_channels()
+        show_pixel_size()
         for warning in s.role_warnings:
             roles_div.text += f"<br><b style='color:#b36b00'>{warning}</b>"
         refresh()
@@ -565,6 +609,7 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
         names = s.channels()
         sync(channel_sel, names, "options")
         sync(acq_channels, names, "options")
+        sync(scan_chan, [""] + names, "options")
         chan_list.text = ("channels: " + ", ".join(f"<b>{n}</b>" for n in names)
                           if names else
                           "<i>no channels defined yet — set the light path, "
@@ -665,6 +710,181 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
     for w in (interval_spin, duration_spin, npos_spin, movedist_spin):
         w.on_change("value", lambda attr, old, new: recompute_budget())
     acq_channels.on_change("value", lambda attr, old, new: recompute_budget())
+
+    # ---------------------------------------------------------------- scan
+
+    def show_pixel_size() -> None:
+        s = scope()
+        if s is None:
+            return
+        px = s.pixel_size_um()
+        if px > 0:
+            try:
+                w, h = s.fov_um()
+                px_div.text = (f"<b>{px:g} µm/px</b> → field "
+                               f"{w:.0f} × {h:.0f} µm")
+            except ScopeError as exc:
+                px_div.text = str(exc)
+            sync(px_spin, px)
+            return
+        guess, how = s.suggest_pixel_size_um()
+        if guess > 0:
+            sync(px_spin, round(guess, 5))
+        px_div.text = (
+            _badge("no pixel size configured", _WARN)
+            + f" — a scan grid needs one. Suggestion: <b>{guess:g}</b> µm/px "
+              f"({how})" if guess > 0 else
+            _badge("no pixel size configured", _WARN) + f" — {how}. "
+            f"Measure it with a stage micrometer and enter it.")
+
+    def do_set_pixel_size() -> None:
+        if run(lambda s: s.set_pixel_size_um(float(px_spin.value))):
+            show_pixel_size()
+
+    px_set.on_click(do_set_pixel_size)
+
+    def _well_um():
+        try:
+            return plate_mod.well_size_um(plate_sel.value)
+        except Exception:
+            return None
+
+    def do_fit_grid() -> None:
+        s = scope()
+        if s is None:
+            say("not connected", _WARN)
+            return
+        try:
+            fov = s.fov_um()
+        except ScopeError as exc:
+            scan_div.text = _badge(str(exc), _WARN)
+            return
+        well_um = _well_um()
+        if not well_um:
+            scan_div.text = _badge("unknown plate type", _WARN)
+            return
+        rows, cols = scan_mod.fields_for_coverage(
+            fov, well_um, float(cover_spin.value),
+            float(overlap_spin.value) / 100.0)
+        sync(scan_rows, rows)
+        sync(scan_cols, cols)
+        do_plan_scan()
+
+    fit_btn.on_click(do_fit_grid)
+
+    def do_plan_scan() -> None:
+        s = scope()
+        if s is None:
+            say("not connected", _WARN)
+            return
+        cal = state["cal"]
+        if cal is None:
+            scan_div.text = _badge(
+                "register the plate first — a scan needs to know where the "
+                "wells are", _WARN)
+            return
+        sel = selection()
+        if not sel.wells:
+            scan_div.text = _badge(
+                "select wells first, on the Plate tab", _WARN)
+            return
+        try:
+            fov = s.fov_um()
+        except ScopeError as exc:
+            scan_div.text = _badge(str(exc), _WARN)
+            return
+        try:
+            sp = scan_mod.plan(cal, sel, fov_um=fov,
+                               rows=int(scan_rows.value),
+                               columns=int(scan_cols.value),
+                               overlap=float(overlap_spin.value) / 100.0)
+        except ValueError as exc:
+            scan_div.text = _badge(str(exc), _WARN)
+            return
+        state["scan_plan"] = sp
+        lines = sp.describe(_well_um())
+        t = state.get("timings")
+        if t is not None:
+            secs = scan_mod.estimate_seconds(
+                sp, t, channels=[scan_chan.value or ""],
+                refocus_every=int(refocus_spin.value))
+            lines.append(f"<b>≈ {secs / 60:.1f} min</b> from the measured "
+                         f"timings")
+        else:
+            lines.append("<i>measure the timings on the Throughput tab for a "
+                         "time estimate</i>")
+        scan_div.text = _badge("planned", _OK) + "<br>" + "<br>".join(lines)
+
+    plan_btn.on_click(do_plan_scan)
+    for w in (scan_rows, scan_cols, overlap_spin):
+        w.on_change("value", lambda a, o, n: None)
+
+    def do_run_scan() -> None:
+        if state["scan_cb"] is not None:
+            scan_div.text = _badge("a scan is already running", _WARN)
+            return
+        do_plan_scan()
+        sp = state["scan_plan"]
+        s = scope()
+        if sp is None or s is None:
+            return
+        state["scan_stop"] = False
+        try:
+            state["scan_iter"] = scan_mod.run_iter(
+                s, sp, scan_dir.value.strip() or "scan",
+                channel=scan_chan.value or "",
+                refocus_every=int(refocus_spin.value),
+                should_stop=lambda: state["scan_stop"])
+        except Exception as exc:                        # noqa: BLE001
+            scan_div.text = _badge(f"could not start: {exc}", _BAD)
+            return
+        # Stepped from a callback rather than run in a loop: a 361-field scan
+        # takes minutes, and a blocking callback would freeze the page for all
+        # of it — including the Stop button.
+        state["scan_cb"] = doc.add_periodic_callback(_scan_step, 20)
+        scan_btn.disabled = True
+
+    def _scan_step() -> None:
+        it = state.get("scan_iter")
+        if it is None:
+            _scan_finished()
+            return
+        try:
+            result = next(it)
+        except StopIteration:
+            _scan_finished()
+            return
+        except Exception as exc:                        # noqa: BLE001
+            scan_div.text = _badge(f"scan failed: {exc}", _BAD)
+            _scan_finished()
+            return
+        sp = state["scan_plan"]
+        done = len(result.frames) + len(result.failures)
+        total = sp.n_fields if sp else 0
+        bar = "█" * int(24 * done / total) if total else ""
+        scan_progress.text = (
+            f"{bar:<24} {done}/{total} — {len(result.frames)} frame(s)"
+            + (f", {len(result.failures)} failed" if result.failures else ""))
+
+    def _scan_finished() -> None:
+        if state["scan_cb"] is not None:
+            try:
+                doc.remove_periodic_callback(state["scan_cb"])
+            except Exception:
+                pass
+        state["scan_cb"] = None
+        state["scan_iter"] = None
+        scan_btn.disabled = False
+        out = Path(scan_dir.value.strip() or "scan")
+        scan_div.text = (_badge("scan finished", _OK)
+                         + f" manifest: {out / scan_mod.MANIFEST}")
+
+    def do_stop_scan() -> None:
+        state["scan_stop"] = True
+        scan_div.text = _badge("stopping after the current field…", _WARN)
+
+    scan_btn.on_click(do_run_scan)
+    stop_btn.on_click(do_stop_scan)
 
     # --------------------------------------------------------------- plate
 
@@ -784,6 +1004,74 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
 
     def do_clear() -> None:
         state["refs"] = []
+        state["edges"] = {}
+        show_edges()
+        show_refs()
+
+    # ---- wall touches, which is how a centre is really found -------------
+
+    def show_edges() -> None:
+        name = well_input.value.strip().upper()
+        got = state["edges"].get(name, {})
+        if not got:
+            edge_div.text = (
+                "<i>At 40× a well is not even visible — the field is ~333 µm "
+                "and a 96-well well is 6400 µm. So do not aim for the centre: "
+                "drive until the <b>wall</b> sits mid-image on one side, "
+                "capture, then the opposite side. The centre is the midpoint, "
+                "and the implied diameter checks itself.</i>")
+            return
+        edge_div.text = (f"<b>{name}</b> walls: "
+                         + ", ".join(f"{k} {v:.0f}" for k, v in
+                                     sorted(got.items())))
+
+    def _capture_edge(which: str):
+        def handler() -> None:
+            s = scope()
+            if s is None:
+                say("not connected", _WARN)
+                return
+            name = well_input.value.strip().upper()
+            if not name:
+                edge_div.text = _badge("name the well first", _WARN)
+                return
+            try:
+                here = s.xy()
+            except Exception as exc:                    # noqa: BLE001
+                say(f"could not read the stage: {exc}", _BAD)
+                return
+            value = here.x if which in ("left", "right") else here.y
+            state["edges"].setdefault(name, {})[which] = value
+            show_edges()
+        return handler
+
+    edge_x0.on_click(_capture_edge("left"))
+    edge_x1.on_click(_capture_edge("right"))
+    edge_y0.on_click(_capture_edge("bottom"))
+    edge_y1.on_click(_capture_edge("top"))
+
+    def do_centre_from_edges() -> None:
+        name = well_input.value.strip().upper()
+        got = state["edges"].get(name, {})
+        if not got:
+            edge_div.text = _badge("capture at least one wall in each axis "
+                                   "first", _WARN)
+            return
+        try:
+            centre = plate_mod.centre_from_edges(plate_sel.value, name, **got)
+        except ValueError as exc:
+            edge_div.text = _badge(str(exc), _WARN)
+            return
+        state["refs"] = [r for r in state["refs"]
+                         if r.name.upper() != centre.name]
+        state["refs"].append(centre.to_ref())
+        colour = _OK if centre.trustworthy else _WARN
+        edge_div.text = _badge("centre from walls", colour) + " " + \
+            centre.describe()
+        if not centre.trustworthy:
+            edge_div.text += ("<br><span style='color:#b36b00'>that is far "
+                              "from the plate's well size — a wall of the "
+                              "wrong well, or the wrong plate type</span>")
         show_refs()
 
     def do_calibrate() -> None:
@@ -803,9 +1091,10 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
         if not cal.rotation_estimated:
             notes.append("rotation assumed 0 — capture a far corner to "
                          "measure it")
-        if cal.residual_um > 50:
-            notes.append(f"residual {cal.residual_um:.0f} µm is large for "
-                         f"hand-centred wells; re-check the well names")
+        if cal.residual_um > plate_mod.GOOD_RESIDUAL_UM:
+            notes.append(f"residual {cal.residual_um:.0f} µm exceeds the "
+                         f"~{plate_mod.GOOD_RESIDUAL_UM:.0f} µm a well scan "
+                         f"can absorb — re-check the well names")
         cal_div.text = (_badge("registered", _OK) + " " + cal.describe() +
                         ("<br><span style='color:#b36b00'>" +
                          "; ".join(notes) + "</span>" if notes else ""))
@@ -815,6 +1104,7 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
     capture_btn.on_click(do_capture)
     clear_btn.on_click(do_clear)
     calib_btn.on_click(do_calibrate)
+    edge_use.on_click(do_centre_from_edges)
 
     def do_save() -> None:
         if state["cal"] is None:
@@ -1017,7 +1307,9 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
 
     plate_panel = column(
         row(plate_sel, well_input, capture_btn, clear_btn, calib_btn),
-        suggest_div, refs_div, cal_div,
+        suggest_div,
+        row(edge_x0, edge_x1, edge_y0, edge_y1, edge_use),
+        edge_div, refs_div, cal_div,
         row(plate_file, column(Div(text="<br>"), row(save_btn, load_btn))),
         Div(text="<b>Wells to image</b>", styles={"margin-top": "6px"}),
         row(wells_text, column(Div(text="<br>"),
@@ -1048,10 +1340,26 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
         measure_btn, timing_div, budget_div,
     )
 
+    scan_panel = column(
+        Div(text="<b>Scan the selected wells, field by field</b><br>"
+                 "<span style='font-size:12px;color:#666'>Frames plus a "
+                 "manifest recording every frame's stage position — which is "
+                 "what lets a cell found offline be driven back to.</span>"),
+        row(px_spin, column(Div(text="<br>"), px_set)),
+        px_div,
+        row(cover_spin, fit_btn),
+        row(scan_rows, scan_cols, overlap_spin),
+        refocus_spin,
+        row(scan_chan, scan_dir),
+        row(plan_btn, scan_btn, stop_btn),
+        scan_div, scan_progress,
+    )
+
     tabs = Tabs(tabs=[
         TabPanel(child=drive_panel, title="Drive"),
         TabPanel(child=plate_panel, title="Plate"),
         TabPanel(child=channel_panel, title="Channels"),
+        TabPanel(child=scan_panel, title="Scan"),
         TabPanel(child=throughput_panel, title="Throughput"),
     ], width=560)
 
@@ -1059,6 +1367,13 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
         """A closed tab (or a dropped RDP session) must not leave the lamp
         burning the specimen, nor keep the stand claimed against the next
         session's Connect."""
+        state["scan_stop"] = True
+        if state.get("scan_cb") is not None:
+            try:
+                doc.remove_periodic_callback(state["scan_cb"])
+            except Exception:
+                pass
+            state["scan_cb"] = None
         if state.get("live_cb") is not None:
             try:
                 doc.remove_periodic_callback(state["live_cb"])
@@ -1074,6 +1389,7 @@ def modify_doc(doc, config_path: str = "", plate_path: str = "") -> None:
 
     do_suggest()
     show_refs()
+    show_edges()
     if plate_path and Path(plate_path).exists():
         plate_file.value = plate_path
         do_load()

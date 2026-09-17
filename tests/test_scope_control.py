@@ -482,3 +482,62 @@ def test_close_is_safe_on_a_scope_with_no_shutter():
     core.unloadAllDevices = lambda: core.log.append("unloadAll")
     Scope(core, {"camera": "Cam"}).close()
     assert "unloadAll" in core.log
+
+
+# --------------------------------------------------- pixel size and the FOV
+
+def test_no_pixel_size_refuses_to_report_a_field_of_view():
+    """A scan grid built on a zero pixel size puts every field in one spot."""
+    class NoPixelSize(FakeCore):
+        def getPixelSizeUm(self): return 0.0
+        def getImageWidth(self): return 2048
+        def getImageHeight(self): return 2048
+
+    s = Scope(NoPixelSize(), ROLES)
+    assert s.pixel_size_um() == 0.0
+    with pytest.raises(ScopeError, match="no pixel size"):
+        s.fov_um()
+
+
+def test_field_of_view_is_pixels_times_pixel_size():
+    class Sized(FakeCore):
+        def getPixelSizeUm(self): return 0.1625
+        def getImageWidth(self): return 2048
+        def getImageHeight(self): return 2048
+
+    s = Scope(Sized(), ROLES)
+    assert s.image_shape() == (2048, 2048)
+    assert s.fov_um() == pytest.approx((332.8, 332.8))
+    # an explicit override wins, for a scan that knows better
+    assert s.fov_um(0.325) == pytest.approx((665.6, 665.6))
+
+
+def test_suggested_pixel_size_comes_from_the_camera_and_the_objective():
+    class Labelled(FakeCore):
+        def getStateLabel(self, dev): return "3-Plan Apo LmbdD0.25 40x"
+
+        def getLoadedDevices(self):
+            return ["Core", "Cam", "Turret", "IntermediateMagnification"]
+
+        def getDevicePropertyNames(self, label):
+            return {"Cam": ["PixelSize"],
+                    "IntermediateMagnification": ["Magnification"]}.get(label, [])
+
+        def getProperty(self, label, prop):
+            return {"PixelSize": "6.5", "Magnification": "1.0"}.get(prop, "0")
+
+        def isPropertyReadOnly(self, label, prop): return False
+        def hasPropertyLimits(self, label, prop): return False
+        def getAllowedPropertyValues(self, label, prop): return []
+
+    s = Scope(Labelled(), ROLES)
+    value, how = s.suggest_pixel_size_um()
+    assert value == pytest.approx(6.5 / 40)
+    assert "stage micrometer" in how
+
+
+def test_a_suggestion_is_refused_rather_than_guessed_without_the_inputs():
+    s = Scope(FakeCore(), ROLES)
+    value, how = s.suggest_pixel_size_um()
+    assert value == 0.0
+    assert "pixel pitch" in how

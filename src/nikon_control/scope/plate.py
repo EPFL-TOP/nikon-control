@@ -323,3 +323,130 @@ def nearest_well(cal: PlateCalibration, x: float, y: float
                key=lambda i: (lay.x[i] - x) ** 2 + (lay.y[i] - y) ** 2)
     dist = math.hypot(lay.x[best] - x, lay.y[best] - y)
     return lay.names[best], lay.x[best], lay.y[best], dist
+
+
+# ------------------------------------------------------- finding a well centre
+# You cannot centre a well by eye at 40x — the field of view is ~333 um and a
+# 96-well well is 6400 um across, so the well is not even visible. Two things
+# make this a non-problem:
+#
+# 1. **The tolerance is not microns.** A position error shifts the whole scan
+#    grid by that amount; it does not compound. Scan 15x15 fields of a 19-field
+#    well and there is ~700 um of margin on each side, so a few hundred um of
+#    registration error costs nothing. Rotation is the part worth care, which
+#    is why the references should be far apart.
+# 2. **Opposite edges beat a guessed centre.** Drive until the well wall sits
+#    in the middle of the image on one side, then the other: the centre is the
+#    midpoint. That needs no judgement about where a centre is, works at any
+#    magnification, and the implied diameter is a free check that you touched
+#    the right wall.
+#
+# Registration is also fine to do at 4x or 10x and then image at 40x. The
+# objectives are not parcentric, but that offset is a CONSTANT translation —
+# it shifts every reference equally, so it lands in a1_center_xy as a fixed
+# bias of tens of um, far inside tolerance. (It is a real problem only when
+# you must hit a specific cell across a magnification change, which is a
+# different job with a ~10 um budget.)
+
+# A registration this good is enough for a well scan with a sensible margin.
+GOOD_RESIDUAL_UM = 300.0
+# Two opposite edge touches imply a well diameter; this far off the plate
+# definition means a wall was mis-identified or the plate type is wrong.
+DIAMETER_TOLERANCE = 0.10  # 10%
+
+
+@dataclass(frozen=True)
+class EdgeCentre:
+    """A well centre worked out from wall touches, and how trustworthy it is."""
+
+    name: str
+    x: float
+    y: float
+    measured_width_um: float | None      # from an opposite X pair
+    measured_height_um: float | None     # from an opposite Y pair
+    nominal_um: float
+    assumed_axes: tuple[str, ...] = ()   # axes where only one edge was given
+
+    @property
+    def diameter_error(self) -> float:
+        """Worst relative disagreement with the plate's own well size."""
+        worst = 0.0
+        for measured in (self.measured_width_um, self.measured_height_um):
+            if measured and self.nominal_um:
+                worst = max(worst, abs(measured / self.nominal_um - 1.0))
+        return worst
+
+    @property
+    def trustworthy(self) -> bool:
+        return self.diameter_error <= DIAMETER_TOLERANCE
+
+    def to_ref(self) -> WellRef:
+        return WellRef(name=self.name, x=self.x, y=self.y)
+
+    def describe(self) -> str:
+        bits = [f"{self.name} centre ({self.x:.0f}, {self.y:.0f}) µm"]
+        if self.measured_width_um:
+            bits.append(f"width {self.measured_width_um:.0f} µm")
+        if self.measured_height_um:
+            bits.append(f"height {self.measured_height_um:.0f} µm")
+        if self.assumed_axes:
+            bits.append("assumed the nominal radius in "
+                        + "/".join(self.assumed_axes))
+        if self.measured_width_um or self.measured_height_um:
+            bits.append(f"vs {self.nominal_um:.0f} µm nominal "
+                        f"({self.diameter_error:+.1%})")
+        return ", ".join(bits)
+
+
+def well_size_um(plate: str) -> tuple[float, float]:
+    """The plate's well size in stage units (useq holds it in mm)."""
+    from useq import WellPlatePlan
+
+    plan = WellPlatePlan(plate=plate, a1_center_xy=(0.0, 0.0))
+    w, h = plan.plate.well_size
+    return float(w) * 1000.0, float(h) * 1000.0
+
+
+def centre_from_edges(plate: str, name: str, *,
+                      left: float | None = None,
+                      right: float | None = None,
+                      top: float | None = None,
+                      bottom: float | None = None) -> EdgeCentre:
+    """A well centre from stage readings taken at the well walls.
+
+    Give whichever you have. An opposite pair in an axis is best — the centre
+    is the midpoint and no well diameter is assumed. A single edge works too,
+    offset by the nominal radius.
+
+    ``left``/``right`` are stage X readings, ``top``/``bottom`` stage Y. Which
+    physical wall is "left" does not matter; only that the two are opposite.
+    """
+    width, height = well_size_um(plate)
+    if not any(v is not None for v in (left, right, top, bottom)):
+        raise ValueError("give at least one well edge")
+
+    assumed: list[str] = []
+
+    def axis(lo, hi, nominal, axis_name):
+        if lo is not None and hi is not None:
+            return (lo + hi) / 2.0, abs(hi - lo)
+        assumed.append(axis_name)
+        radius = nominal / 2.0
+        if lo is not None:
+            # A single edge cannot say which side of it the well lies, so the
+            # convention is: the well is in the +axis direction from `lo`.
+            return lo + radius, None
+        return hi - radius, None
+
+    if left is None and right is None:
+        raise ValueError(f"no X edge for {name} — give left and/or right")
+    if top is None and bottom is None:
+        raise ValueError(f"no Y edge for {name} — give top and/or bottom")
+
+    cx, measured_w = axis(left, right, width, "x")
+    cy, measured_h = axis(bottom, top, height, "y")
+    return EdgeCentre(name=name.strip().upper(), x=cx, y=cy,
+                      measured_width_um=measured_w,
+                      measured_height_um=measured_h,
+                      nominal_um=(width + height) / 2.0,
+                      assumed_axes=tuple(assumed))

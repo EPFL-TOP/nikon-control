@@ -48,7 +48,7 @@ Why a document rather than a chain of calls:
 |---|--------|-------|----------------|
 | 1 | Plate identify + calibrate | **done** | — → `plate` (type, `a1_center_xy`, `rotation`) |
 | 2 | Well selector | **done** | `plate` → `wells` |
-| 3 | Well scanner | to build | `wells` → `scan` (frames + their stage coords) |
+| 3 | Well scanner | **done** | `wells` → `scan` (frames + their stage coords) |
 | 4 | Cell identifier | model exists | `scan` → `detections` (bbox, class, score, stage coords) |
 | 5 | Position selector | to build | `detections` → `positions` (+ the filter that chose them) |
 | 6 | Path builder | to build | `positions` → `route` (ordered, with travel cost) |
@@ -67,17 +67,27 @@ as the calibration. Visiting order is **serpentine** by default — alternate
 rows reversed, which more than halves the travel of a full-plate scan and so
 comes straight off the time budget.
 
-**3 — Well scanner.** A grid of fields per well
-(`useq.GridRowsColumns` with the camera's real FOV) run as an `MDASequence` in
-**BF only** — the survey does not need fluorescence. Output: one frame per
-field, each with its stage coordinates. This is the expensive stage, which is
-why its output is persisted.
+**3 — Well scanner.** `scope/scan.py` + the Scan tab + `nikon-control-scope
+scan`. A grid of fields per well (`useq.GridRowsColumns` with the camera's
+real FOV), brightfield, writing 16-bit TIFFs plus `scan.json`. The manifest
+is the product: per frame the stage x/y, z, PFS lock and shape, and at the
+top the pixel size and objective — which is what makes
+`scan.stage_of_pixel()` able to turn a detection into a stage coordinate. A
+failed field is recorded and skipped, and the manifest is rewritten at every
+well, so a stopped scan leaves a usable dataset. Steppable
+(`run_iter`) so the dashboard stays responsive and can stop it.
+
+A pixel size is **required** and is not guessed: MMCore reports 0 unless a
+pixel-size configuration exists, and the generated `.cfg` has none. `Scope`
+suggests one from camera pixel pitch ÷ objective magnification and stores it
+per objective, but the scan refuses rather than inventing a field of view.
 
 **4 — Cell identifier.** The trained Faster R-CNN
 (`detector.py`) applied to the scan frames. It already classifies
-single/doublet/debris at 40×, and overlap suppression already exists. The one
-new piece is arithmetic: **pixel bbox → stage coordinates**, via the camera
-pixel size and the frame's own stage position.
+single/doublet/debris at 40×, and overlap suppression already exists. The
+pixel→stage arithmetic is now done — `scan.stage_of_pixel()` — so this stage
+is: read the manifest, run the detector over each TIFF, and write detections
+with stage coordinates attached. **This is the next piece to build.**
 
 **5 — Position selector.** Filters over detections, defined as we learn what
 matters: class, score, distance from a frame edge, isolation from neighbours,

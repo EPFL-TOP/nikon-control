@@ -9,6 +9,7 @@ import math
 
 import pytest
 
+from nikon_control.scope import plate
 from nikon_control.scope.plate import (
     SCALE_TOLERANCE,
     PlateCalibration,
@@ -172,3 +173,77 @@ def test_describe_is_human_readable():
     refs = _measure("96-well", (1000.0, 2000.0), 2.0, ["A1", "A12", "H1"])
     text = calibrate("96-well", refs).describe()
     assert "96-well" in text and "A1 at" in text and "rotation" in text
+
+
+# ------------------------------------------ finding a centre you cannot see
+
+def test_opposite_walls_give_the_centre_with_no_diameter_assumed():
+    """At 40x a well is not visible — the field is ~333 um, the well 6400.
+
+    So the centre is never eyeballed: touch one wall, touch the opposite
+    one, take the midpoint.
+    """
+    e = plate.centre_from_edges("96-well", "A1",
+                                left=1000 - 3200, right=1000 + 3200,
+                                bottom=2000 - 3200, top=2000 + 3200)
+    assert (e.x, e.y) == pytest.approx((1000.0, 2000.0))
+    assert e.measured_width_um == pytest.approx(6400.0)
+    assert e.assumed_axes == ()
+    assert e.trustworthy
+
+
+def test_a_single_wall_per_axis_uses_the_nominal_radius():
+    e = plate.centre_from_edges("96-well", "A1", left=-2200, bottom=-1200)
+    assert (e.x, e.y) == pytest.approx((1000.0, 2000.0))
+    assert set(e.assumed_axes) == {"x", "y"}
+    assert e.measured_width_um is None
+
+
+def test_touching_the_wrong_well_is_caught_by_the_implied_diameter():
+    """The free sanity check: two walls imply a diameter."""
+    e = plate.centre_from_edges("96-well", "A1",
+                                left=-2200, right=7000,
+                                bottom=-1200, top=5200)
+    assert not e.trustworthy
+    assert e.diameter_error > plate.DIAMETER_TOLERANCE
+    assert "vs 6400" in e.describe()
+
+
+def test_an_axis_with_no_wall_at_all_is_refused():
+    with pytest.raises(ValueError, match="no Y edge"):
+        plate.centre_from_edges("96-well", "A1", left=0, right=6400)
+    with pytest.raises(ValueError, match="no X edge"):
+        plate.centre_from_edges("96-well", "A1", bottom=0, top=6400)
+    with pytest.raises(ValueError, match="at least one well edge"):
+        plate.centre_from_edges("96-well", "A1")
+
+
+def test_an_edge_centre_feeds_the_calibration_directly():
+    refs = [
+        plate.centre_from_edges("96-well", name,
+                                left=cx - 3200, right=cx + 3200,
+                                bottom=cy - 3200, top=cy + 3200).to_ref()
+        for name, cx, cy in [("A1", 1000, 2000), ("A12", 100000, 2000),
+                             ("H1", 1000, -61000)]
+    ]
+    cal = plate.calibrate("96-well", refs)
+    assert cal.residual_um < 1.0
+    assert cal.a1_center_xy == pytest.approx((1000.0, 2000.0))
+
+
+def test_the_residual_threshold_matches_what_a_scan_can_absorb():
+    """A registration error shifts the scan grid; it does not compound.
+
+    50 um was the old threshold and would have flagged a perfectly usable
+    registration as suspect.
+    """
+    assert plate.GOOD_RESIDUAL_UM >= 100.0
+    # a few hundred um of error is well inside a well's spare margin
+    width, _height = plate.well_size_um("96-well")
+    assert plate.GOOD_RESIDUAL_UM < width / 10
+
+
+def test_well_size_is_reported_in_stage_units():
+    """useq holds plate dimensions in mm; the stage speaks um."""
+    assert plate.well_size_um("96-well") == pytest.approx((6400.0, 6400.0))
+    assert plate.well_size_um("384-well")[0] < 6400.0

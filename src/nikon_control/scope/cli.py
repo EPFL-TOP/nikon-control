@@ -12,6 +12,7 @@ Subcommands follow the order a rig is actually brought up:
     nikon-control-scope channel --name BF        capture the current
                                                  illumination as a channel
     nikon-control-scope plate ...                register a plate on the stage
+    nikon-control-scope scan --wells A1:B3       40x survey of those wells
 
 Both stand generations are supported: the Ti2-E via ``NikonTi2`` and the
 older Ti-E via ``NikonTI``. Nothing above :mod:`.stand` names a device
@@ -24,7 +25,8 @@ import difflib
 from pathlib import Path
 
 from . import (channels as channels_mod, config_build, discover,
-               plate as plate_mod, stand as stand_mod)
+               plate as plate_mod, scan as scan_mod, stand as stand_mod,
+               wells as wells_mod)
 from .plate import WellRef, calibrate, suggested_refs
 
 
@@ -390,14 +392,86 @@ def _cmd_plate(args) -> int:
     if not cal.rotation_estimated:
         print("  note: one well only — rotation assumed 0. Add a far corner "
               "to measure it.")
-    if cal.residual_um > 50:
-        print(f"  warning: residual {cal.residual_um:.0f} µm is large for "
-              "hand-centred wells; re-check the well identities.")
+    if cal.residual_um > plate_mod.GOOD_RESIDUAL_UM:
+        print(f"  warning: residual {cal.residual_um:.0f} µm exceeds the "
+              f"{plate_mod.GOOD_RESIDUAL_UM:.0f} µm a well scan can absorb — "
+              f"re-check the well identities.")
+    else:
+        print(f"  residual {cal.residual_um:.0f} µm is within the "
+              f"{plate_mod.GOOD_RESIDUAL_UM:.0f} µm a well scan absorbs; a "
+              f"registration error shifts the scan grid, it does not compound.")
     if args.json:
         plate_mod.save(cal, args.json)
         print(f"  written to {args.json} — the /scope dashboard reads this "
               f"file, and so does `plate --show`")
     return 0
+
+
+def _cmd_scan(args) -> int:
+    from .control import Scope
+
+    try:
+        cal = plate_mod.load(args.plate_file)
+    except Exception as exc:
+        print(f"could not read {args.plate_file}: {exc}")
+        print("register the plate first: nikon-control-scope plate --suggest")
+        return 1
+
+    sel = wells_mod.load_selection(args.plate_file)
+    if args.wells:
+        names = wells_mod.parse(cal.plate, args.wells)
+        if not names:
+            print(f"nothing in {args.wells!r} matched a well on a "
+                  f"{cal.plate} plate")
+            return 1
+        sel = wells_mod.Selection(cal.plate, set(names))
+    if sel is None or not sel.wells:
+        print(f"no wells selected — pass --wells, or choose them in the "
+              f"/scope dashboard (they save into {args.plate_file})")
+        return 1
+
+    try:
+        scope = Scope.from_config(args.config)
+    except Exception as exc:
+        print(f"could not load {args.config}: {exc}")
+        return 1
+
+    try:
+        if args.pixel_size:
+            scope.set_pixel_size_um(args.pixel_size)
+        fov = scope.fov_um()
+    except Exception as exc:
+        print(f"{exc}")
+        return 1
+
+    well_um = plate_mod.well_size_um(cal.plate)
+    rows, columns = args.rows, args.columns
+    if args.coverage:
+        rows, columns = scan_mod.fields_for_coverage(
+            fov, well_um, args.coverage, args.overlap / 100.0)
+
+    try:
+        sp = scan_mod.plan(cal, sel, fov_um=fov, rows=rows, columns=columns,
+                           overlap=args.overlap / 100.0)
+    except ValueError as exc:
+        print(f"cannot plan the scan: {exc}")
+        return 1
+
+    print(cal.describe())
+    for line in sp.describe(well_um):
+        print(f"  {line}")
+    if args.dry_run:
+        print("\n(dry run — nothing acquired)")
+        return 0
+
+    print(f"\nwriting to {args.out}")
+    result = scan_mod.run(scope, sp, args.out, channel=args.channel,
+                          refocus_every=args.refocus_every,
+                          progress=lambda m: print(f"  {m}"))
+    for line in result.describe():
+        print(line)
+    print(f"manifest: {result.manifest_path}")
+    return 1 if result.failures and not result.frames else 0
 
 
 def main() -> None:
@@ -497,6 +571,39 @@ def main() -> None:
     pl.add_argument("--show", metavar="FILE",
                     help="print a saved calibration and the wells it implies")
     pl.set_defaults(func=_cmd_plate)
+
+    sc = sub.add_parser("scan", help="survey the selected wells field by "
+                                     "field, writing frames + a manifest of "
+                                     "their stage positions")
+    sc.add_argument("--config", default="MMConfig.cfg",
+                    help="Micro-Manager .cfg (default MMConfig.cfg)")
+    sc.add_argument("--plate-file", default="plate.json",
+                    help="plate calibration + well selection "
+                         "(default plate.json)")
+    sc.add_argument("--wells", default="",
+                    help="wells to scan, e.g. 'A1:B3' — overrides the "
+                         "selection saved in the plate file")
+    sc.add_argument("--out", default="scan",
+                    help="folder to write frames into (default ./scan)")
+    sc.add_argument("--rows", type=int, default=7)
+    sc.add_argument("--columns", type=int, default=7)
+    sc.add_argument("--coverage", type=float, default=0.0,
+                    help="fit the grid to this fraction of each well "
+                         "(e.g. 0.33) instead of --rows/--columns")
+    sc.add_argument("--overlap", type=float, default=10.0,
+                    help="field overlap in percent (default 10)")
+    sc.add_argument("--channel", default="",
+                    help="channel to use; blank leaves the current one. A "
+                         "survey should be brightfield — fluorescence at "
+                         "every field of every well bleaches the sample.")
+    sc.add_argument("--refocus-every", type=int, default=1, metavar="N",
+                    help="re-engage PFS every N fields (0 = never, "
+                         "default 1)")
+    sc.add_argument("--pixel-size", type=float, default=0.0,
+                    help="µm per pixel, if the configuration has none")
+    sc.add_argument("--dry-run", action="store_true",
+                    help="print the plan and stop")
+    sc.set_defaults(func=_cmd_scan)
 
     args = p.parse_args()
     raise SystemExit(args.func(args))

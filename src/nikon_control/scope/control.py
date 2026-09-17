@@ -630,6 +630,115 @@ class Scope:
 
     # --------------------------------------------------------------- camera
 
+    def image_shape(self) -> tuple[int, int]:
+        """Camera frame size in pixels, (height, width)."""
+        self._require("camera")
+        return (int(self.core.getImageHeight()), int(self.core.getImageWidth()))
+
+    def pixel_size_um(self) -> float:
+        """Microns per pixel, or 0.0 when the configuration never said.
+
+        MMCore returns 0 unless a pixel-size configuration is defined, and
+        `nikon-control-scope build` does not write one — there is nothing to
+        derive it from. A scan grid built on 0 would put every field at the
+        same place, so callers must check rather than trust.
+        """
+        try:
+            return float(self.core.getPixelSizeUm())
+        except Exception:
+            return 0.0
+
+    def set_pixel_size_um(self, value: float, *, name: str = "") -> float:
+        """Define a pixel size for the current objective, and select it.
+
+        Stored as an MMCore pixel-size configuration keyed on the nosepiece
+        position, so it follows the objective rather than being a global
+        constant that silently goes wrong after a turret move.
+        """
+        value = float(value)
+        if value <= 0:
+            raise ScopeError("pixel size must be positive")
+        # If a pixel-size configuration already applies to the current
+        # device state, update THAT one. Defining a second config that also
+        # matches leaves MMCore with two candidates and it reports whichever
+        # it finds first — so the new value silently does nothing.
+        current = ""
+        try:
+            current = str(self.core.getCurrentPixelSizeConfig() or "")
+        except Exception:
+            current = ""
+        if current and not name:
+            self.core.setPixelSizeUm(current, value)
+            return self.pixel_size_um()
+
+        nose = self.roles.get("nosepiece")
+        if not nose:
+            raise ScopeError(
+                "no pixel-size configuration applies and there is no "
+                "objective turret to key a new one on. Pass fov_um "
+                "explicitly to the scan instead."
+            )
+        label = str(self.objective() or "objective")
+        resolution_id = name or f"px-{label}"
+        try:
+            if self.core.isPixelSizeConfigDefined(resolution_id):
+                self.core.deletePixelSizeConfig(resolution_id)
+        except Exception:
+            pass
+        self.core.definePixelSizeConfig(resolution_id, nose, "Label", label)
+        self.core.setPixelSizeUm(resolution_id, value)
+        return self.pixel_size_um()
+
+    def suggest_pixel_size_um(self) -> tuple[float, str]:
+        """A starting value from the camera and the objective's own label.
+
+        Returns ``(value, how)``; value is 0.0 when it could not be worked
+        out. This is a suggestion to be checked against a stage micrometer,
+        not a calibration — the label's magnification ignores any extra
+        tube-lens or intermediate factor.
+        """
+        import re
+
+        pitch = 0.0
+        for info in self.properties("camera") if self.has("camera") else []:
+            low = info.name.lower().replace(" ", "")
+            if "pixelsize" in low or low in ("pixelpitch", "sensorpixelsize"):
+                if (n := info.number) and n > 0:
+                    pitch = n
+                    break
+        if pitch <= 0:
+            return 0.0, "the camera does not report its pixel pitch"
+
+        mag = 0.0
+        match = re.search(r"(\d+(?:\.\d+)?)\s*[xX]", self.objective() or "")
+        if match:
+            mag = float(match.group(1))
+        if mag <= 0:
+            return 0.0, (f"camera pixel pitch is {pitch:g} µm but the "
+                         f"objective label carries no magnification")
+
+        extra = 1.0
+        for label, info in (("IntermediateMagnification", None),):
+            for prop in self.properties(label):
+                if "magnif" in prop.name.lower() and (n := prop.number):
+                    extra = n
+                    break
+        return pitch / (mag * extra), (
+            f"{pitch:g} µm camera pixels ÷ ({mag:g}× objective × {extra:g}× "
+            f"intermediate) — check it against a stage micrometer")
+
+    def fov_um(self, pixel_size_um: float | None = None) -> tuple[float, float]:
+        """Field of view in microns, (width, height)."""
+        px = pixel_size_um if pixel_size_um is not None else self.pixel_size_um()
+        if px <= 0:
+            raise ScopeError(
+                "no pixel size is configured, so the field of view is "
+                "unknown. Set it in the dashboard's Scan tab, or call "
+                "set_pixel_size_um()."
+            )
+        h, w = self.image_shape()
+        return w * px, h * px
+
     def snap(self):
         """Acquire one image and return it as a numpy array."""
         self._require("camera")

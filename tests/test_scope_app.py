@@ -451,3 +451,92 @@ def test_a_failed_well_move_is_not_reported_as_success(doc):
     text = widget(doc, "status").text
     assert "moved to B2" not in text
     assert "stage not responding" in text
+
+
+@needs_demo
+def test_the_scan_tab_plans_and_runs(doc, tmp_path):
+    """Plugin 3 through the GUI: register, select, plan, scan."""
+    click(doc, "demo")
+    well_box = widget(doc, "well")
+    for name, x, y in [("A1", 1000.0, 2000.0),
+                       ("A12", 100000.0, 2000.0),
+                       ("H1", 1000.0, -61000.0)]:
+        goto(doc, x, y)
+        well_box.value = name
+        click(doc, "capture")
+    click(doc, "calibrate")
+    widget(doc, "wells_text").value = "A1"
+    click(doc, "wells_add")
+
+    # the pixel size has to exist before a grid can be laid
+    widget(doc, "pixel_size").value = 0.1625
+    click(doc, "pixel_set")
+    assert "µm/px" in widget(doc, "pixel_status").text
+
+    widget(doc, "scan_rows").value = 2
+    widget(doc, "scan_cols").value = 2
+    widget(doc, "scan_dir").value = str(tmp_path / "frames")
+    click(doc, "scan_plan")
+    assert "4 frames" in widget(doc, "scan_status").text
+
+    click(doc, "scan_run")
+    for _ in range(40):                       # step the scan to completion
+        cbs = [c for c in doc.callbacks.session_callbacks
+               if type(c).__name__ == "PeriodicCallback"]
+        if not cbs:
+            break
+        for c in cbs:
+            c.callback()
+
+    from nikon_control.scope import scan as scan_mod
+    manifest = scan_mod.load_manifest(tmp_path / "frames")
+    assert len(manifest["frames"]) == 4
+    assert manifest["pixel_size_um"] == pytest.approx(0.1625)
+    assert "finished" in widget(doc, "scan_status").text
+
+
+@needs_demo
+def test_the_scan_tab_says_what_is_missing_instead_of_failing(doc):
+    click(doc, "demo")
+    click(doc, "scan_plan")
+    assert "register the plate first" in widget(doc, "scan_status").text
+
+
+@needs_demo
+def test_wall_touches_produce_a_reference_without_guessing_a_centre(doc):
+    """At 40x the well is invisible; the centre comes from opposite walls."""
+    click(doc, "demo")
+    widget(doc, "well").value = "A1"
+
+    goto(doc, 1000 - 3200, 2000)
+    click(doc, "edge_x0")
+    goto(doc, 1000 + 3200, 2000)
+    click(doc, "edge_x1")
+    goto(doc, 1000, 2000 - 3200)
+    click(doc, "edge_y0")
+    goto(doc, 1000, 2000 + 3200)
+    click(doc, "edge_y1")
+    click(doc, "edge_use")
+
+    text = widget(doc, "edge_status").text
+    assert "centre from walls" in text
+    assert "A1 centre (1000, 2000)" in text
+    assert "6400" in text                     # the implied diameter checks out
+    assert "A1</b> (1000, 2000)" in widget(doc, "wells_status").text or \
+        "A1" in text
+
+
+@needs_demo
+def test_walls_of_the_wrong_well_are_flagged(doc):
+    click(doc, "demo")
+    widget(doc, "well").value = "A1"
+    goto(doc, -2200, 2000)
+    click(doc, "edge_x0")
+    goto(doc, 7000, 2000)                     # a wall of the next well over
+    click(doc, "edge_x1")
+    goto(doc, 1000, -1200)
+    click(doc, "edge_y0")
+    goto(doc, 1000, 5200)
+    click(doc, "edge_y1")
+    click(doc, "edge_use")
+    assert "wrong well" in widget(doc, "edge_status").text

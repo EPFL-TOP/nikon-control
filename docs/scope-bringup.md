@@ -366,8 +366,47 @@ geometry is fixed by its manufacturer, so locating it takes exactly **three
 numbers**: where the centre of well A1 sits on the stage, and how the plate is
 rotated relative to the stage axes.
 
+### You cannot centre a well by eye, and you do not need to
+
+At 40× the field of view is ~333 µm and a 96-well well is 6400 µm across —
+the well is not even visible, let alone centrable. Two facts make that a
+non-problem.
+
+**1 · The tolerance is hundreds of microns, not microns.** A registration
+error shifts the whole scan grid by that amount; it does not compound across
+the plate. Scan a centred 11×11 of a well that would take 20×20 to cover and
+there is ~1.7 mm of spare margin on each side. So ±300 µm per reference is
+fine — and the tool now says so instead of warning at 50 µm, which was far
+too strict and would have made a perfectly good registration look broken.
+
+Rotation is the part worth care, because it acts over the whole plate. That
+is why the references should be far apart: with ±300 µm references on a
+100 mm baseline, the fitted rotation is good to ~0.17°, which displaces the
+far corner by ~300 µm — the same order as the input noise, not worse.
+
+**2 · Opposite walls beat a guessed centre.** Drive until the well *wall*
+sits mid-image, capture; do the opposite side; the centre is the midpoint. No
+judgement about where a centre is, works at any magnification, and the
+implied diameter is a free check — touch a wall of the wrong well and the
+number comes out 40% off, which the tool refuses.
+
+The Plate tab has four wall buttons (`◀ −X wall`, `+X wall ▶`, `▼ −Y wall`,
+`▲ +Y wall`) and *Centre from walls*. One wall per axis also works, offset by
+the nominal radius; two per axis is better because nothing is assumed.
+
+**Or just calibrate at 4× or 10×.** At 4× the field is ~3.3 mm, so you can
+see the well and its wall and eyeball the centre to a few hundred microns —
+inside tolerance. The objectives are not parcentric, but that offset is a
+**constant translation**: it shifts every reference equally, so it lands in
+`a1_center_xy` as a fixed bias of tens of microns. (Parcentricity is a real
+problem only when you must hit a specific *cell* across a magnification
+change, a ~10 µm job. It does not apply here — worth saying, because it is
+easy to over-apply.)
+
+### Then register
+
 Either from the dashboard's **Plate** panel — pick the plate type, drive to
-each suggested well, type its name and press *Capture current XY*, then
+each suggested well, capture its centre (by walls, or *Centre is here*), then
 *Calibrate* — or from the command line:
 
 ```bat
@@ -470,6 +509,71 @@ sel = wells.load_selection("plate.json")
 plan = sel.to_plan(cal)            # a useq.WellPlatePlan
 for pos in plan.image_positions:
     print(pos.name, pos.x, pos.y)
+```
+
+## 9 · Scan the selected wells at 40×
+
+The survey: visit a grid of fields in each selected well, save the frames,
+and record **where each frame came from**. That last part is the point —
+detection runs offline, and a cell's pixel position plus its frame's stage
+position gives a stage coordinate to drive back to. A scan without per-frame
+stage coordinates is just pictures.
+
+The dashboard's **Scan** tab, or:
+
+```bat
+nikon-control-scope scan --wells A1:B3 --coverage 0.33 --out survey
+nikon-control-scope scan --wells A1 --rows 11 --columns 11 --dry-run
+```
+
+### A pixel size is required
+
+A field of view is pixels × µm/pixel, and `nikon-control-scope build` writes
+no pixel-size configuration — there is nothing to derive one from. Without
+it a grid would put every field in the same place, so the scan refuses rather
+than guessing. Set it in the Scan tab (it suggests a value from the camera's
+pixel pitch and the objective's magnification, which is a starting point to
+check against a stage micrometer, not a calibration). It is stored per
+objective, so it follows a turret move instead of silently going wrong.
+
+For this rig: 6.5 µm camera pixels ÷ 40× = **0.1625 µm/px**, so a 2048²
+frame is a **333 µm** field.
+
+### How many fields
+
+| coverage of a 6400 µm well | grid | frames/well |
+|---|---|---|
+| everything | 20 × 20 | 400 |
+| half | 10 × 10 | 100 |
+| the middle third | 7 × 7 | 49 |
+
+Full coverage is rarely what a survey wants. *Fit grid to coverage* works out
+the grid from a fraction, and the **Throughput** tab's measured timings turn
+that into minutes.
+
+`--refocus-every N` decides how often PFS re-engages: `1` at every field is
+safest and slowest, and a well's fields are coplanar enough that once per
+well is usually enough. On measured numbers, 361 refocuses at 400 ms is
+~2.4 minutes of a single well's scan.
+
+The survey is **brightfield** — `--channel` defaults to leaving the current
+one alone. Firing fluorescence at every field of every well bleaches the
+sample before the experiment starts.
+
+### What comes out
+
+A folder of 16-bit TIFFs plus `scan.json`, recording per frame: file, well,
+field index, stage x/y, z, whether PFS locked, shape and elapsed time — and
+at the top, the pixel size and objective. A field that fails is recorded with
+its position and skipped; the manifest is rewritten at every well, so a
+stopped or crashed scan still leaves a usable dataset.
+
+```python
+from nikon_control.scope import scan
+
+m = scan.load_manifest("survey")
+frame = m["frames"][0]
+x, y = scan.stage_of_pixel(frame, 1024, 960, m)   # a detection -> the stage
 ```
 
 ## How long will a timepoint take?
